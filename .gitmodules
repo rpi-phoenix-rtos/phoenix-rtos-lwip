@@ -1,0 +1,4 @@
+[submodule "lib-lwip"]
+	path = lib-lwip
+	url = https://github.com/phoenix-rtos/lwip
+	branch = STABLE-2_1_x_phoenix

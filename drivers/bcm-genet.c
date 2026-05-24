@@ -57,6 +57,11 @@ typedef struct {
 
 	int irq_general;  /* SPI 189 — reserved for Tier 4+ */
 	int irq_ring;     /* SPI 190 — reserved for Tier 5 */
+
+	int last_link_up;
+	int last_speed;
+	int last_duplex;
+	uint32_t link_poll_stack[1024] __attribute__((aligned(16)));
 } genet_state_t;
 
 
@@ -293,14 +298,23 @@ static void genet_setLinkState(void *arg, int state_up)
 	int speed;
 
 	if (!state_up) {
-		genet_printf(state, "link down");
+		if (state->last_link_up) {
+			genet_printf(state, "link down");
+		}
+		state->last_link_up = 0;
 		netif_set_link_down(netif);
 		return;
 	}
 
 	speed = ephy_linkSpeed(&state->phy, &full_duplex);
-	genet_printf(state, "link up: %d Mbps %s-duplex",
-		speed, full_duplex ? "full" : "half");
+	if (state->last_link_up == 0 || speed != state->last_speed ||
+		full_duplex != state->last_duplex) {
+		genet_printf(state, "link up: %d Mbps %s-duplex",
+			speed, full_duplex ? "full" : "half");
+	}
+	state->last_link_up = 1;
+	state->last_speed = speed;
+	state->last_duplex = full_duplex;
 
 	/* Tier 1 stops here — we don't program UMAC_CMD.SPEED / RX_EN /
 	 * TX_EN because there are no rings to fill yet. Tier 2 adds TX,
@@ -308,6 +322,23 @@ static void genet_setLinkState(void *arg, int state_up)
 	 * for the negotiated speed/duplex. */
 
 	netif_set_link_up(netif);
+}
+
+
+/* --- Link-state poll thread ------------------------------------- */
+
+static void genet_linkPollThread(void *arg)
+{
+	genet_state_t *state = arg;
+	int speed, full_duplex;
+
+	for (;;) {
+		usleep(1000 * 1000);  /* 1s — matches Linux mii_link_poll cadence */
+
+		full_duplex = 0;
+		speed = ephy_linkSpeed(&state->phy, &full_duplex);
+		genet_setLinkState(state->netif, (speed > 0) ? 1 : 0);
+	}
 }
 
 
@@ -404,9 +435,26 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 		return err;
 	}
 
-	/* Read firmware-pre-programmed MAC before reset (UMAC reset may
-	 * stomp on UMAC_MAC0/MAC1). */
+	/* Try the firmware-pre-programmed MAC first. On Pi 4 the VideoCore
+	 * firmware does *not* push the board MAC into UMAC_MAC0/UMAC_MAC1 —
+	 * Linux fetches it from the DT's local-mac-address property or via
+	 * the BCM2835 mailbox GET_BOARD_MAC (tag 0x10003) and then writes it
+	 * back. Phoenix does not yet expose either route from userspace, so
+	 * for Tier 1 we fall back to a deterministic locally-administered
+	 * MAC derived from the SoC's GENET MMIO offset. This is enough for
+	 * link-up validation; Tier 2+ will plumb a proper MAC source.
+	 *   TODO(TD-Eth-MAC): query VideoCore mailbox / DT for the real MAC. */
 	genet_readMac(state);
+	if ((state->mac[0] | state->mac[1] | state->mac[2] | state->mac[3] |
+		state->mac[4] | state->mac[5]) == 0) {
+		state->mac[0] = 0x02;  /* locally administered, unicast */
+		state->mac[1] = 0xB8;
+		state->mac[2] = 0x27;  /* RPi-Foundation OUI tail, helps log scans */
+		state->mac[3] = 0xEB;
+		state->mac[4] = 0x00;
+		state->mac[5] = 0x01;
+		genet_printf(state, "no firmware MAC in UMAC_MAC{0,1}; using fallback");
+	}
 	genet_printf(state, "MAC %02x:%02x:%02x:%02x:%02x:%02x",
 		state->mac[0], state->mac[1], state->mac[2],
 		state->mac[3], state->mac[4], state->mac[5]);
@@ -439,6 +487,16 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 		genet_setLinkState, (void *)netif);
 	if (err < 0) {
 		genet_printf(state, "ephy_init failed: %d", err);
+		return err;
+	}
+
+	/* ephy_init queries the PHY once. With irq:MAC there's no IRQ thread,
+	 * so we spin up our own 1 Hz poller that calls back into genet_setLinkState
+	 * whenever the link transitions. */
+	err = beginthread(genet_linkPollThread, 4, state->link_poll_stack,
+		sizeof(state->link_poll_stack), state);
+	if (err != 0) {
+		genet_printf(state, "link poll thread failed: %d", err);
 		return err;
 	}
 

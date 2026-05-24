@@ -29,7 +29,9 @@
 
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/pbuf.h"
 
+#include <sys/mman.h>
 #include <sys/threads.h>
 #include <sys/time.h>
 #include <errno.h>
@@ -43,6 +45,10 @@
 
 #define GENET_MMIO_SIZE   0x10000u  /* 64 KiB */
 #define MDIO_TIMEOUT_US   20000u    /* xHCI MDIO max per Linux bcmmii */
+
+
+/* Forward declaration: genet_setLinkState fires a TX smoke test via this. */
+static err_t genet_linkOutput(struct netif *netif, struct pbuf *p);
 
 
 typedef struct {
@@ -62,6 +68,14 @@ typedef struct {
 	int last_speed;
 	int last_duplex;
 	uint32_t link_poll_stack[1024] __attribute__((aligned(16)));
+
+	/* TX (Tier 2): single DMA buffer, ring of 256 BDs in MMIO. */
+	void *tx_buf;
+	addr_t tx_buf_phys;
+	handle_t tx_lock;
+	uint32_t tx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
+	uint32_t tx_prod_index;  /* 16-bit running counter the HW compares to CONS_INDEX */
+	int tx_smoke_test_done;
 } genet_state_t;
 
 
@@ -288,6 +302,80 @@ static void genet_configRgmii(genet_state_t *state)
 }
 
 
+/* --- TX ring + UMAC speed configuration (Tier 2) --------------- */
+
+static void genet_initTxRing(genet_state_t *state)
+{
+	uint32_t ring_off = GENET_TX_RINGS_OFF + GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
+	uint32_t cons;
+
+	/* Burst size — 8 64-bit words; matches U-Boot's DMA_MAX_BURST_LENGTH. */
+	genet_write(state, GENET_TDMA_REGS_OFF + GENET_TDMA_SCB_BURST_SIZE,
+		GENET_DMA_DEFAULT_BURST);
+
+	/* Ring slice: spans the full BD area (0 .. TOTAL_DESC*3 - 1 words). */
+	genet_write(state, ring_off + GENET_TDMA_RING_START_ADDR, 0);
+	genet_write(state, ring_off + GENET_TDMA_RING_READ_PTR, 0);
+	genet_write(state, ring_off + GENET_TDMA_RING_WRITE_PTR, 0);
+	genet_write(state, ring_off + GENET_TDMA_RING_END_ADDR,
+		(GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE / 4u) - 1u);
+
+	/* Match SW counters to whatever the hardware says CONS is. The hardware
+	 * keeps an internal 16-bit running count of consumed descriptors; we
+	 * mirror it so our first PROD_INDEX write is correctly ordered. */
+	cons = genet_read(state, ring_off + GENET_TDMA_RING_CONS_INDEX);
+	genet_write(state, ring_off + GENET_TDMA_RING_PROD_INDEX, cons);
+	state->tx_prod_index = cons;
+	state->tx_index = cons % GENET_TOTAL_DESC;
+
+	/* Ring buffer size: <descriptor count><<16 | <per-slot bytes>. */
+	genet_write(state, ring_off + GENET_TDMA_RING_BUF_SIZE,
+		(GENET_TOTAL_DESC << 16) | (GENET_MAX_FRAME & 0xFFFFu));
+
+	/* Mbuf-done threshold: 1 — fire the (yet-unused) IRQ on each packet. */
+	genet_write(state, ring_off + GENET_TDMA_RING_MBUF_DONE, 1);
+	genet_write(state, ring_off + GENET_TDMA_RING_FLOW_PERIOD, 0);
+
+	/* Per-ring enable bitmap. */
+	uint32_t cfg = genet_read(state, GENET_TDMA_REGS_OFF + GENET_TDMA_RING_CFG);
+	cfg |= 1u << GENET_DEFAULT_RING;
+	genet_write(state, GENET_TDMA_REGS_OFF + GENET_TDMA_RING_CFG, cfg);
+
+	/* Global TDMA enable + flag this ring as a default queue. The default-queue
+	 * select bit is at (RBUF_EN_LSB + ring_idx). */
+	uint32_t ctrl = genet_read(state, GENET_TDMA_REGS_OFF + GENET_TDMA_CTRL);
+	ctrl |= GENET_TDMA_CTRL_TDMA_EN |
+		(1u << (GENET_TDMA_CTRL_RBUF_EN_LSB + GENET_DEFAULT_RING));
+	genet_write(state, GENET_TDMA_REGS_OFF + GENET_TDMA_CTRL, ctrl);
+}
+
+
+static void genet_macSetSpeed(genet_state_t *state, int speed, int full_duplex)
+{
+	uint32_t cmd = genet_read(state, UMAC_CMD);
+
+	cmd &= ~CMD_SPEED_MASK;
+	switch (speed) {
+		case 10:   cmd |= CMD_SPEED_10; break;
+		case 100:  cmd |= CMD_SPEED_100; break;
+		case 1000: cmd |= CMD_SPEED_1000; break;
+		default:                          break;  /* leave previous setting */
+	}
+
+	if (full_duplex) {
+		cmd &= ~CMD_HD_EN;
+	}
+	else {
+		cmd |= CMD_HD_EN;
+	}
+
+	/* TX_EN here, RX_EN lands in Tier 3. */
+	cmd |= CMD_TX_EN;
+
+	genet_write(state, UMAC_CMD, cmd);
+}
+
+
 /* --- Link-state callback ---------------------------------------- */
 
 static void genet_setLinkState(void *arg, int state_up)
@@ -316,12 +404,54 @@ static void genet_setLinkState(void *arg, int state_up)
 	state->last_speed = speed;
 	state->last_duplex = full_duplex;
 
-	/* Tier 1 stops here — we don't program UMAC_CMD.SPEED / RX_EN /
-	 * TX_EN because there are no rings to fill yet. Tier 2 adds TX,
-	 * Tier 3 adds RX, then this callback will also program the MAC
-	 * for the negotiated speed/duplex. */
+	/* Program UMAC_CMD.SPEED + TX_EN now that the negotiated rate is known.
+	 * RX_EN lands in Tier 3 once the RDMA ring is set up. */
+	genet_macSetSpeed(state, speed, full_duplex);
 
 	netif_set_link_up(netif);
+
+	/* TODO(TD-Eth-Smoke): once Tier 4 wires DHCP/ARP, the natural protocol
+	 * traffic exercises TX so we can delete this. For Tier 2 we synthesize
+	 * a 60-byte broadcast Ethernet frame on the first link-up so the BD ring
+	 * actually advances and TDMA_RING_CONS_INDEX bumps. The payload is a
+	 * gratuitous-ARP-shaped probe so a host-side tcpdump can confirm the
+	 * frame really left the wire. */
+	if (state->tx_smoke_test_done == 0) {
+		uint8_t frame[60] = {
+			/* dst: broadcast */
+			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+			/* src: filled in below */
+			0, 0, 0, 0, 0, 0,
+			/* ethertype: ARP */
+			0x08, 0x06,
+			/* HTYPE=1 (Ethernet), PTYPE=0x0800 (IPv4), HLEN=6, PLEN=4, OPER=1 (request) */
+			0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+			/* SHA — filled below */
+			0, 0, 0, 0, 0, 0,
+			/* SPA: 169.254.27.235 (link-local self) */
+			169, 254, 27, 235,
+			/* THA: zeros */
+			0, 0, 0, 0, 0, 0,
+			/* TPA: 169.254.27.235 (gratuitous: who-has-self) */
+			169, 254, 27, 235,
+			/* padding to 60 bytes — minimum Ethernet frame */
+			0
+		};
+		struct pbuf pb;
+		err_t res;
+
+		memcpy(frame + 6, state->mac, 6);
+		memcpy(frame + 22, state->mac, 6);
+
+		pb.payload = frame;
+		pb.len = sizeof(frame);
+		pb.tot_len = sizeof(frame);
+		pb.next = NULL;
+
+		res = genet_linkOutput(netif, &pb);
+		genet_printf(state, "smoke-test TX (60 B grat-ARP) result=%d", (int)res);
+		state->tx_smoke_test_done = 1;
+	}
 }
 
 
@@ -344,13 +474,68 @@ static void genet_linkPollThread(void *arg)
 
 /* --- linkoutput / media ----------------------------------------- */
 
+#define GENET_TX_TIMEOUT_US 100000u  /* 100 ms — enough for 1518 B at 10 Mbps */
+
+
 static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 {
-	(void)netif;
-	(void)p;
-	/* Tier 1: no TX path. Drop with "interface down" so lwIP knows the
-	 * link layer isn't ready. */
-	return ERR_IF;
+	genet_state_t *state = netif->state;
+	uint32_t ring_off = GENET_TX_RINGS_OFF + GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
+	uint32_t bd_off, status;
+	time_t now, deadline;
+	uint16_t len;
+
+	if (state->last_link_up == 0) {
+		return ERR_IF;
+	}
+
+	if (p->tot_len > GENET_MAX_FRAME) {
+		return ERR_BUF;
+	}
+
+	len = p->tot_len;
+
+	mutexLock(state->tx_lock);
+
+	/* Linearise the pbuf into the single DMA-coherent slot. dmammap memory
+	 * is uncached, so no further cache maintenance is needed. */
+	pbuf_copy_partial(p, state->tx_buf, len, 0);
+
+	/* Program BD[tx_index]: addr-lo, addr-hi, length+status. */
+	bd_off = GENET_TX_DESCS_OFF + state->tx_index * GENET_DMA_DESC_SIZE;
+	genet_write(state, bd_off + 4, (uint32_t)(state->tx_buf_phys & 0xFFFFFFFFu));
+	genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->tx_buf_phys >> 32));
+
+	status = ((uint32_t)len << BD_LEN_SHIFT) |
+		BD_STATUS_SOP | BD_STATUS_EOP | BD_STATUS_OWN | BD_STATUS_TX_CRC;
+	genet_write(state, bd_off + 0, status);
+
+	/* Advance the ring tail. The 16-bit prod_index wraps at 0x10000; the
+	 * BD index wraps at TOTAL_DESC. */
+	state->tx_index = (state->tx_index + 1u) % GENET_TOTAL_DESC;
+	state->tx_prod_index = (state->tx_prod_index + 1u) & 0xFFFFu;
+	genet_write(state, ring_off + GENET_TDMA_RING_PROD_INDEX, state->tx_prod_index);
+
+	/* Polled completion — Tier 2 doesn't run IRQs yet. */
+	gettime(&now, NULL);
+	deadline = now + GENET_TX_TIMEOUT_US;
+
+	for (;;) {
+		uint32_t cons = genet_read(state, ring_off + GENET_TDMA_RING_CONS_INDEX);
+		if ((cons & 0xFFFFu) == state->tx_prod_index) {
+			break;
+		}
+		gettime(&now, NULL);
+		if (now >= deadline) {
+			mutexUnlock(state->tx_lock);
+			genet_printf(state, "TX timeout (prod=%u cons=%u)",
+				state->tx_prod_index, cons & 0xFFFFu);
+			return ERR_TIMEOUT;
+		}
+	}
+
+	mutexUnlock(state->tx_lock);
+	return ERR_OK;
 }
 
 
@@ -489,6 +674,25 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 		genet_printf(state, "ephy_init failed: %d", err);
 		return err;
 	}
+
+	/* Tier 2: single-slot TX buffer + ring init. dmammap returns a
+	 * page-aligned uncached MAP_CONTIGUOUS region — exactly what GENET
+	 * DMA needs (no D-cache management, low-32-bit physical address). */
+	state->tx_buf = dmammap(GENET_MAX_FRAME);
+	if (state->tx_buf == NULL) {
+		genet_printf(state, "dmammap(%u) for TX failed", GENET_MAX_FRAME);
+		return -ENOMEM;
+	}
+	state->tx_buf_phys = va2pa(state->tx_buf);
+
+	if (mutexCreate(&state->tx_lock) != 0) {
+		genet_printf(state, "tx_lock mutexCreate failed");
+		return -ENOMEM;
+	}
+
+	genet_initTxRing(state);
+	genet_printf(state, "TX ring 16 ready (BD %u..%u, buf %p phys=0x%08x)",
+		0u, GENET_TOTAL_DESC - 1u, state->tx_buf, (unsigned)state->tx_buf_phys);
 
 	/* ephy_init queries the PHY once. With irq:MAC there's no IRQ thread,
 	 * so we spin up our own 1 Hz poller that calls back into genet_setLinkState

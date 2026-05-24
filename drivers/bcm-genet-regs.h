@@ -223,7 +223,13 @@
 #define GENET_RX_RINGS_OFF   (GENET_RX_DESCS_OFF + GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE) /* 0x2C00 */
 #define GENET_RDMA_REGS_OFF  (GENET_RX_RINGS_OFF + GENET_DMA_RINGS_SIZE)  /* 0x3040 */
 
-/* Per-TX-ring control register offsets within the ring's 0x40 slice. */
+/* Per-ring control register offsets within the ring's 0x40 slice. These
+ * apply to BOTH TDMA and RDMA rings, but offset 0x28 has different
+ * meanings on each side:
+ *   - TDMA: TDMA_FLOW_PERIOD (write 0 to disable TX flow throttling)
+ *   - RDMA: RDMA_XON_XOFF_THRESH ({xoff << 16} | xon) — leaving this
+ *           at 0 hangs RX permanently (always XOFF).
+ */
 #define GENET_TDMA_RING_READ_PTR    0x00u
 #define GENET_TDMA_RING_CONS_INDEX  0x08u
 #define GENET_TDMA_RING_PROD_INDEX  0x0Cu
@@ -231,8 +237,17 @@
 #define GENET_TDMA_RING_START_ADDR  0x14u
 #define GENET_TDMA_RING_END_ADDR    0x1Cu
 #define GENET_TDMA_RING_MBUF_DONE   0x24u
-#define GENET_TDMA_RING_FLOW_PERIOD 0x28u
+#define GENET_TDMA_RING_FLOW_PERIOD 0x28u  /* TX-side */
+#define GENET_RDMA_RING_XON_XOFF    0x28u  /* RX-side alias */
 #define GENET_TDMA_RING_WRITE_PTR   0x2Cu
+
+/* Linux's RX flow-control defaults (DMA_FC_THRESH_{LO,HI},
+ * DMA_XOFF_THRESHOLD_SHIFT). Used together as
+ *   (LO << SHIFT) | HI
+ * so XOFF triggers at LO descriptors remaining, XON resumes at HI. */
+#define GENET_DMA_FC_THRESH_LO      5u
+#define GENET_DMA_FC_THRESH_HI      (GENET_TOTAL_DESC >> 4)
+#define GENET_DMA_XOFF_THRESH_SHIFT 16
 
 /* Global TDMA control registers. */
 #define GENET_TDMA_RING_CFG         0x00u  /* per-ring enable bitmap */

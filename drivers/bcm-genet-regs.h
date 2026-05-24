@@ -237,8 +237,10 @@
 /* Global TDMA control registers. */
 #define GENET_TDMA_RING_CFG         0x00u  /* per-ring enable bitmap */
 #define GENET_TDMA_CTRL             0x04u  /* TDMA enable + default-queue */
-#define GENET_TDMA_STATUS           0x08u
+#define GENET_TDMA_STATUS           0x08u  /* per-ring disabled bitmap (mirror of CTRL when stopped) */
 #define GENET_TDMA_SCB_BURST_SIZE   0x0Cu
+
+#define GENET_DMA_TIMEOUT_US        100000u  /* Linux DMA_TIMEOUT_VAL */
 
 #define GENET_TDMA_CTRL_TDMA_EN     (1u << 0)
 #define GENET_TDMA_CTRL_RBUF_EN_LSB 1u      /* per-ring enable starts here */

@@ -356,14 +356,19 @@ static void genet_configRgmii(genet_state_t *state)
 	 * same write for RGMII / RGMII_RXID phy modes. */
 	genet_write(state, SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
 
-	/* Pi 4 DT sets phy-mode = "rgmii-rxid" — RX has an internal
-	 * delay (added by the GENET block), TX delay comes from board
-	 * PCB traces. So: RGMII_MODE_EN=1, ID_MODE_DIS=0 (internal RX
-	 * delay enabled), RGMII_LINK=1, OOB_DISABLE=0. */
+	/* Pi 4 DT sets phy-mode = "rgmii-rxid": internal RX delay enabled
+	 * (clear ID_MODE_DIS), TX delay from PCB traces.
+	 *
+	 * OOB_DISABLE must be SET: that tells the MAC to take link state
+	 * from RGMII_LINK (which we write below) instead of the out-of-band
+	 * pins from the PHY. Without this bit the MAC silently treats the
+	 * link as down and drops every received frame even though TX
+	 * (which only needs RGMII_MODE_EN) still works. This was the cause
+	 * of the Tier 3 RDMA_PROD_INDEX-stuck-at-0 symptom; matches Linux's
+	 * bcmgenet_setup_rgmii / Circle's mii_config exactly. */
 	uint32_t v = genet_read(state, EXT_RGMII_OOB_CTRL);
 
-	v |= RGMII_LINK | RGMII_MODE_EN;
-	v &= ~OOB_DISABLE;
+	v |= RGMII_LINK | RGMII_MODE_EN | OOB_DISABLE;
 	v &= ~ID_MODE_DIS;
 
 	genet_write(state, EXT_RGMII_OOB_CTRL, v);
@@ -555,6 +560,7 @@ static void genet_rxPollThread(void *arg)
 	genet_state_t *state = arg;
 	uint32_t ring_off = GENET_RX_RINGS_OFF + GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
 	unsigned ticks = 0;
+	uint32_t last_bd0_status = ~0u;
 
 	for (;;) {
 		usleep(10 * 1000);  /* 10 ms — Tier 3 polled cadence. */
@@ -562,7 +568,23 @@ static void genet_rxPollThread(void *arg)
 		uint32_t prod = genet_read(state,
 			ring_off + GENET_TDMA_RING_PROD_INDEX) & 0xFFFFu;
 
-		(void)ticks;
+		/* One-shot diagnostic: log BD[0] status word + RDMA indices once
+		 * every second for ~10 s after init, and any time BD[0].status
+		 * changes from what we last saw. If hardware is writing frames
+		 * to RAM but not bumping PROD_INDEX, we'd see the status field
+		 * change here even when prod stays at 0. */
+		uint32_t bd0 = genet_read(state, GENET_RX_DESCS_OFF + 0);
+		if (++ticks <= 1000u && (ticks % 100u) == 0u) {
+			uint32_t status = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_STATUS);
+			genet_printf(state,
+				"RDMA@%us prod=%u sw_c=%u bd0=0x%08x rdma_status=0x%08x",
+				ticks / 100u, prod, state->rx_c_index & 0xFFFFu, bd0, status);
+		}
+		else if (bd0 != last_bd0_status && bd0 != 0u) {
+			genet_printf(state, "BD[0] status changed: 0x%08x -> 0x%08x (prod=%u)",
+				last_bd0_status, bd0, prod);
+		}
+		last_bd0_status = bd0;
 
 		while (prod != (state->rx_c_index & 0xFFFFu)) {
 			uint32_t bd_off = GENET_RX_DESCS_OFF +

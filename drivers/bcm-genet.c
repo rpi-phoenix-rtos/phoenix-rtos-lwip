@@ -46,7 +46,14 @@
 #define GENET_MMIO_SIZE   0x10000u  /* 64 KiB */
 #define MDIO_TIMEOUT_US   20000u    /* xHCI MDIO max per Linux bcmmii */
 
-#define GENET_RX_SLOTS    16u       /* RX ring depth (Tier 3) */
+/*
+ * RX ring depth. Currently sized to match U-Boot's default-queue layout
+ * (full 256 BDs), but on this hardware RX still hasn't been observed to
+ * fill the ring — the bridge's unicast ARP reply to our smoke TX shows
+ * up on the wire (verified via host-side tcpdump) but RDMA_PROD_INDEX
+ * stays at 0. Open at end-of-session — TODO(TD-Eth-RX).
+ */
+#define GENET_RX_SLOTS    GENET_TOTAL_DESC
 
 
 /* Forward declaration: genet_setLinkState fires a TX smoke test via this. */
@@ -438,8 +445,11 @@ static int genet_initRxRing(genet_state_t *state)
 	genet_write(state, ring_off + GENET_TDMA_RING_READ_PTR, 0);
 	genet_write(state, ring_off + GENET_TDMA_RING_WRITE_PTR, 0);
 
-	cons = genet_read(state, ring_off + GENET_TDMA_RING_CONS_INDEX);
-	genet_write(state, ring_off + GENET_TDMA_RING_PROD_INDEX, cons);
+	/* For RX the HW is the producer; we must initialize CONS_INDEX
+	 * to whatever PROD_INDEX is so we don't see stale frames. This is
+	 * the opposite of TX, where we read CONS and align PROD. */
+	cons = genet_read(state, ring_off + GENET_TDMA_RING_PROD_INDEX);
+	genet_write(state, ring_off + GENET_TDMA_RING_CONS_INDEX, cons);
 	state->rx_c_index = cons;
 	state->rx_index = cons % GENET_RX_SLOTS;
 	state->rx_pkts_seen = 0;
@@ -483,16 +493,7 @@ static void genet_rxPollThread(void *arg)
 		uint32_t prod = genet_read(state,
 			ring_off + GENET_TDMA_RING_PROD_INDEX) & 0xFFFFu;
 
-		/* Tier 3 diagnostic: log RDMA state once per second so we can see
-		 * if the HW is filling the ring at all. Drops to debug-off in Tier 5. */
-		if ((++ticks % 100u) == 0u && ticks <= 1000u) {
-			uint32_t cfg = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG);
-			uint32_t ctrl = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL);
-			uint32_t cmd = genet_read(state, UMAC_CMD);
-			genet_printf(state,
-				"RDMA ?@%us: prod=%u sw_c=%u cfg=0x%08x ctrl=0x%08x umac_cmd=0x%08x",
-				ticks / 100u, prod, state->rx_c_index & 0xFFFFu, cfg, ctrl, cmd);
-		}
+		(void)ticks;
 
 		while (prod != (state->rx_c_index & 0xFFFFu)) {
 			uint32_t bd_off = GENET_RX_DESCS_OFF +

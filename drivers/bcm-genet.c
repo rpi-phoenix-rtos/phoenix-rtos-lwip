@@ -168,6 +168,48 @@ static void genet_writeMac(genet_state_t *state)
 }
 
 
+static void genet_dmaDisable(genet_state_t *state)
+{
+	/* Linux bcmgenet_{rdma,tdma}_disable: clear DMA_EN and the per-ring
+	 * enable bitmask in DMA_CTRL, then poll DMA_STATUS until those same
+	 * bits show as set (the status register reports "this ring stopped"
+	 * by asserting the bit, inverted from the CTRL register meaning).
+	 *
+	 * The bootloader's "GENET STOP: 0" leaves the block in a state that
+	 * we have to walk through before initializing fresh — without this,
+	 * RX_EN appears to be set but the data path silently drops frames. */
+	uint32_t ring_mask = (1u << (GENET_DEFAULT_RING + 1)) - 1u;
+	uint32_t full_mask = (ring_mask << GENET_TDMA_CTRL_RBUF_EN_LSB) |
+		GENET_TDMA_CTRL_TDMA_EN;
+	time_t now, deadline;
+
+	for (int dma = 0; dma < 2; ++dma) {
+		uint32_t base = (dma == 0) ?
+			GENET_TDMA_REGS_OFF : GENET_RDMA_REGS_OFF;
+		uint32_t reg = genet_read(state, base + GENET_TDMA_CTRL);
+		reg &= ~full_mask;
+		genet_write(state, base + GENET_TDMA_CTRL, reg);
+
+		gettime(&now, NULL);
+		deadline = now + GENET_DMA_TIMEOUT_US;
+		for (;;) {
+			uint32_t st = genet_read(state, base + GENET_TDMA_STATUS);
+			if ((st & full_mask) == full_mask) {
+				break;
+			}
+			gettime(&now, NULL);
+			if (now >= deadline) {
+				genet_printf(state,
+					"DMA disable timeout (%s base=0x%x status=0x%08x)",
+					dma == 0 ? "TDMA" : "RDMA", base, st);
+				break;
+			}
+			usleep(10);
+		}
+	}
+}
+
+
 static int genet_resetUmac(genet_state_t *state)
 {
 	/* Reset sequence matches Circle's reset_umac and FreeBSD if_genet:
@@ -459,24 +501,15 @@ static int genet_initRxRing(genet_state_t *state)
 	genet_write(state, ring_off + GENET_TDMA_RING_MBUF_DONE, 1);
 	genet_write(state, ring_off + GENET_TDMA_RING_FLOW_PERIOD, 0);
 
-	cfg = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG);
-	cfg |= 1u << GENET_DEFAULT_RING;
-	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG, cfg);
-
-	ctrl = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL);
-	ctrl |= GENET_TDMA_CTRL_TDMA_EN |
-		(1u << (GENET_TDMA_CTRL_RBUF_EN_LSB + GENET_DEFAULT_RING));
-	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL, ctrl);
-
-	/* RBUF needs to be in pass-through state for RDMA to see frames.
-	 * Reading the actual Linux init_umac sequence revealed two bits we
-	 * were missing — without them RDMA_PROD_INDEX silently stays at 0:
-	 *   - RBUF_CTRL.RBUF_64B_EN (bit 0): enable the 64-byte burst path
-	 *     between UMAC and RDMA. Linux sets this in addition to ALIGN_2B.
+	/* RBUF pass-through bits — must be set BEFORE we flip DMA enable.
+	 * Linux's init_umac does the RBUF programming up-front and only later
+	 * flips the DMA_EN bits in DMA_CTRL.
+	 *   - RBUF_CTRL.RBUF_64B_EN  (bit 0): 64B burst path UMAC -> RDMA
+	 *   - RBUF_CTRL.RBUF_ALIGN_2B (bit 1): L3 header 4-byte aligned
 	 *   - RBUF_CHK_CTRL.RBUF_RXCHK_EN + RBUF_L3_PARSE_DIS: turn on the
-	 *     RX checker block in pass-through-L3 mode. Required for v3+.
-	 * RBUF_TBUF_SIZE_CTRL = 1 is the V3+ init step Linux gates with
-	 * !GENET_IS_V1 && !GENET_IS_V2 — we're v5 so it applies. */
+	 *     RX checker, skip L3 inspection (we don't offload checksums)
+	 *   - RBUF_TBUF_SIZE_CTRL=1 is the v3+ init step
+	 */
 	uint32_t rbuf = genet_read(state, RBUF_CTRL);
 	rbuf |= RBUF_ALIGN_2B | RBUF_64B_EN;
 	genet_write(state, RBUF_CTRL, rbuf);
@@ -486,6 +519,23 @@ static int genet_initRxRing(genet_state_t *state)
 	genet_write(state, RBUF_CHK_CTRL, chk);
 
 	genet_write(state, RBUF_TBUF_SIZE_CTRL, 1);
+
+	/* Now the Linux-style two-phase DMA enable:
+	 *   1. RDMA_RING_CFG: per-ring enable bitmap (ring 16 only).
+	 *   2. DMA_CTRL: ring-default-queue enable bit, NO DMA_EN yet.
+	 *   3. DMA_CTRL: |= DMA_EN — flip the global DMA gate last.
+	 * Doing it in three steps matches the Linux init order and avoids
+	 * an early DMA fetch from an unfinished ring config. */
+	cfg = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG);
+	cfg |= 1u << GENET_DEFAULT_RING;
+	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG, cfg);
+
+	ctrl = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL);
+	ctrl |= 1u << (GENET_TDMA_CTRL_RBUF_EN_LSB + GENET_DEFAULT_RING);
+	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL, ctrl);
+
+	ctrl |= GENET_TDMA_CTRL_TDMA_EN;
+	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL, ctrl);
 
 	return 0;
 }
@@ -811,6 +861,12 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	genet_printf(state, "MAC %02x:%02x:%02x:%02x:%02x:%02x",
 		state->mac[0], state->mac[1], state->mac[2],
 		state->mac[3], state->mac[4], state->mac[5]);
+
+	/* Quiesce any leftover DMA from the bootloader BEFORE the UMAC reset.
+	 * Linux's bcmgenet_open does this in init_dma -> bcmgenet_{rdma,tdma}
+	 * _disable; the bootloader's "GENET STOP: 0" message before kernel
+	 * handoff doesn't run the same handshake. */
+	genet_dmaDisable(state);
 
 	err = genet_resetUmac(state);
 	if (err < 0) {

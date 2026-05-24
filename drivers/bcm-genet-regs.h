@@ -54,6 +54,14 @@
 #define SYS_RBUF_FLUSH_CTRL  (GENET_SYS_OFF + 0x08u)
 #define SYS_TBUF_FLUSH_CTRL  (GENET_SYS_OFF + 0x0Cu)
 
+/* SYS_PORT_CTRL: selects which physical interface the MAC drives.
+ * Pi 4 uses an external Broadcom GPHY via RGMII. */
+#define PORT_MODE_INT_EPHY   0x00u
+#define PORT_MODE_INT_GPHY   0x01u
+#define PORT_MODE_EXT_EPHY   0x02u
+#define PORT_MODE_EXT_GPHY   0x03u
+#define PORT_MODE_EXT_RVMII  0x04u
+
 /* SYS_REV_CTRL bit fields: GENET v5 reports major=6 in bits 24..27
  * (the silicon-IP increment counter); we accept either v5 or v6 by
  * masking. See Circle and Linux bcmgenet_check_rev. */
@@ -87,6 +95,19 @@
 #define EXT_CFG_IDDQ_BIAS    (1u << 0)
 #define EXT_CFG_PWR_DOWN     (1u << 1)
 #define EXT_ENERGY_DET_MASK  (0xFu << 12)
+
+
+/* --- RBUF block (0x0300 + ...) ---------------------------------- */
+/*
+ * Receive buffer interface — sits between UMAC and RDMA. Linux/U-Boot
+ * touch RBUF_CTRL.ALIGN_2B (so the L3 header lands 4-byte-aligned) and
+ * write 1 to RBUF_TBUF_SIZE_CTRL during DMA init.
+ */
+#define RBUF_CTRL            (GENET_RBUF_OFF + 0x00u)
+#define RBUF_TBUF_SIZE_CTRL  (GENET_RBUF_OFF + 0xB4u)
+
+#define RBUF_64B_EN          (1u << 0)
+#define RBUF_ALIGN_2B        (1u << 1)
 
 
 /* --- UMAC block (0x0800 + ...) ---------------------------------- */
@@ -186,6 +207,11 @@
 #define GENET_TX_DESCS_OFF   GENET_TDMA_OFF                    /* 0x4000 */
 #define GENET_TX_RINGS_OFF   (GENET_TX_DESCS_OFF + GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE) /* 0x4C00 */
 #define GENET_TDMA_REGS_OFF  (GENET_TX_RINGS_OFF + GENET_DMA_RINGS_SIZE)  /* 0x5040 */
+
+/* RDMA mirrors TDMA's layout one MMIO block lower. */
+#define GENET_RX_DESCS_OFF   GENET_RDMA_OFF                    /* 0x2000 */
+#define GENET_RX_RINGS_OFF   (GENET_RX_DESCS_OFF + GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE) /* 0x2C00 */
+#define GENET_RDMA_REGS_OFF  (GENET_RX_RINGS_OFF + GENET_DMA_RINGS_SIZE)  /* 0x3040 */
 
 /* Per-TX-ring control register offsets within the ring's 0x40 slice. */
 #define GENET_TDMA_RING_READ_PTR    0x00u

@@ -46,6 +46,8 @@
 #define GENET_MMIO_SIZE   0x10000u  /* 64 KiB */
 #define MDIO_TIMEOUT_US   20000u    /* xHCI MDIO max per Linux bcmmii */
 
+#define GENET_RX_SLOTS    16u       /* RX ring depth (Tier 3) */
+
 
 /* Forward declaration: genet_setLinkState fires a TX smoke test via this. */
 static err_t genet_linkOutput(struct netif *netif, struct pbuf *p);
@@ -76,6 +78,16 @@ typedef struct {
 	uint32_t tx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
 	uint32_t tx_prod_index;  /* 16-bit running counter the HW compares to CONS_INDEX */
 	int tx_smoke_test_done;
+
+	/* RX (Tier 3): per-slot buffers + polling thread. The BD's address
+	 * is programmed once at init — HW writes received frames into the
+	 * same physical buffer each time the BD comes back around. */
+	void *rx_bufs[GENET_RX_SLOTS];
+	addr_t rx_bufs_phys[GENET_RX_SLOTS];
+	uint32_t rx_index;       /* 0..GENET_RX_SLOTS-1 — BD index in MMIO */
+	uint32_t rx_c_index;     /* SW's view, mirrors RDMA_RING_CONS_INDEX */
+	unsigned long rx_pkts_seen;
+	uint32_t rx_poll_stack[2048] __attribute__((aligned(16)));
 } genet_state_t;
 
 
@@ -288,6 +300,13 @@ static void genet_phyHardReset(genet_state_t *state)
 
 static void genet_configRgmii(genet_state_t *state)
 {
+	/* GENET defaults SYS_PORT_CTRL to internal-EPHY (0) — it never
+	 * routes data to the external BCM54213PE until we change it. This
+	 * is the missing piece behind the Tier 3 "TX completes but tcpdump
+	 * sees nothing" symptom. U-Boot's bcmgenet_interface_set does the
+	 * same write for RGMII / RGMII_RXID phy modes. */
+	genet_write(state, SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
+
 	/* Pi 4 DT sets phy-mode = "rgmii-rxid" — RX has an internal
 	 * delay (added by the GENET block), TX delay comes from board
 	 * PCB traces. So: RGMII_MODE_EN=1, ID_MODE_DIS=0 (internal RX
@@ -369,11 +388,144 @@ static void genet_macSetSpeed(genet_state_t *state, int speed, int full_duplex)
 		cmd |= CMD_HD_EN;
 	}
 
-	/* TX_EN here, RX_EN lands in Tier 3. */
-	cmd |= CMD_TX_EN;
+	cmd |= CMD_TX_EN | CMD_RX_EN;
+
+	/* TODO(TD-Eth-Promisc): drop once Tier 4 uses the real MAC and
+	 * proves the unicast filter doesn't drop ARP replies. PROMISC keeps
+	 * the diagnostic surface minimal while we validate Tier 3 RX. */
+	cmd |= CMD_PROMISC;
 
 	genet_write(state, UMAC_CMD, cmd);
 }
+
+
+/* --- RX ring + polling thread (Tier 3) ------------------------- */
+
+static int genet_initRxRing(genet_state_t *state)
+{
+	uint32_t ring_off = GENET_RX_RINGS_OFF + GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
+	uint32_t bd_off, cons, cfg, ctrl;
+	unsigned i;
+
+	/* Allocate the RX buffer pool and program each BD with its address.
+	 * The BD addresses are written once and never touched again — the
+	 * hardware writes received frames into the same physical buffer
+	 * each time the BD cycles past. We just read the status word per
+	 * arrival to learn the per-frame length and flags. */
+	for (i = 0; i < GENET_RX_SLOTS; ++i) {
+		state->rx_bufs[i] = dmammap(GENET_MAX_FRAME);
+		if (state->rx_bufs[i] == NULL) {
+			genet_printf(state, "dmammap RX slot %u failed", i);
+			return -ENOMEM;
+		}
+		state->rx_bufs_phys[i] = va2pa(state->rx_bufs[i]);
+
+		bd_off = GENET_RX_DESCS_OFF + i * GENET_DMA_DESC_SIZE;
+		genet_write(state, bd_off + 4, (uint32_t)(state->rx_bufs_phys[i] & 0xFFFFFFFFu));
+		genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->rx_bufs_phys[i] >> 32));
+		genet_write(state, bd_off + 0, 0);
+	}
+
+	/* Same burst size convention as TDMA. */
+	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_SCB_BURST_SIZE,
+		GENET_DMA_DEFAULT_BURST);
+
+	/* Per-ring 16 setup. end_addr is in 32-bit words, covering only the
+	 * portion of the BD area this small ring uses. */
+	genet_write(state, ring_off + GENET_TDMA_RING_START_ADDR, 0);
+	genet_write(state, ring_off + GENET_TDMA_RING_END_ADDR,
+		(GENET_RX_SLOTS * GENET_DMA_DESC_SIZE / 4u) - 1u);
+	genet_write(state, ring_off + GENET_TDMA_RING_READ_PTR, 0);
+	genet_write(state, ring_off + GENET_TDMA_RING_WRITE_PTR, 0);
+
+	cons = genet_read(state, ring_off + GENET_TDMA_RING_CONS_INDEX);
+	genet_write(state, ring_off + GENET_TDMA_RING_PROD_INDEX, cons);
+	state->rx_c_index = cons;
+	state->rx_index = cons % GENET_RX_SLOTS;
+	state->rx_pkts_seen = 0;
+
+	genet_write(state, ring_off + GENET_TDMA_RING_BUF_SIZE,
+		(GENET_RX_SLOTS << 16) | (GENET_MAX_FRAME & 0xFFFFu));
+	genet_write(state, ring_off + GENET_TDMA_RING_MBUF_DONE, 1);
+	genet_write(state, ring_off + GENET_TDMA_RING_FLOW_PERIOD, 0);
+
+	cfg = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG);
+	cfg |= 1u << GENET_DEFAULT_RING;
+	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG, cfg);
+
+	ctrl = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL);
+	ctrl |= GENET_TDMA_CTRL_TDMA_EN |
+		(1u << (GENET_TDMA_CTRL_RBUF_EN_LSB + GENET_DEFAULT_RING));
+	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL, ctrl);
+
+	/* RBUF needs to be in pass-through state for RDMA to see frames.
+	 * Linux/U-Boot set RBUF_ALIGN_2B (so L3 hdr is 4-byte aligned) and
+	 * write 1 to RBUF_TBUF_SIZE_CTRL during DMA init. Without this
+	 * the RDMA producer index never advances. */
+	uint32_t rbuf = genet_read(state, RBUF_CTRL);
+	rbuf |= RBUF_ALIGN_2B;
+	genet_write(state, RBUF_CTRL, rbuf);
+	genet_write(state, RBUF_TBUF_SIZE_CTRL, 1);
+
+	return 0;
+}
+
+
+static void genet_rxPollThread(void *arg)
+{
+	genet_state_t *state = arg;
+	uint32_t ring_off = GENET_RX_RINGS_OFF + GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
+	unsigned ticks = 0;
+
+	for (;;) {
+		usleep(10 * 1000);  /* 10 ms — Tier 3 polled cadence. */
+
+		uint32_t prod = genet_read(state,
+			ring_off + GENET_TDMA_RING_PROD_INDEX) & 0xFFFFu;
+
+		/* Tier 3 diagnostic: log RDMA state once per second so we can see
+		 * if the HW is filling the ring at all. Drops to debug-off in Tier 5. */
+		if ((++ticks % 100u) == 0u && ticks <= 1000u) {
+			uint32_t cfg = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_RING_CFG);
+			uint32_t ctrl = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL);
+			uint32_t cmd = genet_read(state, UMAC_CMD);
+			genet_printf(state,
+				"RDMA ?@%us: prod=%u sw_c=%u cfg=0x%08x ctrl=0x%08x umac_cmd=0x%08x",
+				ticks / 100u, prod, state->rx_c_index & 0xFFFFu, cfg, ctrl, cmd);
+		}
+
+		while (prod != (state->rx_c_index & 0xFFFFu)) {
+			uint32_t bd_off = GENET_RX_DESCS_OFF +
+				state->rx_index * GENET_DMA_DESC_SIZE;
+			uint32_t status = genet_read(state, bd_off + 0);
+			uint16_t len = (uint16_t)((status & BD_LEN_MASK) >> BD_LEN_SHIFT);
+
+			/* Tier 3 deliverable: confirm RX frames arrive. Log the
+			 * first 4 frames with header bytes so we can verify dst/src
+			 * MAC + ethertype against the netboot bridge's traffic. */
+			if (state->rx_pkts_seen < 4) {
+				uint8_t *buf = state->rx_bufs[state->rx_index];
+				genet_printf(state,
+					"RX[%u] %u B st=0x%08x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%02x%02x",
+					state->rx_index, len, status,
+					buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+					buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+					buf[12], buf[13]);
+			}
+			state->rx_pkts_seen++;
+
+			state->rx_index = (state->rx_index + 1u) % GENET_RX_SLOTS;
+			state->rx_c_index = (state->rx_c_index + 1u) & 0xFFFFu;
+		}
+
+		/* Hand all consumed BDs back to HW in one shot. */
+		genet_write(state, ring_off + GENET_TDMA_RING_CONS_INDEX,
+			state->rx_c_index);
+	}
+}
+
+
+/* --- Link-state callback ---------------------------------------- */
 
 
 /* --- Link-state callback ---------------------------------------- */
@@ -428,12 +580,12 @@ static void genet_setLinkState(void *arg, int state_up)
 			0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
 			/* SHA — filled below */
 			0, 0, 0, 0, 0, 0,
-			/* SPA: 169.254.27.235 (link-local self) */
-			169, 254, 27, 235,
+			/* SPA: 10.42.0.42 (a free address in the netboot bridge subnet) */
+			10, 42, 0, 42,
 			/* THA: zeros */
 			0, 0, 0, 0, 0, 0,
-			/* TPA: 169.254.27.235 (gratuitous: who-has-self) */
-			169, 254, 27, 235,
+			/* TPA: 10.42.0.1 (netboot bridge gateway — guaranteed reply) */
+			10, 42, 0, 1,
 			/* padding to 60 bytes — minimum Ethernet frame */
 			0
 		};
@@ -506,8 +658,13 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	genet_write(state, bd_off + 4, (uint32_t)(state->tx_buf_phys & 0xFFFFFFFFu));
 	genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->tx_buf_phys >> 32));
 
+	/* Length+flags only. Neither Linux nor U-Boot's bcmgenet_xmit sets the
+	 * DMA_OWN bit on TX; the producer-index write below is what hands the
+	 * descriptor to hardware. Setting OWN here previously kept TDMA from
+	 * actually pushing the frame onto the wire (the descriptor was consumed
+	 * via cons_index but the MAC never transmitted it). */
 	status = ((uint32_t)len << BD_LEN_SHIFT) |
-		BD_STATUS_SOP | BD_STATUS_EOP | BD_STATUS_OWN | BD_STATUS_TX_CRC;
+		BD_STATUS_SOP | BD_STATUS_EOP | BD_STATUS_TX_CRC;
 	genet_write(state, bd_off + 0, status);
 
 	/* Advance the ring tail. The 16-bit prod_index wraps at 0x10000; the
@@ -652,6 +809,12 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	/* Restore MAC after reset. */
 	genet_writeMac(state);
 
+	/* UMAC needs to know the largest frame it'll accept. Without this the
+	 * RX path drops every packet silently (the reset clears the field to 0).
+	 * 1536 = ENET_MAX_MTU_SIZE in Linux: covers 1500-byte payloads + Ethernet
+	 * header + VLAN tag + FCS with margin. */
+	genet_write(state, UMAC_MAX_FRAME_LEN, 1536);
+
 	/* Copy MAC into netif so lwIP can use it. */
 	memcpy(netif->hwaddr, state->mac, 6);
 	netif->hwaddr_len = 6;
@@ -693,6 +856,21 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	genet_initTxRing(state);
 	genet_printf(state, "TX ring 16 ready (BD %u..%u, buf %p phys=0x%08x)",
 		0u, GENET_TOTAL_DESC - 1u, state->tx_buf, (unsigned)state->tx_buf_phys);
+
+	/* Tier 3: RX pool + ring + polling thread. */
+	err = genet_initRxRing(state);
+	if (err < 0) {
+		return err;
+	}
+	genet_printf(state, "RX ring 16 ready (%u slots, BD 0..%u)",
+		GENET_RX_SLOTS, GENET_RX_SLOTS - 1u);
+
+	err = beginthread(genet_rxPollThread, 4, state->rx_poll_stack,
+		sizeof(state->rx_poll_stack), state);
+	if (err != 0) {
+		genet_printf(state, "rx poll thread failed: %d", err);
+		return err;
+	}
 
 	/* ephy_init queries the PHY once. With irq:MAC there's no IRQ thread,
 	 * so we spin up our own 1 Hz poller that calls back into genet_setLinkState

@@ -469,12 +469,22 @@ static int genet_initRxRing(genet_state_t *state)
 	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_CTRL, ctrl);
 
 	/* RBUF needs to be in pass-through state for RDMA to see frames.
-	 * Linux/U-Boot set RBUF_ALIGN_2B (so L3 hdr is 4-byte aligned) and
-	 * write 1 to RBUF_TBUF_SIZE_CTRL during DMA init. Without this
-	 * the RDMA producer index never advances. */
+	 * Reading the actual Linux init_umac sequence revealed two bits we
+	 * were missing — without them RDMA_PROD_INDEX silently stays at 0:
+	 *   - RBUF_CTRL.RBUF_64B_EN (bit 0): enable the 64-byte burst path
+	 *     between UMAC and RDMA. Linux sets this in addition to ALIGN_2B.
+	 *   - RBUF_CHK_CTRL.RBUF_RXCHK_EN + RBUF_L3_PARSE_DIS: turn on the
+	 *     RX checker block in pass-through-L3 mode. Required for v3+.
+	 * RBUF_TBUF_SIZE_CTRL = 1 is the V3+ init step Linux gates with
+	 * !GENET_IS_V1 && !GENET_IS_V2 — we're v5 so it applies. */
 	uint32_t rbuf = genet_read(state, RBUF_CTRL);
-	rbuf |= RBUF_ALIGN_2B;
+	rbuf |= RBUF_ALIGN_2B | RBUF_64B_EN;
 	genet_write(state, RBUF_CTRL, rbuf);
+
+	uint32_t chk = genet_read(state, RBUF_CHK_CTRL);
+	chk |= RBUF_RXCHK_EN | RBUF_L3_PARSE_DIS;
+	genet_write(state, RBUF_CHK_CTRL, chk);
+
 	genet_write(state, RBUF_TBUF_SIZE_CTRL, 1);
 
 	return 0;

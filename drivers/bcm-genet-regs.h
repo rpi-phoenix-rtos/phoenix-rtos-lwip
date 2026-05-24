@@ -104,10 +104,20 @@
  * write 1 to RBUF_TBUF_SIZE_CTRL during DMA init.
  */
 #define RBUF_CTRL            (GENET_RBUF_OFF + 0x00u)
+#define RBUF_CHK_CTRL        (GENET_RBUF_OFF + 0x14u)
 #define RBUF_TBUF_SIZE_CTRL  (GENET_RBUF_OFF + 0xB4u)
 
+/* RBUF_CTRL */
 #define RBUF_64B_EN          (1u << 0)
 #define RBUF_ALIGN_2B        (1u << 1)
+
+/* RBUF_CHK_CTRL — Linux always sets RXCHK_EN + L3_PARSE_DIS. The Linux v5
+ * init_umac is the only public source that documents these as required;
+ * U-Boot and Circle either omit or never re-read RBUF, which masked the
+ * dependency on these bits. */
+#define RBUF_RXCHK_EN        (1u << 0)
+#define RBUF_SKIP_FCS        (1u << 4)
+#define RBUF_L3_PARSE_DIS    (1u << 5)
 
 
 /* --- UMAC block (0x0800 + ...) ---------------------------------- */

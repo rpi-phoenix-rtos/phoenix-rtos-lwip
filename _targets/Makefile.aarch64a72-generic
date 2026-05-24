@@ -1,0 +1,21 @@
+#
+# Makefile for Phoenix-RTOS 3 LwIP
+#
+# Raspberry Pi 4-B / BCM2711 / Cortex-A72 target
+#
+# Driver list: GENET (built-in 1 GbE) + tuntap. WiFi (BCM43455) is
+# parked; ports for it would require an SDIO host driver first.
+#
+# Copyright 2026 Phoenix Systems
+#
+
+NET_DRIVERS_SUPPORTED := genet tuntap
+NET_DRIVERS ?= $(NET_DRIVERS_SUPPORTED)
+
+# ephy.c references gpio_set/gpio_init for the per-PHY reset/IRQ pin
+# wiring. The Pi 4 routes the PHY hard-reset through GENET's
+# EXT_GPHY_RESET register (driven inside bcm-genet.c), and the PHY
+# link IRQ is not yet wired in Tier 1, so we link null-gpio.c — its
+# stubs return -ENOSYS while gpio_valid() reports the pin as uninitialised,
+# which makes ephy.c skip the GPIO-based reset and IRQ paths cleanly.
+DRIVERS_SRCS_genet = bcm-genet.c ephy.c null-gpio.c $(DRIVERS_SRCS_UTIL)

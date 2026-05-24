@@ -1,0 +1,177 @@
+/*
+ * Phoenix-RTOS --- LwIP port
+ *
+ * BCM2711 GENET v5 register map (Pi 4)
+ *
+ * Copyright 2026 Phoenix Systems
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Block layout in the 64 KiB GENET MMIO window:
+ *   0x0000  SYS         system / revision / flush
+ *   0x0040  GR_BRIDGE   global bridge control
+ *   0x0080  EXT         external (PHY reset, RGMII OOB, EEE)
+ *   0x0200  INTRL2_0    interrupt level-2 set 0 (general / RX-dflt / TX-dflt)
+ *   0x0240  INTRL2_1    interrupt level-2 set 1 (priority rings)
+ *   0x0300  RBUF        RX buffer / packet filters
+ *   0x0800  UMAC        UMAC (Unified MAC) — incl. CMD, MAC0/1
+ *   0x0E14  UMAC_MDIO   MDIO command register (single-word interface on v5)
+ *   0x2000  RDMA        RX DMA registers
+ *   0x4000  TDMA        TX DMA registers
+ *   0xFC00  HFB         hardware filter blocks
+ *
+ * All offsets in bytes from the GENET MMIO base.
+ *
+ * Pi 4 / BCM2711: GENET sits at ARM-side phys 0xFD580000, size 64 KiB.
+ * Two SPIs: 189 (general) + 190 (ring); both level-high.
+ *
+ * Tier 1 needs only SYS, EXT, UMAC, and UMAC_MDIO. The rest are
+ * declared here so subsequent tiers don't need to extend this header.
+ */
+#ifndef PHOENIX_BCM_GENET_REGS_H_
+#define PHOENIX_BCM_GENET_REGS_H_
+
+#include <stdint.h>
+
+
+/* Block bases within the GENET window. */
+#define GENET_SYS_OFF        0x0000u
+#define GENET_GR_BRIDGE_OFF  0x0040u
+#define GENET_EXT_OFF        0x0080u
+#define GENET_INTRL2_0_OFF   0x0200u
+#define GENET_INTRL2_1_OFF   0x0240u
+#define GENET_RBUF_OFF       0x0300u
+#define GENET_UMAC_OFF       0x0800u
+#define GENET_RDMA_OFF       0x2000u
+#define GENET_TDMA_OFF       0x4000u
+#define GENET_HFB_REGS_OFF   0xFC00u
+
+
+/* --- SYS block (0x0000 + ...) ----------------------------------- */
+
+#define SYS_REV_CTRL         (GENET_SYS_OFF + 0x00u)
+#define SYS_PORT_CTRL        (GENET_SYS_OFF + 0x04u)
+#define SYS_RBUF_FLUSH_CTRL  (GENET_SYS_OFF + 0x08u)
+#define SYS_TBUF_FLUSH_CTRL  (GENET_SYS_OFF + 0x0Cu)
+
+/* SYS_REV_CTRL bit fields: GENET v5 reports major=6 in bits 24..27
+ * (the silicon-IP increment counter); we accept either v5 or v6 by
+ * masking. See Circle and Linux bcmgenet_check_rev. */
+#define SYS_REV_CTRL_MAJOR_MASK   0x0F000000u
+#define SYS_REV_CTRL_MAJOR_SHIFT  24
+#define SYS_REV_CTRL_MINOR_MASK   0x00F00000u
+#define SYS_REV_CTRL_MINOR_SHIFT  20
+
+/* SYS_RBUF_FLUSH_CTRL / SYS_TBUF_FLUSH_CTRL: bit 1 = reset the RX/TX
+ * datapath FIFOs. Used during reset_umac. */
+#define SYS_BUF_FLUSH_RESET  (1u << 1)
+
+
+/* --- EXT block (0x0080 + ...) ----------------------------------- */
+
+#define EXT_EXT_PWR_MGMT     (GENET_EXT_OFF + 0x00u)
+#define EXT_RGMII_OOB_CTRL   (GENET_EXT_OFF + 0x0Cu)
+#define EXT_GPHY_CTRL        (GENET_EXT_OFF + 0x1Cu)
+
+/* EXT_RGMII_OOB_CTRL bits used during PHY bring-up. */
+#define RGMII_LINK           (1u << 4)
+#define OOB_DISABLE          (1u << 5)
+#define RGMII_MODE_EN        (1u << 6)  /* "RGMII mode enable" — required for RGMII */
+#define ID_MODE_DIS          (1u << 16) /* "internal delay mode disable" */
+
+/* EXT_GPHY_CTRL bits used to hard-reset the integrated/external PHY.
+ * Pi 4 has an external BCM54213PE — the EXT_GPHY_RESET strobe still
+ * routes a GPIO reset to the PHY through the GENET block. */
+#define EXT_GPHY_RESET       (1u << 5)
+#define EXT_CK25_DIS         (1u << 4)
+#define EXT_CFG_IDDQ_BIAS    (1u << 0)
+#define EXT_CFG_PWR_DOWN     (1u << 1)
+#define EXT_ENERGY_DET_MASK  (0xFu << 12)
+
+
+/* --- UMAC block (0x0800 + ...) ---------------------------------- */
+
+#define UMAC_HD_BKP_CTRL     (GENET_UMAC_OFF + 0x004u)
+#define UMAC_CMD             (GENET_UMAC_OFF + 0x008u)
+#define UMAC_MAC0            (GENET_UMAC_OFF + 0x00Cu)
+#define UMAC_MAC1            (GENET_UMAC_OFF + 0x010u)
+#define UMAC_MAX_FRAME_LEN   (GENET_UMAC_OFF + 0x014u)
+#define UMAC_TX_FLUSH        (GENET_UMAC_OFF + 0x334u)
+#define UMAC_MIB_START       (GENET_UMAC_OFF + 0x400u)
+
+/* UMAC_CMD bit fields — common across GENETv4/v5. */
+#define CMD_TX_EN            (1u << 0)
+#define CMD_RX_EN            (1u << 1)
+#define CMD_SPEED_SHIFT      2
+#define CMD_SPEED_MASK       (3u << CMD_SPEED_SHIFT)
+#define CMD_SPEED_10         (0u << CMD_SPEED_SHIFT)
+#define CMD_SPEED_100        (1u << CMD_SPEED_SHIFT)
+#define CMD_SPEED_1000       (2u << CMD_SPEED_SHIFT)
+#define CMD_PROMISC          (1u << 4)
+#define CMD_PAD_EN           (1u << 5)
+#define CMD_CRC_FWD          (1u << 6)
+#define CMD_PAUSE_FWD        (1u << 7)
+#define CMD_RX_PAUSE_IGNORE  (1u << 8)
+#define CMD_TX_ADDR_INS      (1u << 9)
+#define CMD_HD_EN            (1u << 10) /* half-duplex */
+#define CMD_SW_RESET         (1u << 13)
+#define CMD_LCL_LOOP_EN      (1u << 15)
+#define CMD_AUTO_CONFIG      (1u << 22)
+#define CMD_CNTL_FRM_EN      (1u << 23)
+#define CMD_NO_LEN_CHK       (1u << 24)
+#define CMD_RMT_LOOP_EN      (1u << 25)
+#define CMD_PRBL_EN          (1u << 27)
+#define CMD_TX_PAUSE_IGNORE  (1u << 28)
+#define CMD_TX_RX_EN_CFG     (1u << 29)
+#define CMD_LCL_LOOP_EN_M    (1u << 31)
+
+
+/* --- MDIO (absolute offset 0x0E14, single-register interface) --- */
+
+#define UMAC_MDIO_CMD        0x0E14u
+
+#define MDIO_DATA_MASK       0x0000FFFFu  /* read result is in bits 0..15 */
+#define MDIO_REG_SHIFT       16            /* phy register (5 bits) */
+#define MDIO_REG_MASK        (0x1Fu << MDIO_REG_SHIFT)
+#define MDIO_PMD_SHIFT       21            /* phy MDIO address (5 bits) */
+#define MDIO_PMD_MASK        (0x1Fu << MDIO_PMD_SHIFT)
+#define MDIO_CMD_WR          (1u << 26)
+#define MDIO_CMD_RD          (1u << 27)
+#define MDIO_FAIL            (1u << 28)
+#define MDIO_READ_FAILED     (1u << 29)
+#define MDIO_START_BUSY      (1u << 29)   /* alias on GENETv5: bit 29 is
+                                            "start/busy"; controller clears
+                                            when MDIO transaction completes.
+                                            (Some references use bit 30 — to
+                                            be confirmed against hardware in
+                                            Tier 1.) */
+
+
+/* --- INTRL2_0 / INTRL2_1 (0x0200 / 0x0240 + ...) --------------- */
+/* Tier 1 doesn't enable IRQs; declarations here for later. */
+
+#define INTRL2_CPU_STAT      0x00u
+#define INTRL2_CPU_SET       0x04u
+#define INTRL2_CPU_CLEAR     0x08u
+#define INTRL2_CPU_MASK_STAT 0x0Cu
+#define INTRL2_CPU_MASK_SET  0x10u
+#define INTRL2_CPU_MASK_CLEAR 0x14u
+
+/* INTRL2_0 sources we'll care about in Tier 4+ */
+#define INTRL2_0_RX_DMA_DONE (1u << 13)
+#define INTRL2_0_TX_DMA_DONE (1u << 16)
+#define INTRL2_0_LINK_UP     (1u << 4)
+#define INTRL2_0_LINK_DOWN   (1u << 5)
+
+
+/* --- DMA constants (Tier 2+) ----------------------------------- */
+
+#define GENET_TOTAL_DESC     256u
+#define GENET_DEFAULT_RING   16u   /* default queue index in the BD table */
+#define GENET_WORDS_PER_BD   3u    /* address-lo, addr-hi/length, status */
+
+#define GENET_MAX_FRAME      2048u /* per-buffer slot size */
+#define GENET_BUF_ALIGN      32u   /* skb alignment from Linux SKB_ALIGNMENT */
+
+
+#endif /* PHOENIX_BCM_GENET_REGS_H_ */

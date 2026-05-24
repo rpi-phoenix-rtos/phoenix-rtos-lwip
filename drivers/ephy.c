@@ -137,6 +137,14 @@ enum {
 	EPHY_88E1111_13_ISR,          /* Interrupt Status */
 };
 
+/* BCM54213PE-specific registers (GbE PHY on Raspberry Pi 4-B).
+ * The Auxiliary Status Summary at reg 0x19 directly reports the
+ * negotiated HCD speed/duplex once AN completes, which is the cheapest
+ * way to read the link state without parsing AN advertisement masks. */
+enum {
+	EPHY_BCM54213_19_AUXSTAT = 0x19,
+};
+
 
 #define ephy_printf(phy, fmt, ...) printf("lwip: ephy%u.%u: " fmt "\n", phy->bus, phy->addr, ##__VA_ARGS__)
 
@@ -279,6 +287,7 @@ static void ephy_setLinkState(const eth_phy_state_t *phy)
 		case ephy_ksz9031mnx:
 		case ephy_dp83867is:
 		case ephy_rtl8201fi:
+		case ephy_bcm54213pe:
 			ephy_printf(phy, "link is %s %uMbps/%s (ctl %04x, status %04x, adv %04x, lpa %04x)",
 					(linkup != 0) ? "UP  " : "DOWN", speed, (full_duplex != 0) ? "Full" : "Half", bctl, bstat, adv, lpa);
 			break;
@@ -409,6 +418,42 @@ static inline int ephy_rtl8211fdi_linkSpeed(const eth_phy_state_t *phy, int *ful
 }
 
 
+static inline int ephy_bcm54213pe_linkSpeed(const eth_phy_state_t *phy, int *full_duplex)
+{
+	/* Read BMSR twice: bit 5 (Auto-Neg Complete) latches low on transitions
+	 * so we want the steady-state value. Pre-AN we just report 0. */
+	(void)ephy_regRead(phy, EPHY_COMMON_01_BMSR);
+	uint16_t bmsr = ephy_regRead(phy, EPHY_COMMON_01_BMSR);
+
+	if ((bmsr & (1U << 5)) == 0) {
+		return 0;
+	}
+
+	/* AUXSTAT bits 10:8 = HCD (highest common denominator) per BCM5421x
+	 * programming notes:
+	 *   001 = 10BASE-T half-duplex
+	 *   010 = 10BASE-T full-duplex
+	 *   011 = 100BASE-TX half-duplex
+	 *   101 = 100BASE-TX full-duplex
+	 *   110 = 1000BASE-T half-duplex
+	 *   111 = 1000BASE-T full-duplex
+	 * (100 = 100BASE-T4, no longer manufactured; ignore.) */
+	uint16_t aux = ephy_regRead(phy, EPHY_BCM54213_19_AUXSTAT);
+	unsigned hcd = (aux >> 8) & 0x7;
+
+	if (full_duplex != NULL) {
+		*full_duplex = (hcd == 2 || hcd == 5 || hcd == 7) ? 1 : 0;
+	}
+
+	switch (hcd) {
+		case 1: case 2: return 10;
+		case 3: case 5: return 100;
+		case 6: case 7: return 1000;
+		default:        return 0;
+	}
+}
+
+
 static inline int ephy_88e1111_linkSpeed(const eth_phy_state_t *phy, int *full_duplex)
 {
 	uint16_t physr = ephy_regRead(phy, EPHY_88E1111_11_PHYSR);
@@ -452,6 +497,8 @@ int ephy_linkSpeed(const eth_phy_state_t *phy, int *full_duplex)
 			return ephy_rtl8211fdi_linkSpeed(phy, full_duplex);
 		case ephy_88e1111:
 			return ephy_88e1111_linkSpeed(phy, full_duplex);
+		case ephy_bcm54213pe:
+			return ephy_bcm54213pe_linkSpeed(phy, full_duplex);
 		default:
 			/* unreachable */
 			return 0;
@@ -485,7 +532,8 @@ static void ephy_restartAN(const eth_phy_state_t *phy)
 		/* don't adv: 1000Base-T EEE (MMD write) */
 		ephy_mmdWrite(phy, 0x7, 0x3c /* EEEAR */, 0);
 	}
-	if (phy->model == ephy_ksz9031mnx || phy->model == ephy_dp83867is) {
+	if (phy->model == ephy_ksz9031mnx || phy->model == ephy_dp83867is ||
+		phy->model == ephy_bcm54213pe) {
 		/* adv: 1000M-FD */
 		ephy_regWrite(phy, EPHY_COMMON_09_GBCR, (1U << 9));
 	}
@@ -594,6 +642,9 @@ static __attribute__((unused)) char *ephy_parsePhyModel(eth_phy_state_t *phy, ch
 	}
 	else if (strcmp(cfg, "88e1111") == 0) {
 		phy->model = ephy_88e1111;
+	}
+	else if (strcmp(cfg, "bcm54213pe") == 0) {
+		phy->model = ephy_bcm54213pe;
 	}
 	else {
 		printf("lwip: ephy: unsupported PHY model: \"%s\"\n", cfg);

@@ -164,11 +164,60 @@
 #define INTRL2_0_LINK_DOWN   (1u << 5)
 
 
-/* --- DMA constants (Tier 2+) ----------------------------------- */
-
+/* --- DMA layout (Tier 2+) -------------------------------------- */
+/*
+ * GENET TDMA / RDMA MMIO map:
+ *
+ *   0x4000  TX buffer descriptors (256 × 12 B = 0xC00)
+ *   0x4C00  per-TX-ring control (17 × 0x40 = 0x440)
+ *   0x5040  global TDMA control
+ *   ...
+ *   (RX layout mirrors, starting at GENET_RDMA_OFF = 0x2000)
+ *
+ * Cross-reference: U-Boot drivers/net/bcmgenet.c, Linux bcmgenet.h.
+ * Each BD is 3 little-endian words: length+status, addr-lo, addr-hi.
+ */
+#define GENET_DMA_DESC_SIZE  12u
 #define GENET_TOTAL_DESC     256u
-#define GENET_DEFAULT_RING   16u   /* default queue index in the BD table */
-#define GENET_WORDS_PER_BD   3u    /* address-lo, addr-hi/length, status */
+#define GENET_DEFAULT_RING   16u   /* default TX queue (= DEFAULT_Q) */
+#define GENET_DMA_RING_SIZE  0x40u
+#define GENET_DMA_RINGS_SIZE (GENET_DMA_RING_SIZE * (GENET_DEFAULT_RING + 1))
+
+#define GENET_TX_DESCS_OFF   GENET_TDMA_OFF                    /* 0x4000 */
+#define GENET_TX_RINGS_OFF   (GENET_TX_DESCS_OFF + GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE) /* 0x4C00 */
+#define GENET_TDMA_REGS_OFF  (GENET_TX_RINGS_OFF + GENET_DMA_RINGS_SIZE)  /* 0x5040 */
+
+/* Per-TX-ring control register offsets within the ring's 0x40 slice. */
+#define GENET_TDMA_RING_READ_PTR    0x00u
+#define GENET_TDMA_RING_CONS_INDEX  0x08u
+#define GENET_TDMA_RING_PROD_INDEX  0x0Cu
+#define GENET_TDMA_RING_BUF_SIZE    0x10u
+#define GENET_TDMA_RING_START_ADDR  0x14u
+#define GENET_TDMA_RING_END_ADDR    0x1Cu
+#define GENET_TDMA_RING_MBUF_DONE   0x24u
+#define GENET_TDMA_RING_FLOW_PERIOD 0x28u
+#define GENET_TDMA_RING_WRITE_PTR   0x2Cu
+
+/* Global TDMA control registers. */
+#define GENET_TDMA_RING_CFG         0x00u  /* per-ring enable bitmap */
+#define GENET_TDMA_CTRL             0x04u  /* TDMA enable + default-queue */
+#define GENET_TDMA_STATUS           0x08u
+#define GENET_TDMA_SCB_BURST_SIZE   0x0Cu
+
+#define GENET_TDMA_CTRL_TDMA_EN     (1u << 0)
+#define GENET_TDMA_CTRL_RBUF_EN_LSB 1u      /* per-ring enable starts here */
+
+#define GENET_DMA_DEFAULT_BURST     0x08u   /* 8 64-bit words per burst */
+
+/* Per-BD status/length word bits (low 16 = flags, high 12 = length). */
+#define BD_LEN_SHIFT         16
+#define BD_LEN_MASK          (0xFFFu << BD_LEN_SHIFT)
+#define BD_STATUS_OWN        (1u << 15)   /* hardware owns the BD */
+#define BD_STATUS_EOP        (1u << 14)   /* end-of-packet */
+#define BD_STATUS_SOP        (1u << 13)   /* start-of-packet */
+#define BD_STATUS_WRAP       (1u << 12)   /* last BD in the ring */
+#define BD_STATUS_TX_CRC     (1u << 6)    /* auto-append FCS */
+#define BD_STATUS_TX_CSUM    (1u << 4)    /* hardware checksum */
 
 #define GENET_MAX_FRAME      2048u /* per-buffer slot size */
 #define GENET_BUF_ALIGN      32u   /* skb alignment from Linux SKB_ALIGNMENT */

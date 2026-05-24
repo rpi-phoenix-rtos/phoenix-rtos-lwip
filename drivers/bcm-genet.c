@@ -499,7 +499,16 @@ static int genet_initRxRing(genet_state_t *state)
 	genet_write(state, ring_off + GENET_TDMA_RING_BUF_SIZE,
 		(GENET_RX_SLOTS << 16) | (GENET_MAX_FRAME & 0xFFFFu));
 	genet_write(state, ring_off + GENET_TDMA_RING_MBUF_DONE, 1);
-	genet_write(state, ring_off + GENET_TDMA_RING_FLOW_PERIOD, 0);
+
+	/* RDMA shares offset 0x28 with TDMA but it's the XON/XOFF flow-control
+	 * threshold here, NOT a flow-period writer. Leaving it at 0 makes the
+	 * RX engine treat the ring as always-XOFF — RDMA_PROD_INDEX never
+	 * advances and frames silently drop. Use Linux's defaults:
+	 *   XOFF at 5 BDs remaining, XON resumes at TOTAL_DESC/16 free.
+	 * This is the bug that wedged Tier 3 RX through multiple iterations. */
+	genet_write(state, ring_off + GENET_RDMA_RING_XON_XOFF,
+		(GENET_DMA_FC_THRESH_LO << GENET_DMA_XOFF_THRESH_SHIFT) |
+		GENET_DMA_FC_THRESH_HI);
 
 	/* RBUF pass-through bits — must be set BEFORE we flip DMA enable.
 	 * Linux's init_umac does the RBUF programming up-front and only later

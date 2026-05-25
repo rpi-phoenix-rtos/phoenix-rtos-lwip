@@ -509,41 +509,28 @@ static int genet_initRxRing(genet_state_t *state)
 	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_SCB_BURST_SIZE,
 		GENET_DMA_DEFAULT_BURST);
 
-	/* END_ADDR spans the FULL 256-BD default-queue area (words 0..767)
-	 * even though we only have GENET_RX_SLOTS unique buffers — BDs are
-	 * aliased above. Matches Linux's bcmgenet_init_rx_ring layout. */
-	genet_write(state, ring_off + GENET_TDMA_RING_START_ADDR, 0);
-	genet_write(state, ring_off + GENET_TDMA_RING_END_ADDR,
+	/* END_ADDR spans the FULL 256-BD default-queue area (words 0..767).
+	 * BUF_SIZE depth must match. Matches Linux's bcmgenet_init_rx_ring. */
+	genet_write(state, ring_off + GENET_RDMA_RING_START_ADDR, 0);
+	genet_write(state, ring_off + GENET_RDMA_RING_END_ADDR,
 		(GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE / 4u) - 1u);
-	genet_write(state, ring_off + GENET_TDMA_RING_READ_PTR, 0);
-	genet_write(state, ring_off + GENET_TDMA_RING_WRITE_PTR, 0);
+	genet_write(state, ring_off + GENET_RDMA_RING_READ_PTR, 0);
+	genet_write(state, ring_off + GENET_RDMA_RING_WRITE_PTR, 0);
 
-	/* For RX the HW is the producer; we must initialize CONS_INDEX
-	 * to whatever PROD_INDEX is so we don't see stale frames. This is
-	 * the opposite of TX, where we read CONS and align PROD. */
-	cons = genet_read(state, ring_off + GENET_TDMA_RING_PROD_INDEX);
-	genet_write(state, ring_off + GENET_TDMA_RING_CONS_INDEX, cons);
+	/* RX indices are MIRRORED from TX: HW writes PROD (at 0x08),
+	 * SW writes CONS (at 0x0C). At init, sync our c_index to whatever
+	 * HW is at so we don't see stale frames. */
+	cons = genet_read(state, ring_off + GENET_RDMA_RING_PROD_INDEX);
+	genet_write(state, ring_off + GENET_RDMA_RING_CONS_INDEX, cons);
 	state->rx_c_index = cons;
-	/* rx_index tracks the HW BD position (0..GENET_TOTAL_DESC-1).
-	 * Buffer lookup uses (rx_index % GENET_RX_SLOTS) since BDs are
-	 * aliased to RX_SLOTS unique buffers. */
 	state->rx_index = cons % GENET_TOTAL_DESC;
 	state->rx_pkts_seen = 0;
 
-	/* Ring depth in BUF_SIZE must match the END_ADDR span — HW reads
-	 * both, and a mismatch was the cause of the WRAP-set-on-BD[0]
-	 * symptom. So we report the full 256-BD default-queue depth even
-	 * though only GENET_RX_SLOTS unique buffers back the ring. */
-	genet_write(state, ring_off + GENET_TDMA_RING_BUF_SIZE,
+	genet_write(state, ring_off + GENET_RDMA_RING_BUF_SIZE,
 		(GENET_TOTAL_DESC << 16) | (GENET_MAX_FRAME & 0xFFFFu));
-	genet_write(state, ring_off + GENET_TDMA_RING_MBUF_DONE, 1);
+	genet_write(state, ring_off + GENET_RDMA_RING_MBUF_DONE, 1);
 
-	/* RDMA shares offset 0x28 with TDMA but it's the XON/XOFF flow-control
-	 * threshold here, NOT a flow-period writer. Leaving it at 0 makes the
-	 * RX engine treat the ring as always-XOFF — RDMA_PROD_INDEX never
-	 * advances and frames silently drop. Use Linux's defaults:
-	 *   XOFF at 5 BDs remaining, XON resumes at TOTAL_DESC/16 free.
-	 * This is the bug that wedged Tier 3 RX through multiple iterations. */
+	/* XON/XOFF threshold — at 0 the RX engine is always-XOFF. */
 	genet_write(state, ring_off + GENET_RDMA_RING_XON_XOFF,
 		(GENET_DMA_FC_THRESH_LO << GENET_DMA_XOFF_THRESH_SHIFT) |
 		GENET_DMA_FC_THRESH_HI);
@@ -598,8 +585,10 @@ static void genet_rxPollThread(void *arg)
 	for (;;) {
 		usleep(10 * 1000);  /* 10 ms — Tier 3 polled cadence. */
 
+		/* RDMA PROD_INDEX is at offset 0x08 (NOT 0x0C, which is the
+		 * TX layout — RDMA mirrors the producer/consumer pair). */
 		uint32_t prod = genet_read(state,
-			ring_off + GENET_TDMA_RING_PROD_INDEX) & 0xFFFFu;
+			ring_off + GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu;
 
 		/* Extended diagnostic: track BD[0] and BD[1] status words plus
 		 * BD[0]'s addr fields. We've seen BD[0].status get a 0x007e7f80
@@ -651,8 +640,9 @@ static void genet_rxPollThread(void *arg)
 			state->rx_c_index = (state->rx_c_index + 1u) & 0xFFFFu;
 		}
 
-		/* Hand all consumed BDs back to HW in one shot. */
-		genet_write(state, ring_off + GENET_TDMA_RING_CONS_INDEX,
+		/* Hand all consumed BDs back to HW in one shot. RDMA CONS_INDEX
+		 * is at offset 0x0C (mirrored from TX layout). */
+		genet_write(state, ring_off + GENET_RDMA_RING_CONS_INDEX,
 			state->rx_c_index);
 	}
 }

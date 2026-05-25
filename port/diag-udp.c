@@ -1229,6 +1229,147 @@ static int diag_format_wifi(char *buf, size_t cap)
 }
 
 
+/* USB resumption probe per docs/usb-resumption-strategy.md.
+ *
+ * Reads xHCI MMIO + USB HCD power state + throttle bits from this
+ * (lwip-port) process. This is a side-process inspector — usb-hcd
+ * already ran (and probably failed) before lwip started. If the
+ * side-process MMIO reads work, H3 ("per-process bridge state
+ * applies to reads too") is ruled out and we have a generic xHCI
+ * observability channel.
+ *
+ * Per bcm2711-pcie-0xdead-causes B: VL805 advertises AC64=1 but
+ * actually returns garbage on 64-bit reads. EVERY xHCI MMIO read
+ * MUST be 32-bit. We split CRCR_HI / DCBAAP_HI etc. into two
+ * separate 32-bit loads as per Linux/U-Boot/Circle. */
+#define USB_XHCI_MMIO_BASE          0x600000000ull
+#define USB_XHCI_MMIO_SIZE          0x1000u  /* VL805 BAR0 is 4 KiB */
+
+#define USB_XHCI_CAP_CAPLENGTH_HCIVER 0x00u
+#define USB_XHCI_CAP_HCSPARAMS1     0x04u
+#define USB_XHCI_CAP_HCSPARAMS2     0x08u
+#define USB_XHCI_CAP_HCSPARAMS3     0x0Cu
+#define USB_XHCI_CAP_HCCPARAMS1     0x10u
+
+/* Operational registers; offsets relative to operational base
+ * (CAPLENGTH from offset 0x00). */
+#define USB_XHCI_OP_USBCMD          0x00u
+#define USB_XHCI_OP_USBSTS          0x04u
+#define USB_XHCI_OP_PAGESIZE        0x08u
+#define USB_XHCI_OP_DNCTRL          0x14u
+#define USB_XHCI_OP_CRCR_LO         0x18u
+#define USB_XHCI_OP_CRCR_HI         0x1Cu
+#define USB_XHCI_OP_DCBAAP_LO       0x30u
+#define USB_XHCI_OP_DCBAAP_HI       0x34u
+#define USB_XHCI_OP_CONFIG          0x38u
+
+#define VC_DEV_USB_HCD              3u  /* per VC4 mailbox device-id table */
+
+
+static int diag_format_xhci(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *page;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 xhci\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	page = mmap(NULL, USB_XHCI_MMIO_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, USB_XHCI_MMIO_BASE);
+	if (page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *base = (volatile uint8_t *)page;
+		uint32_t cap_dword = *(volatile uint32_t *)(base + USB_XHCI_CAP_CAPLENGTH_HCIVER);
+		uint8_t caplength = (uint8_t)(cap_dword & 0xFFu);
+		uint16_t hciversion = (uint16_t)((cap_dword >> 16) & 0xFFFFu);
+		uint32_t hcsp1 = *(volatile uint32_t *)(base + USB_XHCI_CAP_HCSPARAMS1);
+		uint32_t hcsp2 = *(volatile uint32_t *)(base + USB_XHCI_CAP_HCSPARAMS2);
+		uint32_t hcsp3 = *(volatile uint32_t *)(base + USB_XHCI_CAP_HCSPARAMS3);
+		uint32_t hccp1 = *(volatile uint32_t *)(base + USB_XHCI_CAP_HCCPARAMS1);
+
+		r = snprintf(buf + off, cap - off,
+			"CAPLENGTH=0x%02x  HCIVERSION=0x%04x\n"
+			"HCSPARAMS1=0x%08x  HCSPARAMS2=0x%08x  HCSPARAMS3=0x%08x\n"
+			"HCCPARAMS1=0x%08x\n",
+			caplength, hciversion,
+			(unsigned)hcsp1, (unsigned)hcsp2, (unsigned)hcsp3,
+			(unsigned)hccp1);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+
+		/* Only read operational registers if CAPLENGTH looks sane.
+		 * If the bridge is wedged we may get 0xdeaddead for everything
+		 * and CAPLENGTH would be 0xDE; don't follow that into invalid
+		 * offsets. */
+		if (caplength >= 0x20u && caplength < 0x80u) {
+			uint32_t usbcmd  = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_USBCMD);
+			uint32_t usbsts  = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_USBSTS);
+			uint32_t pgsz    = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_PAGESIZE);
+			uint32_t crcr_lo = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_CRCR_LO);
+			uint32_t crcr_hi = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_CRCR_HI);
+			uint32_t dcb_lo  = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_DCBAAP_LO);
+			uint32_t dcb_hi  = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_DCBAAP_HI);
+			uint32_t config  = *(volatile uint32_t *)(base + caplength + USB_XHCI_OP_CONFIG);
+
+			r = snprintf(buf + off, cap - off,
+				"USBCMD=0x%08x  USBSTS=0x%08x  PAGESIZE=0x%08x  CONFIG=0x%08x\n"
+				"CRCR=0x%08x_%08x  DCBAAP=0x%08x_%08x\n",
+				(unsigned)usbcmd, (unsigned)usbsts,
+				(unsigned)pgsz, (unsigned)config,
+				(unsigned)crcr_hi, (unsigned)crcr_lo,
+				(unsigned)dcb_hi, (unsigned)dcb_lo);
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+		else {
+			r = snprintf(buf + off, cap - off,
+				"operational regs SKIPPED (CAPLENGTH=0x%02x out of sane range — likely 0xdeaddead poison)\n",
+				caplength);
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+	}
+
+	munmap(page, USB_XHCI_MMIO_SIZE);
+
+	/* USB HCD power state + throttle bits. */
+	{
+		uint32_t pwr = diag_mboxPower(VC_PROP_GET_POWER_STATE,
+			VC_DEV_USB_HCD, 0u);
+		uint32_t throttle = diag_mboxProp1in1out(VC_PROP_GET_THROTTLED, 0);
+
+		r = snprintf(buf + off, cap - off,
+			"USB_HCD power: 0x%x   throttle: 0x%08x"
+			"%s%s%s%s\n",
+			(unsigned)pwr, (unsigned)throttle,
+			(throttle & 0x00000001u) ? " uv-now"  : "",
+			(throttle & 0x00010000u) ? " uv-since": "",
+			(throttle & 0x00000004u) ? " thr-now" : "",
+			(throttle & 0x00040000u) ? " thr-since": "");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -1448,6 +1589,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'i') {
 		len = diag_format_sdio(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'x') {
+		len = diag_format_xhci(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

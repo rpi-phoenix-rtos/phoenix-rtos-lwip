@@ -40,11 +40,15 @@
 #include "lwip/stats.h"
 #include "netif-driver.h"
 
+#include <sys/mman.h>
+
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/threads.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <time.h>
 
 
@@ -251,6 +255,78 @@ static int diag_format_threads(char *buf, size_t cap)
 }
 
 
+/* WiFi Tier 0 scout: dump Pi 4 GPFSEL3/4 + register-zero reads from
+ * candidate MMC/SDIO host controllers, to determine which one is
+ * wired to the BCM43455 on this board.
+ *
+ *   GPFSEL3 @ 0x7e20000c  controls function-select for GPIO 30..39
+ *   GPFSEL4 @ 0x7e200010  controls function-select for GPIO 40..49
+ *
+ *   SDHOST  @ 0xfe202000  bcm2835-style legacy MMC controller — Linux
+ *                         uses it for SD card by default on Pi 4
+ *   SDIO/EMMC2 (Arasan) @ 0xfe340000  used for WiFi on Pi 4 per
+ *                         raspberrypi/linux dts files
+ *
+ * (Notes: 0xfe300000 is occasionally cited as a third controller in
+ * older docs; on BCM2711 Linux DT, EMMC2 is at 0xfe340000.) */
+static int diag_format_sdio_scout(char *buf, size_t cap)
+{
+	int off = 0, r;
+	/* Only read register 0 of each controller. Some BCM2711 controllers
+	 * fault on reads when held in reset / clock-gated, so don't poke
+	 * at high offsets blindly. We also dump the GPFSEL bits that
+	 * route pins to SD/MMC alt functions. */
+	struct probe {
+		const char *name;
+		addr_t pa;
+	} probes[] = {
+		{ "GPFSEL3",   0xfe20000cu },  /* GPIO 30..39 fn-sel */
+		{ "GPFSEL4",   0xfe200010u },  /* GPIO 40..49 fn-sel */
+		{ "SDHOST_0",  0xfe202000u },  /* bcm2835 SDHOST (typically SD) */
+		{ "SDHCI_0",   0xfe300000u },  /* legacy SDHCI (Pi 3 EMMC) */
+		{ "EMMC2_0",   0xfe340000u },  /* BCM2711 EMMC2 (typically WiFi) */
+		{ NULL, 0 },
+	};
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-scout\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	for (int i = 0; probes[i].name != NULL; ++i) {
+		addr_t pa_base = probes[i].pa & ~(addr_t)(_PAGE_SIZE - 1);
+		addr_t pa_offs = probes[i].pa & (addr_t)(_PAGE_SIZE - 1);
+		void *page;
+		uint32_t val = 0xDEADBEEFu;
+		int ok = 0;
+
+		page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+			MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+			-1, pa_base);
+		if (page != MAP_FAILED) {
+			val = *(volatile uint32_t *)((volatile uint8_t *)page + pa_offs);
+			munmap(page, _PAGE_SIZE);
+			ok = 1;
+		}
+
+		r = snprintf(buf + off, cap - off, "%s @ 0x%08x = 0x%08x%s\n",
+			probes[i].name, (unsigned)probes[i].pa,
+			(unsigned)val, ok ? "" : " (mmap failed)");
+		if (r < 0 || (size_t)r >= cap - off) {
+			break;
+		}
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 static int diag_format_reply(char *buf, size_t cap)
 {
 	struct netif *n;
@@ -338,6 +414,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'b') {
 		len = diag_format_burn(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 's') {
+		len = diag_format_sdio_scout(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

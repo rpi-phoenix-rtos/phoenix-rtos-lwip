@@ -926,6 +926,133 @@ static int diag_format_sdio_scout(char *buf, size_t cap)
 }
 
 
+/* SDHCI 3.0 register offsets (from the Pi 4 controller at 0xfe300000):
+ *   0x00 SDMA_SYSADDR / ARG2 (32-bit)
+ *   0x04 BLOCK_SIZE_COUNT (32-bit)
+ *   0x08 ARGUMENT_1 (32-bit)
+ *   0x0C TRANSFER_MODE (16) + COMMAND (16)
+ *   0x10..0x1C RESPONSE_0..3 (32-bit each)
+ *   0x20 BUFFER_DATA_PORT (32-bit)
+ *   0x24 PRESENT_STATE (32-bit)
+ *   0x30 NORMAL_INT_STATUS (16) + ERR_INT_STATUS (16)
+ *   0x34 NORMAL_INT_STATUS_EN (16) + ERR_INT_STATUS_EN (16)
+ *   0x38 NORMAL_INT_SIGNAL_EN (16) + ERR_INT_SIGNAL_EN (16)
+ *
+ * Command-register encoding (16-bit at offset 0x0E):
+ *   bits 15:8  CMD_NUMBER (0..63)
+ *   bits 7:6   CMD_TYPE (00 = normal)
+ *   bit  5     DATA_PRESENT
+ *   bit  4     CMD_INDEX_CHECK_EN
+ *   bit  3     CMD_CRC_CHECK_EN
+ *   bits 1:0   RESPONSE_TYPE (00 none, 01 R2 136-bit, 10 R1/3/4/5/6 48-bit, 11 R1b)
+ *
+ * Issue protocol: poll PRES_STATE.CMD_INHIBIT (bit 0) clear, write
+ * ARGUMENT at 0x08, write COMMAND at 0x0E, poll NORMAL_INT_STATUS
+ * bit 0 (CMD_COMPLETE), W1C the status, read response. */
+#define SDHCI_ARGUMENT_1   0x08u
+#define SDHCI_TRANS_CMD    0x0Cu
+#define SDHCI_RESPONSE_0   0x10u
+#define SDHCI_PRES_STATE   0x24u
+#define SDHCI_INT_STATUS   0x30u
+#define SDHCI_INT_STAT_EN  0x34u
+
+#define SDHCI_PRES_CMD_INHIBIT  0x00000001u
+#define SDHCI_INT_CMD_COMPLETE  0x00000001u
+#define SDHCI_INT_ERR_ANY       0x00008000u  /* ERR_INT bits live in the upper 16 */
+
+/* SOFT_RESET_* live in bits 24..26 of the 32-bit dword at offset 0x2C
+ * (CLOCK_CTL + TIMEOUT_CTL + SOFT_RESET, big-endian-in-bit-position).
+ * Write 1 to the bit to start the reset; the bit clears when done. */
+#define SDHCI_CLK_TIMEOUT_RESET 0x2Cu
+#define SDHCI_SOFT_RESET_ALL    (1u << 24)
+#define SDHCI_SOFT_RESET_CMD    (1u << 25)
+#define SDHCI_SOFT_RESET_DAT    (1u << 26)
+
+
+/* Soft-reset the CMD and DAT lines without disturbing CLOCK_CTL /
+ * TIMEOUT_CTL (which firmware has already set up). 32-bit RMW. */
+static int diag_sdhciResetCmdDat(volatile uint8_t *base)
+{
+	uint32_t orig = *(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET);
+	uint32_t deadline = 100000u;
+	uint32_t i;
+
+	*(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET) =
+		(orig & 0x00FFFFFFu) | SDHCI_SOFT_RESET_CMD | SDHCI_SOFT_RESET_DAT;
+
+	for (i = 0; i < deadline; ++i) {
+		uint32_t v = *(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET);
+		if ((v & (SDHCI_SOFT_RESET_CMD | SDHCI_SOFT_RESET_DAT)) == 0u) {
+			return 0;
+		}
+	}
+	return -1;
+}
+
+
+/* Issue an SDHCI command. Returns 0 on success, negative on error
+ * (CMD_INHIBIT didn't clear, CMD_COMPLETE didn't assert in time,
+ * error bits set in INT_STATUS). On success, response_out[0..3] is
+ * filled from RESPONSE_0..3 (caller must allocate). */
+static int diag_sdhciCmd(volatile uint8_t *base, uint8_t cmd_index,
+	uint32_t arg, uint16_t resp_type, uint32_t response_out[4])
+{
+	uint32_t deadline = 100000u;  /* arbitrary spin count for cmd_inhibit */
+	uint32_t i;
+
+	/* Clear stale INT_STATUS bits (W1C). */
+	*(volatile uint32_t *)(base + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
+
+	/* Wait for CMD_INHIBIT clear. */
+	for (i = 0; i < deadline; ++i) {
+		if ((*(volatile uint32_t *)(base + SDHCI_PRES_STATE) &
+				SDHCI_PRES_CMD_INHIBIT) == 0u) {
+			break;
+		}
+	}
+	if (i == deadline) {
+		return -1;  /* CMD_INHIBIT stuck */
+	}
+
+	/* Program ARGUMENT then COMMAND. Use 32-bit write to TRANS_CMD
+	 * (offset 0x0C): low 16 = TRANSFER_MODE = 0 (no data), high 16 =
+	 * COMMAND. The combined write commits when bit 30:16 lands. */
+	*(volatile uint32_t *)(base + SDHCI_ARGUMENT_1) = arg;
+	{
+		uint32_t cmd_word = (uint32_t)resp_type |
+			((uint32_t)cmd_index << 24);  /* CMD_NUMBER at bits 24..31 */
+		*(volatile uint32_t *)(base + SDHCI_TRANS_CMD) = cmd_word;
+	}
+
+	/* Wait for CMD_COMPLETE (or any error bit). */
+	for (i = 0; i < deadline; ++i) {
+		uint32_t st = *(volatile uint32_t *)(base + SDHCI_INT_STATUS);
+		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+			return -2;  /* error reported */
+		}
+		if ((st & SDHCI_INT_CMD_COMPLETE) != 0u) {
+			break;
+		}
+	}
+	if (i == deadline) {
+		return -3;  /* cmd_complete didn't assert */
+	}
+
+	/* Read response registers. */
+	if (response_out != NULL) {
+		response_out[0] = *(volatile uint32_t *)(base + SDHCI_RESPONSE_0 + 0x0);
+		response_out[1] = *(volatile uint32_t *)(base + SDHCI_RESPONSE_0 + 0x4);
+		response_out[2] = *(volatile uint32_t *)(base + SDHCI_RESPONSE_0 + 0x8);
+		response_out[3] = *(volatile uint32_t *)(base + SDHCI_RESPONSE_0 + 0xC);
+	}
+
+	/* W1C the CMD_COMPLETE bit. */
+	*(volatile uint32_t *)(base + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
+
+	return 0;
+}
+
+
 /* WiFi Tier 1c: GPIO 34-39 → ALT3 + WL_REG_ON assertion.
  *
  * Sequence per docs/wifi-bringup-plan.md + the BCM43455 power-on
@@ -1020,6 +1147,111 @@ static int diag_format_wifi(char *buf, size_t cap)
 		(unsigned)pres_before, (unsigned)pres_after,
 		(unsigned)caps_lo_before, (unsigned)caps_lo_after,
 		(unsigned)caps_hi_before, (unsigned)caps_hi_after);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
+/* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
+ * discovery). After the Tier 1c power-on, issue:
+ *   CMD0  GO_IDLE_STATE       arg=0, no response
+ *   CMD5  IO_SEND_OP_COND     arg=0, R4 response = OCR
+ * CMD5 is SDIO-specific: SD/MMC cards don't respond to it. A successful
+ * CMD5 confirms the BCM43455 SDIO function 0 is alive. */
+static int diag_format_sdio(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t pres_pre_wlon, pres_post_wlon, pres_post_cmd0, pres_post_cmd5;
+	int rc_cmd0, rc_cmd5;
+	uint32_t resp_cmd0[4] = {0}, resp_cmd5[4] = {0};
+	uint32_t intst_pre_wlon, intst_post_wlon, intst_post_cmd0, intst_post_cmd5;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+		int i;
+
+		pres_pre_wlon = *(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE);
+		intst_pre_wlon = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+
+		/* Idempotent re-assert of Tier 1c if not already done. */
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+
+		pres_post_wlon = *(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE);
+		intst_post_wlon = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+
+		/* Soft-reset CMD + DAT lines to clear stale CMD_INHIBIT. The
+		 * BCM2711 controller's PRES_STATE comes up with CMD_INHIBIT=1
+		 * after firmware asserts CARD_INSERTED; without this reset
+		 * every command spins on the inhibit check. */
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		/* CMD0: GO_IDLE_STATE, no response. */
+		rc_cmd0 = diag_sdhciCmd(sdhci, 0u, 0u, 0x0000u, resp_cmd0);
+		pres_post_cmd0 = *(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE);
+		intst_post_cmd0 = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+
+		usleep(2 * 1000);  /* let the chip see CMD0 + settle */
+
+		/* CMD5: IO_SEND_OP_COND, arg=0 (probe), R4 = 48-bit response,
+		 * no CRC, no index check. response_type bits 1:0 = 10 = 2 */
+		rc_cmd5 = diag_sdhciCmd(sdhci, 5u, 0u, 0x0002u, resp_cmd5);
+		pres_post_cmd5 = *(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE);
+		intst_post_cmd5 = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"pres pre_wlon=0x%08x intst=0x%08x\n"
+		"pres post_wlon=0x%08x intst=0x%08x\n"
+		"CMD0  rc=%d  pres=0x%08x intst=0x%08x  resp=%08x %08x %08x %08x\n"
+		"CMD5  rc=%d  pres=0x%08x intst=0x%08x  resp=%08x %08x %08x %08x\n",
+		(unsigned)pres_pre_wlon,  (unsigned)intst_pre_wlon,
+		(unsigned)pres_post_wlon, (unsigned)intst_post_wlon,
+		rc_cmd0, (unsigned)pres_post_cmd0, (unsigned)intst_post_cmd0,
+		(unsigned)resp_cmd0[0], (unsigned)resp_cmd0[1],
+		(unsigned)resp_cmd0[2], (unsigned)resp_cmd0[3],
+		rc_cmd5, (unsigned)pres_post_cmd5, (unsigned)intst_post_cmd5,
+		(unsigned)resp_cmd5[0], (unsigned)resp_cmd5[1],
+		(unsigned)resp_cmd5[2], (unsigned)resp_cmd5[3]);
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}
@@ -1137,6 +1369,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'w') {
 		len = diag_format_wifi(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'i') {
+		len = diag_format_sdio(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

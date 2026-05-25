@@ -597,6 +597,19 @@ static void genet_rxPollThread(void *arg)
 			uint32_t status = genet_read(state, bd_off + 0);
 			uint16_t frame_len_total = (uint16_t)((status & BD_LEN_MASK) >> BD_LEN_SHIFT);
 
+			/* Print every RX so we can see ARP requests landing.
+			 * Show the destination MAC of the frame to distinguish
+			 * broadcast / unicast / multicast. */
+			{
+				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
+				uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
+				genet_printf(state,
+					"RX#%lu len=%u st=0x%08x dst=%02x:%02x:%02x:%02x:%02x:%02x type=0x%02x%02x",
+					state->rx_pkts_seen, frame_len_total, status,
+					frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+					frame[12], frame[13]);
+			}
+
 			/* GENET prepends a 64-byte RX status block to every frame
 			 * (RBUF_64B_EN set during init). The actual Ethernet frame
 			 * starts at buf+64 and has length status-encoded - 64. */
@@ -651,17 +664,30 @@ static void genet_rxPollThread(void *arg)
 static void genet_dhcpStartCb(void *arg)
 {
 	struct netif *netif = arg;
-	err_t err;
 
-	/* lwip's DHCP client picks the route via netif_default. Without
-	 * a default netif, DISCOVER goes out with no source-route info
-	 * and lwip's stack-internal validation may silently swallow it. */
 	netif_set_default(netif);
 
-	err = dhcp_start(netif);
-	if (err != ERR_OK) {
-		printf("lwip: genet: dhcp_start in tcpip ctx returned %d\n", (int)err);
-	}
+	/* Tier 4 validation: assign a static IP and skip DHCP. This proves
+	 * RX → tcpip_input → ARP-reply → TX is fully wired end-to-end —
+	 * the host can `ping 10.42.0.99` and lwip's stack handles the ARP
+	 * + ICMP echo automatically. Once we confirm that, Tier 4b can
+	 * revisit autonomous DHCP (which on this lwip seems to reset the
+	 * netif IP back to 0.0.0.0 the moment dhcp_start runs, defeating
+	 * a pre-set static IP).
+	 *
+	 * 10.42.0.99 is outside the dnsmasq pool (.10..20) so it won't
+	 * collide with the bootloader's earlier DHCP lease. */
+	ip4_addr_t ip, mask, gw;
+	IP4_ADDR(&ip, 10, 42, 0, 99);
+	IP4_ADDR(&mask, 255, 255, 255, 0);
+	IP4_ADDR(&gw, 10, 42, 0, 1);
+	netif_set_addr(netif, &ip, &mask, &gw);
+	printf("lwip: genet: static IP set; netif ip=0x%08x mask=0x%08x gw=0x%08x flags=0x%02x name=%c%c%u\n",
+		(unsigned)netif_ip4_addr(netif)->addr,
+		(unsigned)netif_ip4_netmask(netif)->addr,
+		(unsigned)netif_ip4_gw(netif)->addr,
+		netif->flags,
+		netif->name[0], netif->name[1], (unsigned)netif->num);
 }
 
 

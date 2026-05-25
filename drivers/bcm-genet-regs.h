@@ -307,11 +307,22 @@
 	(BD_STATUS_RX_LG | BD_STATUS_RX_NO | BD_STATUS_RX_RXER | \
 	 BD_STATUS_RX_CRC_ERROR | BD_STATUS_RX_OV)
 
-/* RBUF_64B_EN prepends 64 bytes of GENET-internal status before the
- * actual Ethernet frame in every RX buffer. The length field in the
- * BD status word counts those 64 bytes; subtract before handing the
- * payload to lwIP. */
-#define GENET_RX_STATUS_PREFIX   64u
+/* RBUF_64B_EN + RBUF_ALIGN_2B together prepend 66 bytes before the
+ * actual Ethernet frame in every RX buffer:
+ *   buf[0..1]   2-byte alignment pad (so the IP header lands 4-byte
+ *               aligned at buf[80] = 66 + 14)
+ *   buf[2..65]  64-byte GENET status block
+ *   buf[66..]   Ethernet frame (dst MAC, src MAC, ethertype, payload)
+ *
+ * The length field in the BD status word counts all 66 bytes; subtract
+ * before handing the payload to lwIP.
+ *
+ * Found by observing a captured RX#0 frame had dst MAC reading as
+ * 00:00:01:00:5e:00 when read at buf[64]: the leading 00:00 is the
+ * alignment pad, and the real multicast dst 01:00:5e:00:XX:XX starts
+ * at buf[66].
+ */
+#define GENET_RX_STATUS_PREFIX   66u
 
 #define GENET_MAX_FRAME      2048u /* per-buffer slot size */
 #define GENET_BUF_ALIGN      32u   /* skb alignment from Linux SKB_ALIGNMENT */

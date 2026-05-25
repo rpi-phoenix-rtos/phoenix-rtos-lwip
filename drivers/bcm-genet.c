@@ -474,7 +474,16 @@ static int genet_initRxRing(genet_state_t *state)
 	 * The BD addresses are written once and never touched again — the
 	 * hardware writes received frames into the same physical buffer
 	 * each time the BD cycles past. We just read the status word per
-	 * arrival to learn the per-frame length and flags. */
+	 * arrival to learn the per-frame length and flags.
+	 *
+	 * We populate the first GENET_RX_SLOTS BDs with unique dmammap'd
+	 * buffers, then alias the remaining BDs [GENET_RX_SLOTS .. GENET_TOTAL_DESC-1]
+	 * cyclically back to the same buffers. The previous attempt had
+	 * END_ADDR set for only 16 BDs, which seems to have made BCM2711
+	 * GENET treat BD[0] as also the LAST BD in the ring (WRAP set on
+	 * the first received frame). Programming all 256 BD slots with
+	 * (aliased) valid addresses + writing the full default-queue
+	 * END_ADDR = 767 keeps HW from setting WRAP early. */
 	for (i = 0; i < GENET_RX_SLOTS; ++i) {
 		state->rx_bufs[i] = dmammap(GENET_MAX_FRAME);
 		if (state->rx_bufs[i] == NULL) {
@@ -488,16 +497,24 @@ static int genet_initRxRing(genet_state_t *state)
 		genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->rx_bufs_phys[i] >> 32));
 		genet_write(state, bd_off + 0, 0);
 	}
+	for (i = GENET_RX_SLOTS; i < GENET_TOTAL_DESC; ++i) {
+		addr_t pa = state->rx_bufs_phys[i % GENET_RX_SLOTS];
+		bd_off = GENET_RX_DESCS_OFF + i * GENET_DMA_DESC_SIZE;
+		genet_write(state, bd_off + 4, (uint32_t)(pa & 0xFFFFFFFFu));
+		genet_write(state, bd_off + 8, (uint32_t)((uint64_t)pa >> 32));
+		genet_write(state, bd_off + 0, 0);
+	}
 
 	/* Same burst size convention as TDMA. */
 	genet_write(state, GENET_RDMA_REGS_OFF + GENET_TDMA_SCB_BURST_SIZE,
 		GENET_DMA_DEFAULT_BURST);
 
-	/* Per-ring 16 setup. end_addr is in 32-bit words, covering only the
-	 * portion of the BD area this small ring uses. */
+	/* END_ADDR spans the FULL 256-BD default-queue area (words 0..767)
+	 * even though we only have GENET_RX_SLOTS unique buffers — BDs are
+	 * aliased above. Matches Linux's bcmgenet_init_rx_ring layout. */
 	genet_write(state, ring_off + GENET_TDMA_RING_START_ADDR, 0);
 	genet_write(state, ring_off + GENET_TDMA_RING_END_ADDR,
-		(GENET_RX_SLOTS * GENET_DMA_DESC_SIZE / 4u) - 1u);
+		(GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE / 4u) - 1u);
 	genet_write(state, ring_off + GENET_TDMA_RING_READ_PTR, 0);
 	genet_write(state, ring_off + GENET_TDMA_RING_WRITE_PTR, 0);
 
@@ -507,11 +524,18 @@ static int genet_initRxRing(genet_state_t *state)
 	cons = genet_read(state, ring_off + GENET_TDMA_RING_PROD_INDEX);
 	genet_write(state, ring_off + GENET_TDMA_RING_CONS_INDEX, cons);
 	state->rx_c_index = cons;
-	state->rx_index = cons % GENET_RX_SLOTS;
+	/* rx_index tracks the HW BD position (0..GENET_TOTAL_DESC-1).
+	 * Buffer lookup uses (rx_index % GENET_RX_SLOTS) since BDs are
+	 * aliased to RX_SLOTS unique buffers. */
+	state->rx_index = cons % GENET_TOTAL_DESC;
 	state->rx_pkts_seen = 0;
 
+	/* Ring depth in BUF_SIZE must match the END_ADDR span — HW reads
+	 * both, and a mismatch was the cause of the WRAP-set-on-BD[0]
+	 * symptom. So we report the full 256-BD default-queue depth even
+	 * though only GENET_RX_SLOTS unique buffers back the ring. */
 	genet_write(state, ring_off + GENET_TDMA_RING_BUF_SIZE,
-		(GENET_RX_SLOTS << 16) | (GENET_MAX_FRAME & 0xFFFFu));
+		(GENET_TOTAL_DESC << 16) | (GENET_MAX_FRAME & 0xFFFFu));
 	genet_write(state, ring_off + GENET_TDMA_RING_MBUF_DONE, 1);
 
 	/* RDMA shares offset 0x28 with TDMA but it's the XON/XOFF flow-control
@@ -609,9 +633,11 @@ static void genet_rxPollThread(void *arg)
 
 			/* Tier 3 deliverable: confirm RX frames arrive. Log the
 			 * first 4 frames with header bytes so we can verify dst/src
-			 * MAC + ethertype against the netboot bridge's traffic. */
+			 * MAC + ethertype against the netboot bridge's traffic.
+			 * Buffer lookup uses rx_index % GENET_RX_SLOTS — the BDs
+			 * are aliased so multiple HW slots share each buffer. */
 			if (state->rx_pkts_seen < 4) {
-				uint8_t *buf = state->rx_bufs[state->rx_index];
+				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
 				genet_printf(state,
 					"RX[%u] %u B st=0x%08x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%02x%02x",
 					state->rx_index, len, status,
@@ -621,7 +647,7 @@ static void genet_rxPollThread(void *arg)
 			}
 			state->rx_pkts_seen++;
 
-			state->rx_index = (state->rx_index + 1u) % GENET_RX_SLOTS;
+			state->rx_index = (state->rx_index + 1u) % GENET_TOTAL_DESC;
 			state->rx_c_index = (state->rx_c_index + 1u) & 0xFFFFu;
 		}
 

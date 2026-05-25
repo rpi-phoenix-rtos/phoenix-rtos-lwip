@@ -430,6 +430,10 @@ static int diag_format_clocks(char *buf, size_t cap)
 	int off = 0, r;
 	uint32_t rate_emmc, rate_emmc2;
 	uint32_t pwr_before, pwr_set;
+	void *sdhci_page;
+	uint32_t sdhci_r00 = 0xDEADBEEFu, sdhci_caps_lo = 0xDEADBEEFu;
+	uint32_t sdhci_caps_hi = 0xDEADBEEFu, sdhci_version = 0xDEADBEEFu;
+	int sdhci_ok = 0;
 
 	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 clocks\n");
 	if (r < 0 || (size_t)r >= cap - off) {
@@ -457,6 +461,31 @@ static int diag_format_clocks(char *buf, size_t cap)
 	r = snprintf(buf + off, cap - off,
 		"SDCard power: before=0x%x after_set=0x%x\n",
 		(unsigned)pwr_before, (unsigned)pwr_set);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	/* Single mmap of SDHCI @ 0xfe300000 (page-aligned), then four
+	 * register reads from that one mapping. Replaces the v2 scout
+	 * pattern that did 4 separate mmaps of overlapping pages and
+	 * returned an empty UDP reply. */
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+	if (sdhci_page != MAP_FAILED) {
+		volatile uint8_t *base = (volatile uint8_t *)sdhci_page;
+		sdhci_r00     = *(volatile uint32_t *)(base + 0x00);
+		sdhci_caps_lo = *(volatile uint32_t *)(base + 0x40);
+		sdhci_caps_hi = *(volatile uint32_t *)(base + 0x44);
+		sdhci_version = *(volatile uint32_t *)(base + 0xfc);
+		munmap(sdhci_page, _PAGE_SIZE);
+		sdhci_ok = 1;
+	}
+	r = snprintf(buf + off, cap - off,
+		"SDHCI@fe300000: r00=0x%08x caps_lo=0x%08x caps_hi=0x%08x ver=0x%08x%s\n",
+		(unsigned)sdhci_r00, (unsigned)sdhci_caps_lo,
+		(unsigned)sdhci_caps_hi, (unsigned)sdhci_version,
+		sdhci_ok ? "" : " (mmap failed)");
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}

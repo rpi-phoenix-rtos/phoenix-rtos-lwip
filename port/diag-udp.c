@@ -516,6 +516,10 @@ static int diag_format_reboot(char *buf, size_t cap, int halt)
 #define VC_PROP_GET_TEMPERATURE 0x00030006u
 #define VC_PROP_GET_MAX_TEMP    0x0003000au
 #define VC_PROP_GET_THROTTLED   0x00030046u
+#define VC_PROP_SET_GPIO_STATE  0x00038041u
+
+#define EXPGPIO_BT_ON           128u  /* expgpio[0] = "BT_ON" per Pi 4 DT */
+#define EXPGPIO_WL_ON           129u  /* expgpio[1] = "WL_ON" per Pi 4 DT */
 
 #define VC_CLOCK_EMMC   1u
 #define VC_CLOCK_EMMC2  12u
@@ -922,6 +926,112 @@ static int diag_format_sdio_scout(char *buf, size_t cap)
 }
 
 
+/* WiFi Tier 1c: GPIO 34-39 → ALT3 + WL_REG_ON assertion.
+ *
+ * Sequence per docs/wifi-bringup-plan.md + the BCM43455 power-on
+ * sequence:
+ *   1. Set GPFSEL3 to route pins 34-39 to ALT3 (function 7 = SDIO).
+ *   2. Call mailbox SET_GPIO_STATE(WL_REG_ON, on) to power on the
+ *      WiFi half of the combo chip.
+ *   3. Wait ≥150 ms for the chip to settle and pull SD_CLK.
+ *   4. Re-read SDHCI registers to see if CAPS populate now that
+ *      the chip is alive on the bus. */
+static int diag_format_wifi(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	unsigned fsel_before[6] = {0};
+	unsigned fsel_after[6] = {0};
+	uint32_t pres_before = 0, pres_after = 0;
+	uint32_t caps_lo_before = 0, caps_lo_after = 0;
+	uint32_t caps_hi_before = 0, caps_hi_after = 0;
+	uint32_t wlon_set;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 wifi\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+		int i;
+
+		for (i = 0; i < 6; ++i) {
+			fsel_before[i] = *(volatile uint32_t *)(gpio + GPIO_GPFSEL0 + i * 4u);
+		}
+		pres_before    = *(volatile uint32_t *)(sdhci + 0x24);
+		caps_lo_before = *(volatile uint32_t *)(sdhci + 0x40);
+		caps_hi_before = *(volatile uint32_t *)(sdhci + 0x44);
+
+		/* Step 1: GPIO 34..39 → ALT3 (function 7). */
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+
+		for (i = 0; i < 6; ++i) {
+			fsel_after[i] = *(volatile uint32_t *)(gpio + GPIO_GPFSEL0 + i * 4u);
+		}
+
+		/* Step 2: WL_REG_ON via mailbox. Reuses the SET_POWER_STATE
+		 * helper since both tags share the (device_id, state) packet
+		 * layout. */
+		wlon_set = diag_mboxPower(VC_PROP_SET_GPIO_STATE,
+			EXPGPIO_WL_ON, 1u);
+
+		/* Step 3: wait 150 ms (chip settle per BCM43455 datasheet). */
+		usleep(150 * 1000);
+
+		pres_after    = *(volatile uint32_t *)(sdhci + 0x24);
+		caps_lo_after = *(volatile uint32_t *)(sdhci + 0x40);
+		caps_hi_after = *(volatile uint32_t *)(sdhci + 0x44);
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"GPFSEL3:    before=0x%08x after=0x%08x\n"
+		"WL_ON mbox: state_after_set=0x%x\n"
+		"SDHCI: pres_before=0x%08x  pres_after=0x%08x\n"
+		"SDHCI: caps_lo before=0x%08x after=0x%08x\n"
+		"SDHCI: caps_hi before=0x%08x after=0x%08x\n",
+		fsel_before[3], fsel_after[3],
+		(unsigned)wlon_set,
+		(unsigned)pres_before, (unsigned)pres_after,
+		(unsigned)caps_lo_before, (unsigned)caps_lo_after,
+		(unsigned)caps_hi_before, (unsigned)caps_hi_after);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 static int diag_format_reply(char *buf, size_t cap)
 {
 	struct netif *n;
@@ -1024,6 +1134,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'g') {
 		len = diag_format_gpio(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'w') {
+		len = diag_format_wifi(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

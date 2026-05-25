@@ -67,6 +67,9 @@
 #define GENET_RX_SLOTS    16u
 
 
+static err_t genet_linkOutput(struct netif *netif, struct pbuf *p);
+
+
 
 
 typedef struct {
@@ -630,8 +633,13 @@ static void genet_rxPollThread(void *arg)
 				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
 				uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
 
+				/* PBUF_RAM = contiguous heap allocation. Avoids the
+				 * pool-pbuf chain quirks where the first pbuf might
+				 * carry only a small portion of the payload, which
+				 * confuses ARP/ICMP parsers that expect the L2 + L3
+				 * header in one contiguous span. */
 				struct pbuf *p = pbuf_alloc(PBUF_RAW,
-					(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_POOL);
+					(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_RAM);
 				if (p != NULL) {
 					/* Zero the 2-byte pad, copy the L2+payload after it. */
 					((uint8_t *)p->payload)[0] = 0;
@@ -701,6 +709,14 @@ static void genet_dhcpStartCb(void *arg)
 		(unsigned)netif_ip4_gw(netif)->addr,
 		netif->flags,
 		netif->name[0], netif->name[1], (unsigned)netif->num);
+
+	/* Verify the netif's output handlers are still wired up. If
+	 * netif->linkoutput is NULL or got clobbered by netif_set_addr,
+	 * lwip's etharp would call a stale pointer and we'd see no
+	 * frames on the wire. */
+	printf("lwip: genet: netif->output=%p netif->linkoutput=%p (genet_linkOutput=%p)\n",
+		(void *)netif->output, (void *)netif->linkoutput,
+		(void *)genet_linkOutput);
 
 	/* Emit one unsolicited (gratuitous) ARP to prove the ARP module +
 	 * linkoutput chain is functional from the tcpip-thread side. If
@@ -791,17 +807,25 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 		return ERR_IF;
 	}
 
-	if (p->tot_len > GENET_MAX_FRAME) {
+	if (p->tot_len > GENET_MAX_FRAME + ETH_PAD_SIZE ||
+		p->tot_len <= ETH_PAD_SIZE) {
 		return ERR_BUF;
 	}
 
-	len = p->tot_len;
+	/* lwip with ETH_PAD_SIZE=2 leaves the 2-byte head pad ON the pbuf
+	 * even when handing it to the driver's linkoutput (some lwip
+	 * versions strip it via pbuf_remove_header before this call;
+	 * 2.1.x as shipped here doesn't). Skip the pad when copying to the
+	 * DMA buffer — otherwise the wire frame starts with two bytes of
+	 * zero before the real dst MAC and the switch drops it. */
+	len = p->tot_len - ETH_PAD_SIZE;
 
 	mutexLock(state->tx_lock);
 
-	/* Linearise the pbuf into the single DMA-coherent slot. dmammap memory
-	 * is uncached, so no further cache maintenance is needed. */
-	pbuf_copy_partial(p, state->tx_buf, len, 0);
+	/* Linearise the pbuf into the single DMA-coherent slot, starting
+	 * past the ETH_PAD_SIZE head pad. dmammap memory is uncached, so
+	 * no further cache maintenance is needed. */
+	pbuf_copy_partial(p, state->tx_buf, len, ETH_PAD_SIZE);
 
 	/* Program BD[tx_index]: addr-lo, addr-hi, length+status. */
 	bd_off = GENET_TX_DESCS_OFF + state->tx_index * GENET_DMA_DESC_SIZE;

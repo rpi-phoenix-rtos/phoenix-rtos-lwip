@@ -969,6 +969,76 @@ static int diag_format_sdio_scout(char *buf, size_t cap)
 #define SDHCI_SOFT_RESET_DAT    (1u << 26)
 
 
+/* Program SDHCI to a target SD-bus clock by dividing the 250 MHz base.
+ * Per SDHCI 3.0 §2.2.13: divisor is 10-bit, output_hz = base / (2*N).
+ * For 400 kHz init speed, N = 313 (0x139). 8 low bits go to
+ * CLOCK_CTL[15:8], 2 high bits go to CLOCK_CTL[7:6].
+ *
+ * Bring-up sequence: clear SD_CLOCK_EN, write new FREQ_SELECT, set
+ * INTERNAL_CLOCK_EN, wait for INTERNAL_CLOCK_STABLE, set SD_CLOCK_EN. */
+static int diag_sdhciSetClockKHz(volatile uint8_t *base, unsigned target_khz)
+{
+	uint32_t base_hz = 250000000u;
+	uint32_t target_hz = (uint32_t)target_khz * 1000u;
+	uint32_t divisor;
+	uint32_t clkctl;
+	uint32_t i;
+
+	if (target_hz == 0u || target_hz > base_hz) {
+		return -1;
+	}
+	divisor = (base_hz + (2u * target_hz) - 1u) / (2u * target_hz);
+	if (divisor > 0x3FFu) {
+		divisor = 0x3FFu;
+	}
+
+	/* Disable SD clock first. The whole dword at 0x2C has CLOCK_CTL
+	 * in the low 16, TIMEOUT_CTL+SOFT_RESET in the high 16. RMW the
+	 * low 16 only. */
+	clkctl = *(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET);
+	clkctl &= 0xFFFF0000u;  /* zero CLOCK_CTL */
+	*(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET) = clkctl;
+
+	/* Build new CLOCK_CTL:
+	 *   bit 0: INTERNAL_CLOCK_EN = 1
+	 *   bit 1: stable (read-only, set by HW)
+	 *   bit 2: SD_CLOCK_EN = 0 for now
+	 *   bits 7:6 = divisor high bits [9:8]
+	 *   bits 15:8 = divisor low bits [7:0]
+	 */
+	{
+		uint16_t cctl = (uint16_t)(
+			(uint16_t)(divisor & 0xFFu) << 8 |
+			(uint16_t)((divisor >> 8) & 0x3u) << 6 |
+			(1u << 0));
+		uint32_t hi = *(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET) &
+			0xFFFF0000u;
+		*(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET) =
+			hi | (uint32_t)cctl;
+	}
+
+	/* Wait for INTERNAL_CLOCK_STABLE (bit 1). */
+	for (i = 0; i < 100000u; ++i) {
+		uint32_t v = *(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET);
+		if ((v & (1u << 1)) != 0u) {
+			break;
+		}
+	}
+	if (i == 100000u) {
+		return -2;
+	}
+
+	/* Enable SD_CLOCK (bit 2). */
+	{
+		uint32_t v = *(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET);
+		v |= (1u << 2);
+		*(volatile uint32_t *)(base + SDHCI_CLK_TIMEOUT_RESET) = v;
+	}
+
+	return 0;
+}
+
+
 /* Soft-reset the CMD and DAT lines without disturbing CLOCK_CTL /
  * TIMEOUT_CTL (which firmware has already set up). 32-bit RMW. */
 static int diag_sdhciResetCmdDat(volatile uint8_t *base)
@@ -1215,6 +1285,12 @@ static int diag_format_sdio(char *buf, size_t cap)
 
 		pres_post_wlon = *(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE);
 		intst_post_wlon = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+
+		/* SDHCI init-speed cap is 400 kHz per SD spec. Firmware left
+		 * the clock at ~926 kHz. Some SDIO chips drop responses at
+		 * too-high init clocks; program 400 kHz before the first
+		 * commands. */
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 
 		/* Soft-reset CMD + DAT lines to clear stale CMD_INHIBIT. The
 		 * BCM2711 controller's PRES_STATE comes up with CMD_INHIBIT=1

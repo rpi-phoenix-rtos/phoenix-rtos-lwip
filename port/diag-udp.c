@@ -59,7 +59,19 @@ static struct udp_pcb *diag_pcb;
 static time_t diag_boot_us;
 static volatile int diag_burn_active;
 static volatile time_t diag_burn_deadline_us;
-static volatile unsigned long long diag_burn_counters[DIAG_BURN_THREADS];
+
+/* One counter per cache line. Without the padding all 4 slots fit in
+ * one 64-byte L1 line and every burner thread's per-iteration RMW
+ * invalidates the other 3 cores' caches — millions of cycles per
+ * effective increment, with frequent lost updates from non-atomic
+ * load-add-store. With the padding (this struct), four cores each
+ * own their own cache line and the inner loop runs at ALU speed.
+ * See `docs/notes/2026-05-25-pi4-userspace-shareability.md`. */
+static struct {
+	unsigned long long c;
+	char pad[64 - sizeof(unsigned long long)];
+} __attribute__((aligned(64))) diag_burn_counters[DIAG_BURN_THREADS];
+
 static uint32_t diag_burn_stacks[DIAG_BURN_THREADS][DIAG_BURN_STACK]
 	__attribute__((aligned(16)));
 
@@ -81,19 +93,16 @@ static void diag_burnThread(void *arg)
 		if (now_us >= diag_burn_deadline_us) {
 			break;
 		}
-		/* Inner unrolled loop. Increment a local counter; publish the
-		 * total to the shared array via __atomic_store_n once per
-		 * gettime tick. The previous version's `volatile ++` (writes
-		 * via plain str on aarch64) appeared to leave burners 1-3's
-		 * counters at 0 in the reader CPU's view even after ~5s of
-		 * cpuTime — indicating a Pi 4 userspace memory-ordering
-		 * caveat. An RELEASE store + cross-CPU ACQUIRE load is the
-		 * standard portable fix. */
+		/* Plain inner loop on the cache-line-padded slot. Per-thread
+		 * cache lines mean no inter-CPU coherence traffic; the loop
+		 * runs at ALU speed (~3 cycles per iteration on the A72). */
 		for (int i = 0; i < 4096; ++i) {
 			local++;
+			diag_burn_counters[slot].c++;
 		}
-		__atomic_store_n(&diag_burn_counters[slot], local, __ATOMIC_RELEASE);
 	}
+
+	(void)local;
 
 	if (__atomic_sub_fetch(&diag_burn_active, 1, __ATOMIC_RELAXED) == 0) {
 		/* Last burner out — leave counters readable by future
@@ -127,7 +136,7 @@ static int diag_format_burn(char *buf, size_t cap)
 		int spawned = 0;
 		diag_burn_deadline_us = now_us + (time_t)DIAG_BURN_DURATION_US;
 		for (int i = 0; i < DIAG_BURN_THREADS; ++i) {
-			diag_burn_counters[i] = 0;
+			diag_burn_counters[i].c = 0;
 		}
 		for (int i = 0; i < DIAG_BURN_THREADS; ++i) {
 			int err = beginthread(diag_burnThread, 4,
@@ -148,9 +157,8 @@ static int diag_format_burn(char *buf, size_t cap)
 	}
 
 	for (int i = 0; i < DIAG_BURN_THREADS; ++i) {
-		unsigned long long c = __atomic_load_n(&diag_burn_counters[i],
-			__ATOMIC_ACQUIRE);
-		r = snprintf(buf + off, cap - off, "burner%d_count: %llu\n", i, c);
+		r = snprintf(buf + off, cap - off,
+			"burner%d_count: %llu\n", i, diag_burn_counters[i].c);
 		if (r > 0 && (size_t)r < cap - off) {
 			off += r;
 		}

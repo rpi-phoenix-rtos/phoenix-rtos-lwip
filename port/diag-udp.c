@@ -255,6 +255,146 @@ static int diag_format_threads(char *buf, size_t cap)
 }
 
 
+/* BCM2711 GPIO block. Per docs/research/gpio-pinctrl.md. The block
+ * exposes 54 lines as two banks (0..27 and 28..53). Pi 4 added
+ * GPIO_PUP_PDN_CNTRL_REGn at 0xE4..0xF0 — the legacy GPPUD/GPPUDCLK
+ * sequence is RAZ/WI on BCM2711.
+ *
+ * Function-select encoding (3 bits per pin in GPFSELn):
+ *   0 = INPUT
+ *   1 = OUTPUT
+ *   2 = ALT5
+ *   3 = ALT4
+ *   4 = ALT0
+ *   5 = ALT1
+ *   6 = ALT2
+ *   7 = ALT3   <- the SDIO function for GPIO 34..39 on Pi 4
+ *
+ * The 'g' command reads GPFSEL0..5 + GPLEV0/1 + GPIO_PUP_PDN_CNTRL_REG0..3
+ * to give a full picture of pin function / level / pull state. */
+#define BCM2711_GPIO_BASE   0xfe200000u
+
+#define GPIO_GPFSEL0        0x00u   /* +4*n for GPFSEL1..5 */
+#define GPIO_GPSET0         0x1cu   /* +4 for GPSET1 (lines 32..53) */
+#define GPIO_GPCLR0         0x28u   /* +4 for GPCLR1 */
+#define GPIO_GPLEV0         0x34u   /* +4 for GPLEV1 */
+#define GPIO_PUP_PDN_CNTRL  0xe4u   /* +4*n for REG1..3 */
+
+
+/* Set pin function-select (3 bits). pin: 0..53, fn: 0..7. Read-
+ * modify-write of GPFSEL(pin/10). Unused yet — kept for WiFi Tier 1c
+ * (will route GPIO 34..39 to ALT3 for SDIO). */
+__attribute__((unused))
+static void diag_gpioSetFsel(volatile uint8_t *base, unsigned pin, unsigned fn)
+{
+	unsigned bank = pin / 10u;
+	unsigned shift = (pin % 10u) * 3u;
+	volatile uint32_t *reg = (volatile uint32_t *)(base + GPIO_GPFSEL0 + bank * 4u);
+	uint32_t v = *reg;
+	v &= ~(0x7u << shift);
+	v |= ((fn & 0x7u) << shift);
+	*reg = v;
+}
+
+
+/* Get current function select for pin (returns 0..7). */
+static unsigned diag_gpioGetFsel(volatile uint8_t *base, unsigned pin)
+{
+	unsigned bank = pin / 10u;
+	unsigned shift = (pin % 10u) * 3u;
+	volatile uint32_t *reg = (volatile uint32_t *)(base + GPIO_GPFSEL0 + bank * 4u);
+	return (*reg >> shift) & 0x7u;
+}
+
+
+/* Set pin pull (encoding: 0=off, 1=up, 2=down — per BCM2711 docs).
+ * Two bits per pin in GPIO_PUP_PDN_CNTRL_REG(pin/16). Unused yet —
+ * kept for WiFi Tier 1c (SDIO pin pull-up sequencing). */
+__attribute__((unused))
+static void diag_gpioSetPull(volatile uint8_t *base, unsigned pin, unsigned pull)
+{
+	unsigned reg_idx = pin / 16u;
+	unsigned shift = (pin % 16u) * 2u;
+	volatile uint32_t *reg = (volatile uint32_t *)(base + GPIO_PUP_PDN_CNTRL + reg_idx * 4u);
+	uint32_t v = *reg;
+	v &= ~(0x3u << shift);
+	v |= ((pull & 0x3u) << shift);
+	*reg = v;
+}
+
+
+static int diag_format_gpio(char *buf, size_t cap)
+{
+	void *page;
+	int off = 0, r;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 gpio\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	if (page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: GPIO mmap failed\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *base = (volatile uint8_t *)page;
+		uint32_t fsel[6];
+		uint32_t lev[2];
+		uint32_t pup[4];
+		int i;
+
+		for (i = 0; i < 6; ++i) {
+			fsel[i] = *(volatile uint32_t *)(base + GPIO_GPFSEL0 + i * 4u);
+		}
+		for (i = 0; i < 2; ++i) {
+			lev[i] = *(volatile uint32_t *)(base + GPIO_GPLEV0 + i * 4u);
+		}
+		for (i = 0; i < 4; ++i) {
+			pup[i] = *(volatile uint32_t *)(base + GPIO_PUP_PDN_CNTRL + i * 4u);
+		}
+
+		r = snprintf(buf + off, cap - off,
+			"GPFSEL0..5: %08x %08x %08x %08x %08x %08x\n"
+			"GPLEV0/1:   %08x %08x\n"
+			"PUP_PDN0..3: %08x %08x %08x %08x\n",
+			fsel[0], fsel[1], fsel[2], fsel[3], fsel[4], fsel[5],
+			lev[0], lev[1],
+			pup[0], pup[1], pup[2], pup[3]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+
+		/* Decode the GPIO 34..39 (SDIO/WiFi) function-select bits
+		 * specifically — those are the ones we need to flip to ALT3
+		 * for WiFi Tier 1c. */
+		r = snprintf(buf + off, cap - off,
+			"sdio pins fsel (need ALT3=7):  gpio34=%u gpio35=%u gpio36=%u gpio37=%u gpio38=%u gpio39=%u\n",
+			diag_gpioGetFsel(base, 34),
+			diag_gpioGetFsel(base, 35),
+			diag_gpioGetFsel(base, 36),
+			diag_gpioGetFsel(base, 37),
+			diag_gpioGetFsel(base, 38),
+			diag_gpioGetFsel(base, 39));
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	munmap(page, _PAGE_SIZE);
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* BCM2711 PM block (watchdog + soft reset + halt). Address range
  * mapped via mmap on demand from the 'r' / 'h' handlers.
  *   PM_RSTC at offset 0x1c — reset control
@@ -881,6 +1021,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'h') {
 		len = diag_format_reboot(body, DIAG_REPLY_MAX, 1);
+	}
+	else if (query == 'g') {
+		len = diag_format_gpio(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

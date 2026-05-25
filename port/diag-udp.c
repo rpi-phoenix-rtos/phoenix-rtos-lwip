@@ -74,16 +74,25 @@ static void diag_burnThread(void *arg)
 {
 	unsigned slot = (unsigned)(uintptr_t)arg;
 	time_t now_us;
+	unsigned long long local = 0;
 
 	for (;;) {
 		gettime(&now_us, NULL);
 		if (now_us >= diag_burn_deadline_us) {
 			break;
 		}
-		/* Inner unrolled loop to keep gettime overhead negligible. */
+		/* Inner unrolled loop. Increment a local counter; publish the
+		 * total to the shared array via __atomic_store_n once per
+		 * gettime tick. The previous version's `volatile ++` (writes
+		 * via plain str on aarch64) appeared to leave burners 1-3's
+		 * counters at 0 in the reader CPU's view even after ~5s of
+		 * cpuTime — indicating a Pi 4 userspace memory-ordering
+		 * caveat. An RELEASE store + cross-CPU ACQUIRE load is the
+		 * standard portable fix. */
 		for (int i = 0; i < 4096; ++i) {
-			diag_burn_counters[slot]++;
+			local++;
 		}
+		__atomic_store_n(&diag_burn_counters[slot], local, __ATOMIC_RELEASE);
 	}
 
 	if (__atomic_sub_fetch(&diag_burn_active, 1, __ATOMIC_RELAXED) == 0) {
@@ -139,8 +148,9 @@ static int diag_format_burn(char *buf, size_t cap)
 	}
 
 	for (int i = 0; i < DIAG_BURN_THREADS; ++i) {
-		r = snprintf(buf + off, cap - off,
-			"burner%d_count: %llu\n", i, diag_burn_counters[i]);
+		unsigned long long c = __atomic_load_n(&diag_burn_counters[i],
+			__ATOMIC_ACQUIRE);
+		r = snprintf(buf + off, cap - off, "burner%d_count: %llu\n", i, c);
 		if (r > 0 && (size_t)r < cap - off) {
 			off += r;
 		}

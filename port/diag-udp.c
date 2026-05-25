@@ -255,6 +255,102 @@ static int diag_format_threads(char *buf, size_t cap)
 }
 
 
+/* BCM2711 PM block (watchdog + soft reset + halt). Address range
+ * mapped via mmap on demand from the 'r' / 'h' handlers.
+ *   PM_RSTC at offset 0x1c — reset control
+ *   PM_RSTS at offset 0x20 — reset status / halt magic channel
+ *   PM_WDOG at offset 0x24 — countdown register
+ *   PM_PASSWORD = 0x5a000000 — top byte required on every write */
+#define BCM2711_PM_BASE             0xfe100000u
+#define BCM2711_PM_RSTC             0x1cu
+#define BCM2711_PM_RSTS             0x20u
+#define BCM2711_PM_WDOG             0x24u
+
+#define PM_PASSWORD                 0x5a000000u
+#define PM_RSTC_WRCFG_CLR           0xffffffcfu
+#define PM_RSTC_WRCFG_FULL_RESET    0x00000020u
+#define PM_RSTS_RASPBERRYPI_HALT    0x00000555u
+
+
+/* Trigger a watchdog-driven reset. If `halt` is set, stamp the HALT
+ * magic into PM_RSTS first so the firmware comes up into halt mode
+ * rather than rebooting. Both paths share the final RSTC write that
+ * arms the countdown.
+ *
+ * Returns 0 on success (the call should never actually return on
+ * hardware — the reset fires within ~150 us). Non-zero means we
+ * couldn't even map the PM block. */
+static int diag_pmReboot(int halt)
+{
+	void *pm_page;
+	volatile uint8_t *pm;
+
+	pm_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_PM_BASE);
+	if (pm_page == MAP_FAILED) {
+		return -1;
+	}
+	pm = (volatile uint8_t *)pm_page;
+
+	if (halt) {
+		uint32_t rsts = *(volatile uint32_t *)(pm + BCM2711_PM_RSTS);
+		*(volatile uint32_t *)(pm + BCM2711_PM_RSTS) =
+			PM_PASSWORD | rsts | PM_RSTS_RASPBERRYPI_HALT;
+	}
+
+	/* 10 ticks ≈ 150 us, per the bcm2835_wdt driver convention. */
+	*(volatile uint32_t *)(pm + BCM2711_PM_WDOG) = PM_PASSWORD | 10u;
+
+	{
+		uint32_t rstc = *(volatile uint32_t *)(pm + BCM2711_PM_RSTC);
+		*(volatile uint32_t *)(pm + BCM2711_PM_RSTC) =
+			PM_PASSWORD | (rstc & PM_RSTC_WRCFG_CLR) |
+			PM_RSTC_WRCFG_FULL_RESET;
+	}
+
+	/* On hardware the reset fires before we get here. If we somehow
+	 * survive (e.g. PM block was inaccessible), surface the error. */
+	munmap(pm_page, _PAGE_SIZE);
+	return 0;
+}
+
+
+/* Deferred-reboot thread. Spawned by the 'r' / 'h' handlers; sleeps
+ * 100 ms to let the UDP reply egress the GENET DMA + wire, then fires
+ * the watchdog. */
+static uint32_t diag_reboot_stack[1024] __attribute__((aligned(16)));
+static volatile int diag_reboot_halt;
+
+static void diag_rebootThread(void *arg)
+{
+	(void)arg;
+	usleep(100 * 1000);
+	(void)diag_pmReboot(diag_reboot_halt);
+	/* Should never reach here on real hardware. */
+	endthread();
+}
+
+
+static int diag_format_reboot(char *buf, size_t cap, int halt)
+{
+	int off = 0, r;
+
+	r = snprintf(buf + off, cap - off,
+		"PHX-DIAG/1 %s\nfiring PM_RSTC countdown in 100ms ...\n.\n",
+		halt ? "halt" : "reboot");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	diag_reboot_halt = halt;
+	(void)beginthread(diag_rebootThread, 4, diag_reboot_stack,
+		sizeof(diag_reboot_stack), NULL);
+	return off;
+}
+
+
 /* WiFi Tier 1a scout: probe VideoCore mailbox for EMMC/EMMC2 clock
  * state, then attempt to read SDHCI VERSION/CAPS now that we know
  * the controller is alive. Earlier extended scout (with VERSION at
@@ -680,6 +776,12 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'c') {
 		len = diag_format_clocks(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'r') {
+		len = diag_format_reboot(body, DIAG_REPLY_MAX, 0);
+	}
+	else if (query == 'h') {
+		len = diag_format_reboot(body, DIAG_REPLY_MAX, 1);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

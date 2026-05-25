@@ -433,7 +433,6 @@ static int diag_format_clocks(char *buf, size_t cap)
 	void *sdhci_page;
 	uint32_t sdhci_r00 = 0xDEADBEEFu, sdhci_caps_lo = 0xDEADBEEFu;
 	uint32_t sdhci_caps_hi = 0xDEADBEEFu, sdhci_version = 0xDEADBEEFu;
-	int sdhci_ok = 0;
 
 	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 clocks\n");
 	if (r < 0 || (size_t)r >= cap - off) {
@@ -465,27 +464,45 @@ static int diag_format_clocks(char *buf, size_t cap)
 		off += r;
 	}
 
-	/* Single mmap of SDHCI @ 0xfe300000 (page-aligned), then four
-	 * register reads from that one mapping. Replaces the v2 scout
-	 * pattern that did 4 separate mmaps of overlapping pages and
-	 * returned an empty UDP reply. */
+	/* Full SDHCI 3.0 register snapshot. The boot-time state lets us
+	 * decide what the Tier 1 driver needs to do first (reset?
+	 * clock-setup? power-on?). All registers are SDHCI-standard
+	 * 32-bit offsets — see Part A2 of the SD Host Controller Simplified
+	 * Specification 3.0. */
 	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
 		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
 		-1, 0xfe300000u);
 	if (sdhci_page != MAP_FAILED) {
 		volatile uint8_t *base = (volatile uint8_t *)sdhci_page;
-		sdhci_r00     = *(volatile uint32_t *)(base + 0x00);
-		sdhci_caps_lo = *(volatile uint32_t *)(base + 0x40);
-		sdhci_caps_hi = *(volatile uint32_t *)(base + 0x44);
-		sdhci_version = *(volatile uint32_t *)(base + 0xfc);
+		uint32_t pres_state, host_pwr_blkgap, clkctl_to_reset;
+		uint32_t int_status, int_status_en, host_ctrl2;
+
+		sdhci_r00       = *(volatile uint32_t *)(base + 0x00);
+		pres_state      = *(volatile uint32_t *)(base + 0x24);
+		host_pwr_blkgap = *(volatile uint32_t *)(base + 0x28);
+		clkctl_to_reset = *(volatile uint32_t *)(base + 0x2c);
+		int_status      = *(volatile uint32_t *)(base + 0x30);
+		int_status_en   = *(volatile uint32_t *)(base + 0x34);
+		sdhci_caps_lo   = *(volatile uint32_t *)(base + 0x40);
+		sdhci_caps_hi   = *(volatile uint32_t *)(base + 0x44);
+		host_ctrl2      = *(volatile uint32_t *)(base + 0xf8);
+		sdhci_version   = *(volatile uint32_t *)(base + 0xfc);
 		munmap(sdhci_page, _PAGE_SIZE);
-		sdhci_ok = 1;
+
+		r = snprintf(buf + off, cap - off,
+			"SDHCI@fe300000:\n"
+			"  r00=0x%08x  pres=0x%08x  host/pwr=0x%08x  clk/rst=0x%08x\n"
+			"  intst=0x%08x  intst_en=0x%08x  caps_lo=0x%08x  caps_hi=0x%08x\n"
+			"  hctl2=0x%08x  ver=0x%08x\n",
+			(unsigned)sdhci_r00, (unsigned)pres_state,
+			(unsigned)host_pwr_blkgap, (unsigned)clkctl_to_reset,
+			(unsigned)int_status, (unsigned)int_status_en,
+			(unsigned)sdhci_caps_lo, (unsigned)sdhci_caps_hi,
+			(unsigned)host_ctrl2, (unsigned)sdhci_version);
 	}
-	r = snprintf(buf + off, cap - off,
-		"SDHCI@fe300000: r00=0x%08x caps_lo=0x%08x caps_hi=0x%08x ver=0x%08x%s\n",
-		(unsigned)sdhci_r00, (unsigned)sdhci_caps_lo,
-		(unsigned)sdhci_caps_hi, (unsigned)sdhci_version,
-		sdhci_ok ? "" : " (mmap failed)");
+	else {
+		r = snprintf(buf + off, cap - off, "SDHCI@fe300000: mmap failed\n");
+	}
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}

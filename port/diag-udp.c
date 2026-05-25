@@ -1449,6 +1449,159 @@ static int diag_format_xhci(char *buf, size_t cap)
 }
 
 
+/* SDHCI command-type encodings for the COMMAND register's bits 7:0
+ * (in the upper half of the dword at offset 0x0C, so position
+ * COMMAND_BITS << 16 in the dword write):
+ *
+ *   bits 1:0   RESPONSE_TYPE  (0 = none, 1 = R2 136-bit,
+ *                              2 = R1/R3/R4/R5/R6/R7 48-bit,
+ *                              3 = R1b/R5b 48-bit with busy)
+ *   bit  3     CMD_CRC_CHECK_EN
+ *   bit  4     CMD_INDEX_CHECK_EN
+ *   bit  5     DATA_PRESENT
+ *
+ *   R0  (no resp)  = 0x00
+ *   R1  (CMD7,52)  = 0x1a  (resp=2, CRC, index)
+ *   R1b            = 0x1b  (resp=3, CRC, index)
+ *   R2             = 0x09  (resp=1, CRC, no index)
+ *   R3  (CMD41)    = 0x02  (resp=2, no CRC, no index)
+ *   R4  (CMD5)     = 0x02  (resp=2, no CRC, no index)
+ *   R5  (CMD52,53) = 0x1a  (resp=2, CRC, index)
+ *   R6  (CMD3)     = 0x1a  (resp=2, CRC, index)
+ *   R7             = 0x1a  (resp=2, CRC, index)
+ */
+#define SDHCI_RESP_R0   0x00u
+#define SDHCI_RESP_R1   0x1au
+#define SDHCI_RESP_R1b  0x1bu
+#define SDHCI_RESP_R3   0x02u
+#define SDHCI_RESP_R4   0x02u
+#define SDHCI_RESP_R5   0x1au
+#define SDHCI_RESP_R6   0x1au
+
+
+/* WiFi Tier 3: SDIO chip enumeration following the standard sequence
+ * (post-Tier-2 CMD5 OCR = 0x30ffff00, 3 IO functions, voltage 2.0-3.6V):
+ *
+ *   CMD5(0)         already done in Tier 2 — ocr returned
+ *   CMD5(ocr)       claim the voltage window; poll for C (Ready) bit
+ *   CMD3            request RCA
+ *   CMD7(rca<<16)   select the card (puts it in CMD state)
+ *   CMD52 read F0   read CCCR register 0 (SDIO version)
+ *   CMD52 read F0r4 read CIS pointer if SDIO version is sane
+ */
+static int diag_format_sdio_enum(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t cccr_resp[4] = {0};
+	int rc_ocr, rc_claim, rc_rca, rc_sel, rc_cccr;
+	int ready_iters = 0;
+	uint16_t rca = 0;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-enum\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+		int i;
+
+		/* Re-assert Tier 1c power-on (idempotent). */
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		/* CMD0 reset. */
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+
+		/* CMD5 arg=0 — probe OCR. */
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+
+		/* CMD5 arg=ocr — claim voltage window. Poll up to 50ms for
+		 * the C bit (bit 31 of response) to be set. */
+		rc_claim = -1;
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		/* CMD3 — get RCA. */
+		rc_rca = diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+
+		/* CMD7 — select the card. arg = RCA in high 16 bits. */
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		/* CMD52 read F0 reg 0 (SDIO version).
+		 * arg layout: [R/W bit31][FN bits30:28][RAW bit27]
+		 *             [stuff bit26][reg 17 bits at 25:9][stuff bit8][data 7:0]
+		 * Read F0 reg 0 = 0 (everything zero). */
+		rc_cccr = diag_sdhciCmd(sdhci, 52u, 0u, SDHCI_RESP_R5, cccr_resp);
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"CMD5(0)    rc=%d  resp=%08x  (OCR + flags)\n"
+		"CMD5(ocr)  rc=%d  resp=%08x  ready_iters=%d  C=%d\n"
+		"CMD3       rc=%d  resp=%08x  RCA=0x%04x\n"
+		"CMD7(rca)  rc=%d  resp=%08x\n"
+		"CMD52(F0r0) rc=%d  resp=%08x  (R5: stat/data)\n",
+		rc_ocr, (unsigned)ocr_resp[0],
+		rc_claim, (unsigned)claim_resp[0], ready_iters,
+		(int)((claim_resp[0] >> 31) & 1u),
+		rc_rca, (unsigned)rca_resp[0], (unsigned)rca,
+		rc_sel, (unsigned)sel_resp[0],
+		rc_cccr, (unsigned)cccr_resp[0]);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -1674,6 +1827,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'd') {
 		len = diag_format_dcbaa(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'e') {
+		len = diag_format_sdio_enum(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

@@ -568,17 +568,23 @@ static void genet_rxPollThread(void *arg)
 		uint32_t prod = genet_read(state,
 			ring_off + GENET_TDMA_RING_PROD_INDEX) & 0xFFFFu;
 
-		/* One-shot diagnostic: log BD[0] status word + RDMA indices once
-		 * every second for ~10 s after init, and any time BD[0].status
-		 * changes from what we last saw. If hardware is writing frames
-		 * to RAM but not bumping PROD_INDEX, we'd see the status field
-		 * change here even when prod stays at 0. */
+		/* Extended diagnostic: track BD[0] and BD[1] status words plus
+		 * BD[0]'s addr fields. We've seen BD[0].status get a 0x007e7f80
+		 * write after smoke TX while prod_index stays at 0. Need to
+		 * distinguish (a) a real RX hitting BD[0] from (b) HW clobbering
+		 * the BD memory for some other reason, and (c) confirm we
+		 * didn't lose the buffer phys address. */
 		uint32_t bd0 = genet_read(state, GENET_RX_DESCS_OFF + 0);
 		if (++ticks <= 1000u && (ticks % 100u) == 0u) {
+			uint32_t bd0_lo = genet_read(state, GENET_RX_DESCS_OFF + 4);
+			uint32_t bd0_hi = genet_read(state, GENET_RX_DESCS_OFF + 8);
+			uint32_t bd1 = genet_read(state,
+				GENET_RX_DESCS_OFF + GENET_DMA_DESC_SIZE);
 			uint32_t status = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_STATUS);
 			genet_printf(state,
-				"RDMA@%us prod=%u sw_c=%u bd0=0x%08x rdma_status=0x%08x",
-				ticks / 100u, prod, state->rx_c_index & 0xFFFFu, bd0, status);
+				"RDMA@%us prod=%u sw_c=%u bd0={st=0x%08x lo=0x%08x hi=0x%08x} bd1=0x%08x rdma_st=0x%08x",
+				ticks / 100u, prod, state->rx_c_index & 0xFFFFu,
+				bd0, bd0_lo, bd0_hi, bd1, status);
 		}
 		else if (bd0 != last_bd0_status && bd0 != 0u) {
 			genet_printf(state, "BD[0] status changed: 0x%08x -> 0x%08x (prod=%u)",

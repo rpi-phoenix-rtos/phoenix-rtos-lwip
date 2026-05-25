@@ -41,7 +41,9 @@
 #include "netif-driver.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/threads.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -52,6 +54,85 @@
 
 static struct udp_pcb *diag_pcb;
 static time_t diag_boot_us;
+
+
+/* Comparator for qsort: largest cpuTime first. */
+static int diag_threads_cmp(const void *a, const void *b)
+{
+	const threadinfo_t *ta = a;
+	const threadinfo_t *tb = b;
+	if (tb->cpuTime > ta->cpuTime) {
+		return 1;
+	}
+	if (tb->cpuTime < ta->cpuTime) {
+		return -1;
+	}
+	return 0;
+}
+
+
+/* Format reply for the 't' query — top threads by accumulated CPU time.
+ * Output format:
+ *   PHX-DIAG/1 threads
+ *   thread: pid=<n> tid=<n> load=<%> cpuTime_us=<n> name=<s>
+ *   ...repeated for top N...
+ *   uptime_ms: <n>
+ *   .
+ * The cpuTime delta between two queries divided by wall-clock delta is
+ * the per-thread fraction-of-a-core consumed; sum across CPU-bound
+ * threads is the cross-CPU distribution metric for SMP Phase E. */
+static int diag_format_threads(char *buf, size_t cap)
+{
+	enum { TOP_N = 12, MAX_THREADS = 128 };
+	threadinfo_t *info;
+	int n, written, off = 0, r;
+	time_t now_us;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 threads\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	info = malloc(MAX_THREADS * sizeof(threadinfo_t));
+	if (info == NULL) {
+		r = snprintf(buf + off, cap - off, "error: out of memory\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+
+	n = threadsinfo(MAX_THREADS, info);
+	if (n < 0) {
+		r = snprintf(buf + off, cap - off, "error: threadsinfo=%d\n.\n", n);
+		free(info);
+		return off + (r > 0 ? r : 0);
+	}
+
+	qsort(info, n, sizeof(threadinfo_t), diag_threads_cmp);
+
+	written = (n < TOP_N) ? n : TOP_N;
+	for (int i = 0; i < written; ++i) {
+		r = snprintf(buf + off, cap - off,
+			"thread: pid=%u tid=%u load=%d cpuTime_us=%llu name=%.40s\n",
+			(unsigned)info[i].pid, (unsigned)info[i].tid,
+			info[i].load, (unsigned long long)info[i].cpuTime,
+			info[i].name);
+		if (r < 0 || (size_t)r >= cap - off) {
+			break;
+		}
+		off += r;
+	}
+
+	gettime(&now_us, NULL);
+	r = snprintf(buf + off, cap - off,
+		"total_threads: %d\nuptime_ms: %llu\n.\n",
+		n, (unsigned long long)((now_us - diag_boot_us) / 1000ULL));
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	free(info);
+	return off;
+}
 
 
 static int diag_format_reply(char *buf, size_t cap)
@@ -117,8 +198,17 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	struct pbuf *reply;
 	int len;
 	char *body;
+	char query;
 
 	(void)arg;
+
+	/* Peek the first byte of the request to pick the response shape.
+	 *   't' → thread/cpu stats
+	 *   anything else → netif stats (default) */
+	query = 0;
+	if (p->len >= 1) {
+		query = ((const char *)p->payload)[0];
+	}
 	pbuf_free(p);
 
 	reply = pbuf_alloc(PBUF_TRANSPORT, DIAG_REPLY_MAX, PBUF_RAM);
@@ -127,7 +217,12 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 
 	body = (char *)reply->payload;
-	len = diag_format_reply(body, DIAG_REPLY_MAX);
+	if (query == 't') {
+		len = diag_format_threads(body, DIAG_REPLY_MAX);
+	}
+	else {
+		len = diag_format_reply(body, DIAG_REPLY_MAX);
+	}
 	if (len <= 0) {
 		pbuf_free(reply);
 		return;

@@ -223,23 +223,48 @@
 #define GENET_RX_RINGS_OFF   (GENET_RX_DESCS_OFF + GENET_TOTAL_DESC * GENET_DMA_DESC_SIZE) /* 0x2C00 */
 #define GENET_RDMA_REGS_OFF  (GENET_RX_RINGS_OFF + GENET_DMA_RINGS_SIZE)  /* 0x3040 */
 
-/* Per-ring control register offsets within the ring's 0x40 slice. These
- * apply to BOTH TDMA and RDMA rings, but offset 0x28 has different
- * meanings on each side:
- *   - TDMA: TDMA_FLOW_PERIOD (write 0 to disable TX flow throttling)
- *   - RDMA: RDMA_XON_XOFF_THRESH ({xoff << 16} | xon) — leaving this
- *           at 0 hangs RX permanently (always XOFF).
+/* Per-ring control register offsets. **TDMA and RDMA have MIRRORED
+ * layouts** for the producer/consumer pair (the SW side and the HW side
+ * are swapped):
+ *
+ *               TDMA (SW produces)        RDMA (HW produces)
+ *   0x00        TDMA_READ_PTR             RDMA_WRITE_PTR
+ *   0x08        TDMA_CONS_INDEX (HW)      RDMA_PROD_INDEX (HW)
+ *   0x0C        TDMA_PROD_INDEX (SW)      RDMA_CONS_INDEX (SW)
+ *   0x10..0x24  identical (BUF_SIZE, START_ADDR, END_ADDR, MBUF_DONE)
+ *   0x28        TDMA_FLOW_PERIOD          RDMA_XON_XOFF_THRESH
+ *   0x2C        TDMA_WRITE_PTR            RDMA_READ_PTR
+ *
+ * Using the TDMA offsets on the RDMA side (which my driver did for
+ * weeks) means reading the SW-written CONS_INDEX as if it were the
+ * HW-written PROD_INDEX — explaining "PROD never advances" while
+ * HW happily wrote frame status into the BDs.
+ *
+ * Reference: Linux drivers/net/ethernet/broadcom/genet/bcmgenet.h.
  */
+
+/* TDMA per-ring (SW produces, HW consumes) */
 #define GENET_TDMA_RING_READ_PTR    0x00u
-#define GENET_TDMA_RING_CONS_INDEX  0x08u
-#define GENET_TDMA_RING_PROD_INDEX  0x0Cu
+#define GENET_TDMA_RING_CONS_INDEX  0x08u  /* HW writes after TX */
+#define GENET_TDMA_RING_PROD_INDEX  0x0Cu  /* SW writes to kick TX */
 #define GENET_TDMA_RING_BUF_SIZE    0x10u
 #define GENET_TDMA_RING_START_ADDR  0x14u
 #define GENET_TDMA_RING_END_ADDR    0x1Cu
 #define GENET_TDMA_RING_MBUF_DONE   0x24u
-#define GENET_TDMA_RING_FLOW_PERIOD 0x28u  /* TX-side */
-#define GENET_RDMA_RING_XON_XOFF    0x28u  /* RX-side alias */
+#define GENET_TDMA_RING_FLOW_PERIOD 0x28u
 #define GENET_TDMA_RING_WRITE_PTR   0x2Cu
+
+/* RDMA per-ring (HW produces, SW consumes). Note: indices SWAPPED
+ * from TDMA layout — see the table above. */
+#define GENET_RDMA_RING_WRITE_PTR   0x00u
+#define GENET_RDMA_RING_PROD_INDEX  0x08u  /* HW writes after RX */
+#define GENET_RDMA_RING_CONS_INDEX  0x0Cu  /* SW writes when buffers returned */
+#define GENET_RDMA_RING_BUF_SIZE    0x10u
+#define GENET_RDMA_RING_START_ADDR  0x14u
+#define GENET_RDMA_RING_END_ADDR    0x1Cu
+#define GENET_RDMA_RING_MBUF_DONE   0x24u
+#define GENET_RDMA_RING_XON_XOFF    0x28u
+#define GENET_RDMA_RING_READ_PTR    0x2Cu
 
 /* Linux's RX flow-control defaults (DMA_FC_THRESH_{LO,HI},
  * DMA_XOFF_THRESHOLD_SHIFT). Used together as

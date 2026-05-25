@@ -623,16 +623,22 @@ static void genet_rxPollThread(void *arg)
 			/* Tier 3 deliverable: confirm RX frames arrive. Log the
 			 * first 4 frames with header bytes so we can verify dst/src
 			 * MAC + ethertype against the netboot bridge's traffic.
-			 * Buffer lookup uses rx_index % GENET_RX_SLOTS — the BDs
-			 * are aliased so multiple HW slots share each buffer. */
+			 *
+			 * GENET prepends a 64-byte RX status block (RBUF_64B_EN'd
+			 * during init) before the actual frame, so the Ethernet
+			 * header lives at buf+64, not buf+0. The 64B prefix is the
+			 * same block whose length field we also see in `status`.
+			 * Buffer lookup uses rx_index % GENET_RX_SLOTS because the
+			 * BDs are aliased so multiple HW slots share each buffer. */
 			if (state->rx_pkts_seen < 4) {
 				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
+				uint8_t *frame = buf + 64;
 				genet_printf(state,
 					"RX[%u] %u B st=0x%08x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%02x%02x",
 					state->rx_index, len, status,
-					buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
-					buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-					buf[12], buf[13]);
+					frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+					frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+					frame[12], frame[13]);
 			}
 			state->rx_pkts_seen++;
 

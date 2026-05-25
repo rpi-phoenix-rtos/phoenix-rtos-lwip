@@ -373,6 +373,9 @@ static int diag_format_reboot(char *buf, size_t cap, int halt)
 #define VC_PROP_GET_CLOCK_RATE 0x00030002u
 #define VC_PROP_GET_POWER_STATE 0x00020001u
 #define VC_PROP_SET_POWER_STATE 0x00028001u
+#define VC_PROP_GET_TEMPERATURE 0x00030006u
+#define VC_PROP_GET_MAX_TEMP    0x0003000au
+#define VC_PROP_GET_THROTTLED   0x00030046u
 
 #define VC_CLOCK_EMMC   1u
 #define VC_CLOCK_EMMC2  12u
@@ -446,6 +449,78 @@ static uint32_t diag_mboxGetClockRate(uint32_t clock_id)
 	munmap(msg_page, _PAGE_SIZE);
 	munmap(mbox_page, _PAGE_SIZE);
 	return rate;
+}
+
+
+/* Generic single-u32-in / single-u32-out mailbox property call.
+ * Used for tags like GET_TEMPERATURE (input: sensor_id 0, output: mC),
+ * GET_THROTTLED (input: 0, output: throttle bitfield), and
+ * GET_MAX_TEMPERATURE (input: sensor_id 0, output: mC). */
+static uint32_t diag_mboxProp1in1out(uint32_t tag, uint32_t arg_in)
+{
+	addr_t pa_base = (addr_t)RPI_PI4_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
+	addr_t pa_offs = (addr_t)RPI_PI4_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
+	volatile uint32_t *mbox;
+	uint32_t *msg;
+	uintptr_t msg_pa;
+	uint32_t request;
+	uint32_t result = 0xFFFFFFFFu;
+	void *mbox_page;
+	void *msg_page;
+
+	mbox_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, pa_base);
+	if (mbox_page == MAP_FAILED) {
+		return 0xFFFFFFFFu;
+	}
+	mbox = (volatile uint32_t *)((volatile uint8_t *)mbox_page + pa_offs);
+
+	msg_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
+	if (msg_page == MAP_FAILED) {
+		munmap(mbox_page, _PAGE_SIZE);
+		return 0xFFFFFFFFu;
+	}
+	msg = msg_page;
+
+	/* tag layout: [size, REQUEST, tag, valbuf_size=8, req=0, arg_in, out, END]. */
+	msg[0] = 32;
+	msg[1] = 0;
+	msg[2] = tag;
+	msg[3] = 8;
+	msg[4] = 0;
+	msg[5] = arg_in;
+	msg[6] = 0;
+	msg[7] = 0;
+
+	msg_pa = (uintptr_t)va2pa(msg);
+	if (msg_pa == (uintptr_t)-1) {
+		munmap(msg_page, _PAGE_SIZE);
+		munmap(mbox_page, _PAGE_SIZE);
+		return 0xFFFFFFFFu;
+	}
+	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
+
+	while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) {
+	}
+	mbox[VC_MBOX_WRITE / 4] = request;
+
+	for (;;) {
+		while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
+		}
+		if (mbox[VC_MBOX_READ / 4] == request) {
+			break;
+		}
+	}
+
+	if (msg[1] == VC_MBOX_RESP_OK) {
+		result = msg[6];
+	}
+
+	munmap(msg_page, _PAGE_SIZE);
+	munmap(mbox_page, _PAGE_SIZE);
+	return result;
 }
 
 
@@ -558,6 +633,30 @@ static int diag_format_clocks(char *buf, size_t cap)
 		(unsigned)pwr_before, (unsigned)pwr_set);
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
+	}
+
+	/* Thermal + throttle telemetry. Tags expect sensor_id=0 for the
+	 * SoC sensor; GET_THROTTLED ignores its arg. */
+	{
+		uint32_t temp_mc = diag_mboxProp1in1out(VC_PROP_GET_TEMPERATURE, 0);
+		uint32_t maxt_mc = diag_mboxProp1in1out(VC_PROP_GET_MAX_TEMP,    0);
+		uint32_t throttle = diag_mboxProp1in1out(VC_PROP_GET_THROTTLED,  0);
+
+		r = snprintf(buf + off, cap - off,
+			"thermal: temp_mC=%u max_mC=%u throttle=0x%08x"
+			"%s%s%s%s%s%s%s%s\n",
+			(unsigned)temp_mc, (unsigned)maxt_mc, (unsigned)throttle,
+			(throttle & 0x00000001u) ? " uv-now"        : "",
+			(throttle & 0x00000002u) ? " arm-cap-now"   : "",
+			(throttle & 0x00000004u) ? " throttle-now"  : "",
+			(throttle & 0x00000008u) ? " soft-now"      : "",
+			(throttle & 0x00010000u) ? " uv-since"      : "",
+			(throttle & 0x00020000u) ? " arm-cap-since" : "",
+			(throttle & 0x00040000u) ? " throttle-since" : "",
+			(throttle & 0x00080000u) ? " soft-since"     : "");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
 	}
 
 	/* Full SDHCI 3.0 register snapshot. The boot-time state lets us

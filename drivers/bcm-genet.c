@@ -610,9 +610,18 @@ static void genet_rxPollThread(void *arg)
 					frame[12], frame[13]);
 			}
 
-			/* GENET prepends a 64-byte RX status block to every frame
-			 * (RBUF_64B_EN set during init). The actual Ethernet frame
-			 * starts at buf+64 and has length status-encoded - 64. */
+			/* GENET prepends a 66-byte block to every frame
+			 * (2-byte alignment + 64-byte status, see RBUF_64B_EN +
+			 * RBUF_ALIGN_2B during init). Actual Ethernet frame starts
+			 * at buf+66.
+			 *
+			 * lwip is built with ETH_PAD_SIZE=2 (see lwipopts.h), which
+			 * means ethernet_input() does pbuf_remove_header(p, 2)
+			 * BEFORE casting payload to struct eth_hdr. The pbuf we
+			 * hand up must therefore have 2 bytes of head padding
+			 * BEFORE the actual L2 header. Without this, lwip reads
+			 * the eth header from frame[2..15] — i.e. src_mac mid-byte
+			 * — and silently drops the frame as a bad ethertype. */
 			if (frame_len_total > GENET_RX_STATUS_PREFIX &&
 				(status & (BD_STATUS_SOP | BD_STATUS_EOP)) ==
 				(BD_STATUS_SOP | BD_STATUS_EOP) &&
@@ -621,9 +630,13 @@ static void genet_rxPollThread(void *arg)
 				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
 				uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
 
-				struct pbuf *p = pbuf_alloc(PBUF_RAW, pay_len, PBUF_POOL);
+				struct pbuf *p = pbuf_alloc(PBUF_RAW,
+					(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_POOL);
 				if (p != NULL) {
-					if (pbuf_take(p, frame, pay_len) == ERR_OK) {
+					/* Zero the 2-byte pad, copy the L2+payload after it. */
+					((uint8_t *)p->payload)[0] = 0;
+					((uint8_t *)p->payload)[1] = 0;
+					if (pbuf_take_at(p, frame, pay_len, ETH_PAD_SIZE) == ERR_OK) {
 						if (state->netif->input(p, state->netif) != ERR_OK) {
 							pbuf_free(p);
 							state->rx_pkts_dropped++;

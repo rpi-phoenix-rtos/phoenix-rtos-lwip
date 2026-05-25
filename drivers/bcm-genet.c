@@ -55,13 +55,14 @@
 #define MDIO_TIMEOUT_US   20000u    /* xHCI MDIO max per Linux bcmmii */
 
 /*
- * RX ring depth. Currently sized to match U-Boot's default-queue layout
- * (full 256 BDs), but on this hardware RX still hasn't been observed to
- * fill the ring — the bridge's unicast ARP reply to our smoke TX shows
- * up on the wire (verified via host-side tcpdump) but RDMA_PROD_INDEX
- * stays at 0. Open at end-of-session — TODO(TD-Eth-RX).
+ * RX ring depth. 16 BDs is enough for Tier 3 (one packet, polled) and
+ * keeps the init's 16-call dmammap loop well under Phoenix's allocator
+ * cliff — bumping to GENET_TOTAL_DESC (256) made the 256 successive
+ * MAP_CONTIGUOUS allocations stall lwip startup so it never produced
+ * its first print. The ring's BUF_SIZE and END_ADDR are programmed
+ * for this count, so the HW only sees the slots we actually filled.
  */
-#define GENET_RX_SLOTS    GENET_TOTAL_DESC
+#define GENET_RX_SLOTS    16u
 
 
 /* Forward declaration: genet_setLinkState fires a TX smoke test via this. */

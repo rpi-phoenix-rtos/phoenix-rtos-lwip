@@ -255,6 +255,130 @@ static int diag_format_threads(char *buf, size_t cap)
 }
 
 
+/* WiFi Tier 1a scout: probe VideoCore mailbox for EMMC/EMMC2 clock
+ * state, then attempt to read SDHCI VERSION/CAPS now that we know
+ * the controller is alive. Earlier extended scout (with VERSION at
+ * 0xFC) faulted because the clock was off; the 'c' sub-command first
+ * asks the firmware for clock rate, and only attempts the high-offset
+ * reads if a non-zero rate is reported.
+ *
+ * Pi 4 mailbox base (board_config.h would expose this, but the port
+ * doesn't have that include path — hardcoded with a comment). */
+#define RPI_PI4_MAILBOX_BASE  0xfe00b880u
+
+#define VC_MBOX_READ          0x00u
+#define VC_MBOX_STATUS        0x18u
+#define VC_MBOX_WRITE         0x20u
+#define VC_MBOX_STATUS_FULL   0x80000000u
+#define VC_MBOX_STATUS_EMPTY  0x40000000u
+#define VC_MBOX_RESP_OK       0x80000000u
+#define VC_MBOX_PROP_CHANNEL  8u
+
+#define VC_PROP_GET_CLOCK_RATE 0x00030002u
+
+#define VC_CLOCK_EMMC   1u
+#define VC_CLOCK_EMMC2  12u
+
+
+static uint32_t diag_mboxGetClockRate(uint32_t clock_id)
+{
+	addr_t pa_base = (addr_t)RPI_PI4_MAILBOX_BASE & ~(addr_t)(_PAGE_SIZE - 1);
+	addr_t pa_offs = (addr_t)RPI_PI4_MAILBOX_BASE & (addr_t)(_PAGE_SIZE - 1);
+	volatile uint32_t *mbox;
+	uint32_t *msg;
+	uintptr_t msg_pa;
+	uint32_t request;
+	uint32_t rate = 0xFFFFFFFFu;
+	void *mbox_page;
+	void *msg_page;
+
+	mbox_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, pa_base);
+	if (mbox_page == MAP_FAILED) {
+		return 0xFFFFFFFFu;
+	}
+	mbox = (volatile uint32_t *)((volatile uint8_t *)mbox_page + pa_offs);
+
+	/* Property message buffer (16-byte aligned, uncached). */
+	msg_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_UNCACHED | MAP_CONTIGUOUS | MAP_ANONYMOUS, -1, 0);
+	if (msg_page == MAP_FAILED) {
+		munmap(mbox_page, _PAGE_SIZE);
+		return 0xFFFFFFFFu;
+	}
+	msg = msg_page;
+
+	/* GET_CLOCK_RATE packet: clock-id sent, rate returned (Hz). */
+	msg[0] = 32;
+	msg[1] = 0;
+	msg[2] = VC_PROP_GET_CLOCK_RATE;
+	msg[3] = 8;
+	msg[4] = 0;
+	msg[5] = clock_id;
+	msg[6] = 0;
+	msg[7] = 0;
+
+	msg_pa = (uintptr_t)va2pa(msg);
+	if (msg_pa == (uintptr_t)-1) {
+		munmap(msg_page, _PAGE_SIZE);
+		munmap(mbox_page, _PAGE_SIZE);
+		return 0xFFFFFFFFu;
+	}
+	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
+
+	while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) {
+	}
+	mbox[VC_MBOX_WRITE / 4] = request;
+
+	for (;;) {
+		while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
+		}
+		if (mbox[VC_MBOX_READ / 4] == request) {
+			break;
+		}
+	}
+
+	if (msg[1] == VC_MBOX_RESP_OK) {
+		rate = msg[6];  /* response rate (Hz) */
+	}
+
+	munmap(msg_page, _PAGE_SIZE);
+	munmap(mbox_page, _PAGE_SIZE);
+	return rate;
+}
+
+
+static int diag_format_clocks(char *buf, size_t cap)
+{
+	int off = 0, r;
+	uint32_t rate_emmc, rate_emmc2;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 clocks\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	rate_emmc  = diag_mboxGetClockRate(VC_CLOCK_EMMC);
+	rate_emmc2 = diag_mboxGetClockRate(VC_CLOCK_EMMC2);
+
+	r = snprintf(buf + off, cap - off,
+		"EMMC  (id=1) : rate_hz = %u\n"
+		"EMMC2 (id=12): rate_hz = %u\n",
+		(unsigned)rate_emmc, (unsigned)rate_emmc2);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 0 scout: dump Pi 4 GPFSEL3/4 + register-zero reads from
  * candidate MMC/SDIO host controllers, to determine which one is
  * wired to the BCM43455 on this board.
@@ -417,6 +541,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 's') {
 		len = diag_format_sdio_scout(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'c') {
+		len = diag_format_clocks(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

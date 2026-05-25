@@ -34,6 +34,11 @@ typedef struct netif_driver_ {
 	size_t state_sz, state_align;
 	const char *name;
 	const char *(*media)(struct netif *netif);
+	/* Optional: write a NUL-terminated driver-specific stats line into
+	 * `buf` (no trailing newline). Returns bytes written, or 0 / negative
+	 * if unavailable. Drivers without per-instance counters leave this
+	 * NULL and the diag responder falls back to the global lwip stats. */
+	int (*stats)(struct netif *netif, char *buf, size_t cap);
 } netif_driver_t;
 
 

@@ -150,6 +150,15 @@ int main(int argc, char **argv)
 	}
 #endif
 
+	/* Network-routed observability — a UDP responder on port 9999.
+	 * Survives the post-fbcon UART silence on Pi 4 and gives the host
+	 * a way to read per-netif counters with `nc -u`. Side-effect-free
+	 * on systems with at least one interface up. */
+	if (have_intfs > 0) {
+		void init_diag_udp(void);
+		init_diag_udp();
+	}
+
 	mainLoop();
 
 	return 1;

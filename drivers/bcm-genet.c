@@ -1019,6 +1019,23 @@ static const char *genet_media(struct netif *netif)
 }
 
 
+static int genet_stats(struct netif *netif, char *buf, size_t cap)
+{
+	genet_state_t *state = netif->state;
+	int r;
+
+	r = snprintf(buf, cap,
+		"rx=%lu rx_drop=%lu tx=%lu tx_timeout=%lu link=%d/%dMbps/%s mac_src=%s",
+		state->rx_pkts_seen, state->rx_pkts_dropped,
+		state->tx_pkts, state->tx_timeouts,
+		state->last_link_up, state->last_speed,
+		state->last_duplex ? "full" : "half",
+		state->mac_is_fallback ? "fallback" : "mailbox");
+
+	return (r > 0 && (size_t)r < cap) ? r : 0;
+}
+
+
 /* --- netif init -------------------------------------------------- */
 
 static int genet_parseCfg(genet_state_t *state, char *cfg, char **phy_cfg_out)
@@ -1249,6 +1266,7 @@ static netif_driver_t genet_drv = {
 	.state_align = _Alignof(genet_state_t),
 	.name = "genet",
 	.media = genet_media,
+	.stats = genet_stats,
 };
 
 

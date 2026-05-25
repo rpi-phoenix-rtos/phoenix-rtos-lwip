@@ -1229,6 +1229,67 @@ static int diag_format_wifi(char *buf, size_t cap)
 }
 
 
+/* DCBAA dump: read the Device Context Base Address Array from
+ * DRAM via Phoenix's pmap (CPU view). usb-hcd writes this region as
+ * cached or coherent DRAM; the VL805 reads it via PCIe bus master
+ * DMA. If the CPU view shows valid device-context pointers but the
+ * controller HSE's trying to DMA-read the same region, H1 (memory
+ * coherence between CPU writes + PCIe DMA reads) is confirmed.
+ *
+ * usb-hcd allocates DCBAA via dmammap (uncached, MAP_CONTIGUOUS).
+ * The PA is stamped into the controller's DCBAAP_LO register — we
+ * read 0x032ff000 in cycles 1-5. */
+static int diag_format_dcbaa(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *page;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 dcbaa\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	/* DCBAAP PA from cycles 1-5; could parse from xHCI snapshot but
+	 * this is faster for a side experiment. Same dmammap pool so
+	 * the PA should be stable across boots (it has been across 5). */
+	page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0x032ff000u);
+	if (page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint32_t *dcbaa = (volatile uint32_t *)page;
+		/* DCBAA entries are 64-bit (low + high u32). Slot 0 is reserved
+		 * for the Scratchpad Buffer Array; slots 1..MaxSlotsEn are
+		 * device-context pointers. Print first 16 entries. */
+		int i;
+		for (i = 0; i < 16; ++i) {
+			uint32_t lo = dcbaa[i * 2 + 0];
+			uint32_t hi = dcbaa[i * 2 + 1];
+			r = snprintf(buf + off, cap - off,
+				"DCBAA[%2d] = 0x%08x_%08x\n", i,
+				(unsigned)hi, (unsigned)lo);
+			if (r < 0 || (size_t)r >= cap - off) {
+				break;
+			}
+			off += r;
+		}
+	}
+
+	munmap(page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* USB resumption probe per docs/usb-resumption-strategy.md.
  *
  * Reads xHCI MMIO + USB HCD power state + throttle bits from this
@@ -1592,6 +1653,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'x') {
 		len = diag_format_xhci(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'd') {
+		len = diag_format_dcbaa(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

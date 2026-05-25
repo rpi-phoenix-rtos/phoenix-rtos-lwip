@@ -1962,6 +1962,284 @@ static int diag_format_sdio_enum(char *buf, size_t cap)
 }
 
 
+/* CMD52 (IO_RW_DIRECT) wrapper. SDIO arg layout:
+ *   bit  31    R/W   (1 = write, 0 = read)
+ *   bits 30:28 FN    (function number 0..7)
+ *   bit  27    RAW   (read-after-write, write-only path)
+ *   bit  26    stuff
+ *   bits 25:9  REG   (17-bit register address)
+ *   bit  8     stuff
+ *   bits 7:0   DATA  (write data or stuff for read)
+ *
+ * Returns diag_sdhciCmd rc; on success, resp_out[0] bits 7:0 contain
+ * either the data byte (read) or the echoed write byte. resp_out must
+ * be at least a 4-element uint32_t array since diag_sdhciCmd unconditionally
+ * dumps all four response slots. */
+static int diag_sdioCmd52(volatile uint8_t *sdhci, int write, int fn,
+	uint32_t reg, uint8_t data, uint32_t *resp_out)
+{
+	uint32_t arg = 0;
+
+	arg |= (write ? 1u : 0u) << 31;
+	arg |= ((uint32_t)fn & 7u) << 28;
+	arg |= ((uint32_t)reg & 0x1ffffu) << 9;
+	if (write) {
+		arg |= (uint32_t)data;
+	}
+	return diag_sdhciCmd(sdhci, 52u, arg, SDHCI_RESP_R5, resp_out);
+}
+
+
+/* WiFi Tier 4: CIS read + Function 1 enable + chip-id readback.
+ *
+ * After the standard CMD5/3/7 enumeration (same as Tier 3), this:
+ *
+ *   1. Reads CCCR 0x09/0x0A/0x0B to get the F0 CIS pointer (24-bit LE).
+ *   2. Reads the first 8 bytes at the CIS pointer (one CMD52 per byte).
+ *      The first tuple should be TPL_MANFID (code 0x20) with vendor
+ *      0x02D0 (Broadcom) and device 0xA9BF (BCM43455).
+ *   3. Writes CCCR 0x02 IOEn bit 1 to enable Function 1.
+ *   4. Polls CCCR 0x03 IORDY bit 1 (up to 50 ms) until set.
+ *   5. Programs F1 SBADDRLOW/MID/HIGH (regs 0x1000A/B/C) to point the
+ *      32K backplane window at 0x18000000 (ChipCommon core).
+ *   6. Reads F1 regs 0x0..0x3 = ChipCommon.chip_id (32-bit LE). The
+ *      low 16 bits should be 0x4345 (BCM43455 family). */
+static int diag_format_sdio_f1(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t cis_resp[3][4] = {{0}};
+	uint32_t cis_byte[8][4] = {{0}};
+	uint32_t ioen_pre_resp[4] = {0}, ioen_post_resp[4] = {0};
+	uint32_t ioen_set_resp[4] = {0};
+	uint32_t iordy_resp[4] = {0};
+	uint32_t sbaddr_pre[3][4] = {{0}};
+	uint32_t sbaddr_set[3][4] = {{0}};
+	uint32_t f1_chipid[4][4] = {{0}};
+	int rc_ocr = -1, rc_claim = -1, rc_rca = -1, rc_sel = -1;
+	int rc_cis[3] = {-1, -1, -1};
+	int rc_cis_body[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+	int rc_ioen_pre = -1, rc_ioen_set = -1, rc_ioen_post = -1;
+	int rc_iordy = -1;
+	int rc_sbaddr_set[3] = {-1, -1, -1};
+	int rc_f1_chipid[4] = {-1, -1, -1, -1};
+	int ready_iters = 0, rdy_iters = 0;
+	uint16_t rca = 0;
+	uint32_t cis_ptr = 0;
+	int i;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-f1\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+
+		/* Re-assert Tier 1c power-on (idempotent). */
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		/* SDIO enumeration (same as Tier 3). */
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		rc_rca = diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		/* Tier 4a: F0 CIS pointer = CCCR 0x09..0x0B (little-endian). */
+		rc_cis[0] = diag_sdioCmd52(sdhci, 0, 0, 0x09u, 0u, cis_resp[0]);
+		rc_cis[1] = diag_sdioCmd52(sdhci, 0, 0, 0x0Au, 0u, cis_resp[1]);
+		rc_cis[2] = diag_sdioCmd52(sdhci, 0, 0, 0x0Bu, 0u, cis_resp[2]);
+		cis_ptr = (cis_resp[0][0] & 0xffu) |
+			((cis_resp[1][0] & 0xffu) << 8) |
+			((cis_resp[2][0] & 0xffu) << 16);
+
+		/* Tier 4b: read first 8 bytes at CIS pointer. */
+		if (cis_ptr != 0u) {
+			for (i = 0; i < 8; ++i) {
+				rc_cis_body[i] = diag_sdioCmd52(sdhci, 0, 0,
+					cis_ptr + (uint32_t)i, 0u, cis_byte[i]);
+			}
+		}
+
+		/* Tier 4c: enable F1 via CCCR 0x02 IOEn bit 1. */
+		rc_ioen_pre = diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		rc_ioen_set = diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), ioen_set_resp);
+		/* Poll CCCR 0x03 IORDY bit 1 up to 50 ms. */
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		rc_ioen_post = diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_post_resp);
+
+		/* Tier 4d: program F1 backplane window to ChipCommon (0x18000000).
+		 * SBADDR layout (per Linux brcmfmac / Cypress WHD):
+		 *   LOW  (F1 0x1000A) = bit 15 of addr in bit 7 (rest reserved)
+		 *   MID  (F1 0x1000B) = bits[23:16] of addr
+		 *   HIGH (F1 0x1000C) = bits[31:24] of addr
+		 * For 0x18000000: LOW=0x00 MID=0x00 HIGH=0x18. */
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Au, 0u, sbaddr_pre[0]);
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Bu, 0u, sbaddr_pre[1]);
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Cu, 0u, sbaddr_pre[2]);
+		rc_sbaddr_set[0] = diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, sbaddr_set[0]);
+		rc_sbaddr_set[1] = diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, sbaddr_set[1]);
+		rc_sbaddr_set[2] = diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, sbaddr_set[2]);
+
+		/* Tier 4e: read F1 regs 0..3 = ChipCommon.chip_id (32-bit LE). */
+		for (i = 0; i < 4; ++i) {
+			rc_f1_chipid[i] = diag_sdioCmd52(sdhci, 0, 1,
+				(uint32_t)i, 0u, f1_chipid[i]);
+		}
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"CMD5(0)    rc=%d  resp=%08x\n"
+		"CMD5(ocr)  rc=%d  resp=%08x  ready_iters=%d  C=%d\n"
+		"CMD3       rc=%d  resp=%08x  RCA=0x%04x\n"
+		"CMD7(rca)  rc=%d  resp=%08x\n",
+		rc_ocr, (unsigned)ocr_resp[0],
+		rc_claim, (unsigned)claim_resp[0], ready_iters,
+		(int)((claim_resp[0] >> 31) & 1u),
+		rc_rca, (unsigned)rca_resp[0], (unsigned)rca,
+		rc_sel, (unsigned)sel_resp[0]);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"F0 CIS ptr rc=%d/%d/%d  bytes=%02x %02x %02x  -> 0x%06x\n",
+		rc_cis[0], rc_cis[1], rc_cis[2],
+		(unsigned)(cis_resp[0][0] & 0xff),
+		(unsigned)(cis_resp[1][0] & 0xff),
+		(unsigned)(cis_resp[2][0] & 0xff),
+		(unsigned)cis_ptr);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"CIS[0..7]  %02x %02x %02x %02x %02x %02x %02x %02x  rc=%d/%d/%d/%d/%d/%d/%d/%d\n",
+		(unsigned)(cis_byte[0][0] & 0xff), (unsigned)(cis_byte[1][0] & 0xff),
+		(unsigned)(cis_byte[2][0] & 0xff), (unsigned)(cis_byte[3][0] & 0xff),
+		(unsigned)(cis_byte[4][0] & 0xff), (unsigned)(cis_byte[5][0] & 0xff),
+		(unsigned)(cis_byte[6][0] & 0xff), (unsigned)(cis_byte[7][0] & 0xff),
+		rc_cis_body[0], rc_cis_body[1], rc_cis_body[2], rc_cis_body[3],
+		rc_cis_body[4], rc_cis_body[5], rc_cis_body[6], rc_cis_body[7]);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	if ((cis_byte[0][0] & 0xffu) == 0x20u && (cis_byte[1][0] & 0xffu) >= 4u) {
+		uint16_t vendor = (uint16_t)((cis_byte[2][0] & 0xffu) |
+			((cis_byte[3][0] & 0xffu) << 8));
+		uint16_t device = (uint16_t)((cis_byte[4][0] & 0xffu) |
+			((cis_byte[5][0] & 0xffu) << 8));
+		r = snprintf(buf + off, cap - off,
+			"TPL_MANFID vendor=0x%04x device=0x%04x  %s\n",
+			(unsigned)vendor, (unsigned)device,
+			(vendor == 0x02D0u && device == 0xA9A6u) ? "(BCM43455)" : "");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"F1 IOEn pre rc=%d val=0x%02x  set rc=%d  IORDY rc=%d iters=%d val=0x%02x  IOEn post rc=%d val=0x%02x\n",
+		rc_ioen_pre, (unsigned)(ioen_pre_resp[0] & 0xff),
+		rc_ioen_set, rc_iordy, rdy_iters,
+		(unsigned)(iordy_resp[0] & 0xff),
+		rc_ioen_post, (unsigned)(ioen_post_resp[0] & 0xff));
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"F1 SBADDR pre L=%02x M=%02x H=%02x  set rc=%d/%d/%d -> L=00 M=00 H=18\n",
+		(unsigned)(sbaddr_pre[0][0] & 0xff),
+		(unsigned)(sbaddr_pre[1][0] & 0xff),
+		(unsigned)(sbaddr_pre[2][0] & 0xff),
+		rc_sbaddr_set[0], rc_sbaddr_set[1], rc_sbaddr_set[2]);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	{
+		uint32_t cid = (f1_chipid[0][0] & 0xffu) |
+			((f1_chipid[1][0] & 0xffu) << 8) |
+			((f1_chipid[2][0] & 0xffu) << 16) |
+			((f1_chipid[3][0] & 0xffu) << 24);
+		r = snprintf(buf + off, cap - off,
+			"F1 backplane[0..3] rc=%d/%d/%d/%d  %02x %02x %02x %02x  chipid=0x%08x  %s\n",
+			rc_f1_chipid[0], rc_f1_chipid[1], rc_f1_chipid[2], rc_f1_chipid[3],
+			(unsigned)(f1_chipid[0][0] & 0xff), (unsigned)(f1_chipid[1][0] & 0xff),
+			(unsigned)(f1_chipid[2][0] & 0xff), (unsigned)(f1_chipid[3][0] & 0xff),
+			(unsigned)cid,
+			((cid & 0xffffu) == 0x4345u) ? "(chip=0x4345 BCM43455)" : "");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -2196,6 +2474,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'e') {
 		len = diag_format_sdio_enum(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'f') {
+		len = diag_format_sdio_f1(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

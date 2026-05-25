@@ -1345,6 +1345,133 @@ static int diag_format_dcbaa(char *buf, size_t cap)
 #define VC_DEV_USB_HCD              3u  /* per VC4 mailbox device-id table */
 
 
+/* USBCMD bit definitions used by the HCRST test. */
+#define USB_XHCI_USBCMD_RS       0x00000001u  /* Run/Stop */
+#define USB_XHCI_USBCMD_HCRST    0x00000002u  /* Host Controller Reset */
+#define USB_XHCI_USBSTS_HCH      0x00000001u  /* Host Controller Halted */
+#define USB_XHCI_USBSTS_HSE      0x00000004u  /* Host System Error */
+#define USB_XHCI_USBSTS_CNR      0x00000800u  /* Controller Not Ready */
+
+
+/* USB resumption iteration K: write test from a side process.
+ *
+ * The previous 10-cycle experiment confirmed side-process MMIO READS
+ * work. This probe tests whether side-process MMIO WRITES + the
+ * controller's response to them work. Specifically: issue HCRST
+ * (USBCMD bit 1), then poll until the bit clears (controller signals
+ * reset done) AND USBSTS.CNR clears (controller signals ready).
+ *
+ * Linux/U-Boot/Circle all issue HCRST as one of the first xhci_init
+ * steps after MMIO is mapped. If it works from lwip-port:
+ *   - The controller responds to writes from a process other than
+ *     the one that did the bridge bring-up.
+ *   - The bus-master path may or may not work, but the OS-side
+ *     control path is alive.
+ *   - usb-hcd's failure becomes more interesting: something it does
+ *     between HCRST and R/S=1 (event ring program, CMD ring program,
+ *     DCBAA program) is the actual breakage.
+ * If HCRST does NOT complete from lwip-port:
+ *   - Process-isolation is intact and the wedge is silicon-side. */
+static int diag_format_xhci_reset(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *page;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 xhci-reset\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	page = mmap(NULL, USB_XHCI_MMIO_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, USB_XHCI_MMIO_BASE);
+	if (page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *base = (volatile uint8_t *)page;
+		uint32_t cap_dword = *(volatile uint32_t *)(base + USB_XHCI_CAP_CAPLENGTH_HCIVER);
+		uint8_t caplength = (uint8_t)(cap_dword & 0xFFu);
+
+		if (caplength < 0x20u || caplength >= 0x80u) {
+			r = snprintf(buf + off, cap - off,
+				"abort: CAPLENGTH=0x%02x out of sane range\n.\n",
+				caplength);
+			munmap(page, USB_XHCI_MMIO_SIZE);
+			return off + (r > 0 ? r : 0);
+		}
+
+		{
+			volatile uint32_t *usbcmd = (volatile uint32_t *)(base + caplength + 0x00);
+			volatile uint32_t *usbsts = (volatile uint32_t *)(base + caplength + 0x04);
+			uint32_t pre_usbcmd = *usbcmd;
+			uint32_t pre_usbsts = *usbsts;
+			uint32_t deadline_iters = 1000000u;
+			uint32_t i, hcrst_cleared = 0, cnr_cleared = 0;
+			uint32_t post_usbcmd, post_usbsts;
+
+			/* Stop the controller first if not already halted. */
+			if ((pre_usbsts & USB_XHCI_USBSTS_HCH) == 0u) {
+				*usbcmd = pre_usbcmd & ~USB_XHCI_USBCMD_RS;
+				for (i = 0; i < deadline_iters; ++i) {
+					if ((*usbsts & USB_XHCI_USBSTS_HCH) != 0u) {
+						break;
+					}
+				}
+			}
+
+			/* Trigger HCRST. */
+			*usbcmd = USB_XHCI_USBCMD_HCRST;
+
+			/* Wait for HCRST bit to clear. */
+			for (i = 0; i < deadline_iters; ++i) {
+				if ((*usbcmd & USB_XHCI_USBCMD_HCRST) == 0u) {
+					hcrst_cleared = i;
+					break;
+				}
+			}
+
+			/* Wait for CNR (Controller Not Ready) to clear. */
+			for (i = 0; i < deadline_iters; ++i) {
+				if ((*usbsts & USB_XHCI_USBSTS_CNR) == 0u) {
+					cnr_cleared = i;
+					break;
+				}
+			}
+
+			post_usbcmd = *usbcmd;
+			post_usbsts = *usbsts;
+
+			r = snprintf(buf + off, cap - off,
+				"pre  USBCMD=0x%08x  USBSTS=0x%08x\n"
+				"HCRST cleared at iter %u%s\n"
+				"CNR cleared at iter %u%s\n"
+				"post USBCMD=0x%08x  USBSTS=0x%08x\n",
+				(unsigned)pre_usbcmd, (unsigned)pre_usbsts,
+				(unsigned)hcrst_cleared,
+				hcrst_cleared == 0 ? " (already-clear OR timeout)" : "",
+				(unsigned)cnr_cleared,
+				cnr_cleared == 0 ? " (already-clear OR timeout)" : "",
+				(unsigned)post_usbcmd, (unsigned)post_usbsts);
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+	}
+
+	munmap(page, USB_XHCI_MMIO_SIZE);
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 static int diag_format_xhci(char *buf, size_t cap)
 {
 	int off = 0, r;
@@ -1824,6 +1951,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'x') {
 		len = diag_format_xhci(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'R') {
+		len = diag_format_xhci_reset(body, DIAG_REPLY_MAX);
 	}
 	else if (query == 'd') {
 		len = diag_format_dcbaa(body, DIAG_REPLY_MAX);

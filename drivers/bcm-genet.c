@@ -38,6 +38,8 @@
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
+#include "lwip/dhcp.h"
+#include "lwip/tcpip.h"
 
 #include <sys/mman.h>
 #include <sys/threads.h>
@@ -83,6 +85,7 @@ typedef struct {
 	int last_link_up;
 	int last_speed;
 	int last_duplex;
+	int dhcp_started;
 	uint32_t link_poll_stack[1024] __attribute__((aligned(16)));
 
 	/* TX (Tier 2): single DMA buffer, ring of 256 BDs in MMIO. */
@@ -645,8 +648,22 @@ static void genet_rxPollThread(void *arg)
 
 /* --- Link-state callback ---------------------------------------- */
 
+static void genet_dhcpStartCb(void *arg)
+{
+	struct netif *netif = arg;
+	err_t err;
 
-/* --- Link-state callback ---------------------------------------- */
+	/* lwip's DHCP client picks the route via netif_default. Without
+	 * a default netif, DISCOVER goes out with no source-route info
+	 * and lwip's stack-internal validation may silently swallow it. */
+	netif_set_default(netif);
+
+	err = dhcp_start(netif);
+	if (err != ERR_OK) {
+		printf("lwip: genet: dhcp_start in tcpip ctx returned %d\n", (int)err);
+	}
+}
+
 
 static void genet_setLinkState(void *arg, int state_up)
 {
@@ -679,6 +696,18 @@ static void genet_setLinkState(void *arg, int state_up)
 	genet_macSetSpeed(state, speed, full_duplex);
 
 	netif_set_link_up(netif);
+
+	/* Kick DHCP once on the first link-up. dhcp_start touches lwip's
+	 * timer + UDP state, which requires the tcpip-thread context with
+	 * LWIP_TCPIP_CORE_LOCKING=1 — calling it from this thread directly
+	 * "works" (returns ERR_OK) but the DISCOVER never makes it to the
+	 * wire because the dhcp timer never starts. Schedule via
+	 * tcpip_callback so lwip runs it in the right context. */
+	if (state->dhcp_started == 0) {
+		err_t err = tcpip_callback(genet_dhcpStartCb, netif);
+		genet_printf(state, "tcpip_callback(dhcp_start): %d", (int)err);
+		state->dhcp_started = 1;
+	}
 }
 
 

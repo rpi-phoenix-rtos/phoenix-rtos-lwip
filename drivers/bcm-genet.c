@@ -23,9 +23,10 @@
  *     a future board variant exposes the line)
  *
  * Caveats still in place:
- *   - UMAC_CMD.PROMISC is on. Lets us validate end-to-end without a
- *     firmware MAC address; the unicast filter path lands when the
- *     mailbox MAC-fetch is plumbed (TODO(TD-Eth-MAC)).
+ *   - MAC source is the VideoCore mailbox property tag 0x10003
+ *     (GET_BOARD_MAC). The previous locally-administered fallback is
+ *     used only if the mailbox call fails; we set UMAC_CMD.PROMISC
+ *     only on that fallback path.
  *   - Static IP 10.42.0.99/24 is assigned on first link-up to bypass
  *     a DHCP-start interaction with this lwip-port (TODO(TD-Eth-DHCP)).
  *
@@ -42,6 +43,7 @@
 #include "physmmap.h"
 #include "ephy.h"
 #include "bcm-genet-regs.h"
+#include "board_config.h"
 
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
@@ -87,6 +89,7 @@ typedef struct {
 	struct netif *netif;
 
 	uint8_t mac[6];
+	bool mac_is_fallback;
 
 	int mdio_bus;
 	eth_phy_state_t phy;
@@ -198,6 +201,107 @@ static void genet_writeMac(genet_state_t *state)
 	genet_write(state, UMAC_MAC0, hi);
 	genet_write(state, UMAC_MAC1, lo);
 }
+
+
+/* --- VideoCore mailbox: GET_BOARD_MAC (property tag 0x10003) ---- */
+
+#if defined(RPI_MAILBOX_BASE_ADDRESS)
+
+/* BCM2835 VideoCore mailbox layout (relative to RPI_MAILBOX_BASE_ADDRESS). */
+#define VC_MBOX_READ         0x00u
+#define VC_MBOX_STATUS       0x18u
+#define VC_MBOX_WRITE        0x20u
+#define VC_MBOX_STATUS_FULL  0x80000000u
+#define VC_MBOX_STATUS_EMPTY 0x40000000u
+#define VC_MBOX_RESP_OK      0x80000000u
+#define VC_MBOX_PROP_CHANNEL 8u
+#define VC_PROP_GET_BOARD_MAC 0x00010003u
+
+
+static int genet_mboxGetMac(uint8_t out[6])
+{
+	volatile uint32_t *mbox;
+	uint32_t *msg;
+	uintptr_t pa_base, pa_offs, msg_pa;
+	uint32_t request;
+	int ret = -EIO;
+
+	pa_base = (uintptr_t)RPI_MAILBOX_BASE_ADDRESS & ~(uintptr_t)(_PAGE_SIZE - 1U);
+	pa_offs = (uintptr_t)RPI_MAILBOX_BASE_ADDRESS & (uintptr_t)(_PAGE_SIZE - 1U);
+
+	mbox = physmmap((addr_t)pa_base, _PAGE_SIZE);
+	if (mbox == MAP_FAILED) {
+		return -ENOMEM;
+	}
+	mbox = (volatile uint32_t *)((volatile uint8_t *)mbox + pa_offs);
+
+	/* Property message buffer must be 16-byte aligned and uncached.
+	 * dmammap is page-aligned + uncached + contiguous — meets all
+	 * VC4 mailbox requirements. */
+	msg = dmammap(_PAGE_SIZE);
+	if (msg == NULL) {
+		physunmap((void *)((volatile uint8_t *)mbox - pa_offs), _PAGE_SIZE);
+		return -ENOMEM;
+	}
+
+	/* Property packet:
+	 *   [0]  total size (bytes, including this header + END terminator)
+	 *   [1]  REQUEST (0)
+	 *   [2]  tag id (GET_BOARD_MAC)
+	 *   [3]  value buffer size (8 bytes — 6-byte MAC padded)
+	 *   [4]  request/response code (firmware sets bit 31 + actual length)
+	 *   [5]  MAC bytes [0..3]    (firmware fills)
+	 *   [6]  MAC bytes [4..5]+pad (firmware fills)
+	 *   [7]  END (0) */
+	msg[0] = 32;
+	msg[1] = 0;
+	msg[2] = VC_PROP_GET_BOARD_MAC;
+	msg[3] = 8;
+	msg[4] = 0;
+	msg[5] = 0;
+	msg[6] = 0;
+	msg[7] = 0;
+
+	msg_pa = va2pa(msg);
+	if (msg_pa == (uintptr_t)-1) {
+		goto out;
+	}
+	request = ((uint32_t)msg_pa & ~0xFu) | VC_MBOX_PROP_CHANNEL;
+
+	while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_FULL) != 0u) {
+	}
+	mbox[VC_MBOX_WRITE / 4] = request;
+
+	for (;;) {
+		while ((mbox[VC_MBOX_STATUS / 4] & VC_MBOX_STATUS_EMPTY) != 0u) {
+		}
+		if (mbox[VC_MBOX_READ / 4] == request) {
+			break;
+		}
+	}
+
+	if (msg[1] == VC_MBOX_RESP_OK) {
+		const uint8_t *src = (const uint8_t *)&msg[5];
+		out[0] = src[0]; out[1] = src[1]; out[2] = src[2];
+		out[3] = src[3]; out[4] = src[4]; out[5] = src[5];
+		ret = 0;
+	}
+
+out:
+	munmap(msg, _PAGE_SIZE);
+	physunmap((void *)((volatile uint8_t *)mbox - pa_offs), _PAGE_SIZE);
+	return ret;
+}
+
+#else  /* !RPI_MAILBOX_BASE_ADDRESS */
+
+static int genet_mboxGetMac(uint8_t out[6])
+{
+	(void)out;
+	return -ENOTSUP;
+}
+
+#endif
 
 
 static void genet_dmaDisable(genet_state_t *state)
@@ -476,10 +580,16 @@ static void genet_macSetSpeed(genet_state_t *state, int speed, int full_duplex)
 
 	cmd |= CMD_TX_EN | CMD_RX_EN;
 
-	/* TODO(TD-Eth-Promisc): drop once Tier 4 uses the real MAC and
-	 * proves the unicast filter doesn't drop ARP replies. PROMISC keeps
-	 * the diagnostic surface minimal while we validate Tier 3 RX. */
-	cmd |= CMD_PROMISC;
+	/* PROMISC is set only when we fell back to the locally-administered
+	 * MAC. With a real board MAC from VideoCore, the unicast filter is
+	 * the correct path — promisc here would just hurt CPU under broadcast
+	 * storms. */
+	if (state->mac_is_fallback) {
+		cmd |= CMD_PROMISC;
+	}
+	else {
+		cmd &= ~CMD_PROMISC;
+	}
 
 	genet_write(state, UMAC_CMD, cmd);
 }
@@ -975,25 +1085,36 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 		return err;
 	}
 
-	/* Try the firmware-pre-programmed MAC first. On Pi 4 the VideoCore
-	 * firmware does *not* push the board MAC into UMAC_MAC0/UMAC_MAC1 —
-	 * Linux fetches it from the DT's local-mac-address property or via
-	 * the BCM2835 mailbox GET_BOARD_MAC (tag 0x10003) and then writes it
-	 * back. Phoenix does not yet expose either route from userspace, so
-	 * for Tier 1 we fall back to a deterministic locally-administered
-	 * MAC derived from the SoC's GENET MMIO offset. This is enough for
-	 * link-up validation; Tier 2+ will plumb a proper MAC source.
-	 *   TODO(TD-Eth-MAC): query VideoCore mailbox / DT for the real MAC. */
+	/* MAC source priority on Pi 4:
+	 *   1. UMAC_MAC0/MAC1 (if firmware pre-programmed it — Pi 3 does
+	 *      this, Pi 4 does not).
+	 *   2. VideoCore mailbox property GET_BOARD_MAC (tag 0x10003).
+	 *      This is what Linux's bcmgenet ends up using on Pi 4.
+	 *   3. Locally-administered fallback. Lets the netif come up far
+	 *      enough to surface other issues; we set CMD_PROMISC in this
+	 *      case since the unicast filter would otherwise drop traffic
+	 *      destined for the real board MAC. */
+	state->mac_is_fallback = false;
 	genet_readMac(state);
 	if ((state->mac[0] | state->mac[1] | state->mac[2] | state->mac[3] |
 		state->mac[4] | state->mac[5]) == 0) {
-		state->mac[0] = 0x02;  /* locally administered, unicast */
-		state->mac[1] = 0xB8;
-		state->mac[2] = 0x27;  /* RPi-Foundation OUI tail, helps log scans */
-		state->mac[3] = 0xEB;
-		state->mac[4] = 0x00;
-		state->mac[5] = 0x01;
-		genet_printf(state, "no firmware MAC in UMAC_MAC{0,1}; using fallback");
+		uint8_t mbox_mac[6];
+		if (genet_mboxGetMac(mbox_mac) == 0 &&
+			(mbox_mac[0] | mbox_mac[1] | mbox_mac[2] |
+				mbox_mac[3] | mbox_mac[4] | mbox_mac[5]) != 0) {
+			memcpy(state->mac, mbox_mac, 6);
+			genet_printf(state, "MAC from VideoCore mailbox");
+		}
+		else {
+			state->mac[0] = 0x02;  /* locally administered, unicast */
+			state->mac[1] = 0xB8;
+			state->mac[2] = 0x27;  /* RPi-Foundation OUI tail, helps log scans */
+			state->mac[3] = 0xEB;
+			state->mac[4] = 0x00;
+			state->mac[5] = 0x01;
+			state->mac_is_fallback = true;
+			genet_printf(state, "no firmware/mailbox MAC; using LAA fallback (PROMISC on)");
+		}
 	}
 	genet_printf(state, "MAC %02x:%02x:%02x:%02x:%02x:%02x",
 		state->mac[0], state->mac[1], state->mac[2],

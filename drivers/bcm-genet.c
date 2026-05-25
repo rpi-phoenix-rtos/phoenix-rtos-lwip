@@ -7,19 +7,27 @@
  *
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Scope as of the head of agent/rpi4-genet:
+ * Tier 5 scope:
  *   - MMIO map, GENET v5 silicon ID validation, UMAC reset
  *   - MDIO bus exposed to ephy.c (BCM54213PE)
  *   - RGMII / SYS_PORT_CTRL / RBUF / DMA init per Linux + Circle refs
- *   - TX: single-slot polled descriptor (verified on the wire via
- *     host-side tcpdump)
- *   - RX: 256-BD ring with per-BD pre-programmed phys address, 100 Hz
- *     poll thread. HW writes to BD memory observed but RDMA_PROD_INDEX
- *     advancement is still open — TODO(TD-Eth-RX). Diagnostic prints
- *     in genet_rxPollThread are kept until that's resolved.
+ *   - TX: single-slot synchronous polled descriptor (one in-flight frame
+ *     at a time; the linkoutput call returns only after the HW consumer
+ *     index advances)
+ *   - RX: 256-BD ring with cyclic aliasing of 16 unique pinned buffers,
+ *     INTRL2_0_RX_DMA_DONE wakes a service thread that drains BDs into
+ *     lwip-owned pbufs and hands them to tcpip_input
+ *   - Link state: 1 Hz polling thread (the BCM54213PE PHY's INT_B pin
+ *     is not routed to a GIC SPI on the Pi 4 board, so MDIO polling is
+ *     the only portable option here — TODO(TD-Eth-LinkIRQ) revisit if
+ *     a future board variant exposes the line)
  *
- * No IRQ wiring yet (Tier 4+). DHCP / ARP / lwIP-level integration is
- * Tier 4 once RX is unblocked. WiFi (BCM43455) is parked behind that.
+ * Caveats still in place:
+ *   - UMAC_CMD.PROMISC is on. Lets us validate end-to-end without a
+ *     firmware MAC address; the unicast filter path lands when the
+ *     mailbox MAC-fetch is plumbed (TODO(TD-Eth-MAC)).
+ *   - Static IP 10.42.0.99/24 is assigned on first link-up to bypass
+ *     a DHCP-start interaction with this lwip-port (TODO(TD-Eth-DHCP)).
  *
  * References (BEHAVIORAL only — fresh-code per CLAUDE.md
  * upstreamability guidance):
@@ -41,6 +49,7 @@
 #include "lwip/dhcp.h"
 #include "lwip/tcpip.h"
 
+#include <sys/interrupt.h>
 #include <sys/mman.h>
 #include <sys/threads.h>
 #include <sys/time.h>
@@ -82,8 +91,8 @@ typedef struct {
 	int mdio_bus;
 	eth_phy_state_t phy;
 
-	int irq_general;  /* SPI 189 — reserved for Tier 4+ */
-	int irq_ring;     /* SPI 190 — reserved for Tier 5 */
+	int irq_general;  /* GIC IRQ for INTRL2_0 (SPI 157 = abs 189) */
+	int irq_ring;     /* GIC IRQ for INTRL2_1 (SPI 158 = abs 190; unused) */
 
 	int last_link_up;
 	int last_speed;
@@ -91,14 +100,16 @@ typedef struct {
 	int dhcp_started;
 	uint32_t link_poll_stack[1024] __attribute__((aligned(16)));
 
-	/* TX (Tier 2): single DMA buffer, ring of 256 BDs in MMIO. */
+	/* TX: single DMA buffer, ring of 256 BDs in MMIO. */
 	void *tx_buf;
 	addr_t tx_buf_phys;
 	handle_t tx_lock;
 	uint32_t tx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
 	uint32_t tx_prod_index;  /* 16-bit running counter the HW compares to CONS_INDEX */
+	unsigned long tx_pkts;
+	unsigned long tx_timeouts;
 
-	/* RX (Tier 3): per-slot buffers + polling thread. The BD's address
+	/* RX: per-slot buffers + IRQ-driven service thread. The BD's address
 	 * is programmed once at init — HW writes received frames into the
 	 * same physical buffer each time the BD comes back around. */
 	void *rx_bufs[GENET_RX_SLOTS];
@@ -107,7 +118,15 @@ typedef struct {
 	uint32_t rx_c_index;     /* SW's view, mirrors RDMA_RING_CONS_INDEX */
 	unsigned long rx_pkts_seen;
 	unsigned long rx_pkts_dropped;
-	uint32_t rx_poll_stack[2048] __attribute__((aligned(16)));
+
+	/* IRQ plumbing: handler runs in interrupt context, masks the level-2
+	 * source bits it's about to service, signals irq_cond; irq_thread
+	 * drains the affected rings and re-unmasks before going back to sleep. */
+	handle_t irq_lock;
+	handle_t irq_cond;
+	handle_t irq_handle;
+	uint32_t irq_events;
+	uint32_t irq_stack[2048] __attribute__((aligned(16)));
 } genet_state_t;
 
 
@@ -579,103 +598,122 @@ static int genet_initRxRing(genet_state_t *state)
 }
 
 
-static void genet_rxPollThread(void *arg)
+static void genet_drainRxRing(genet_state_t *state)
 {
-	genet_state_t *state = arg;
 	uint32_t ring_off = GENET_RX_RINGS_OFF + GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
-	unsigned ticks = 0;
-	uint32_t last_bd0_status = ~0u;
 
-	for (;;) {
-		usleep(10 * 1000);  /* 10 ms — Tier 3 polled cadence. */
+	/* RDMA PROD_INDEX is at offset 0x08 (NOT 0x0C, which is the TX
+	 * layout — RDMA mirrors the producer/consumer pair). */
+	uint32_t prod = genet_read(state,
+		ring_off + GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu;
 
-		/* RDMA PROD_INDEX is at offset 0x08 (NOT 0x0C, which is the
-		 * TX layout — RDMA mirrors the producer/consumer pair). */
-		uint32_t prod = genet_read(state,
-			ring_off + GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu;
+	while (prod != (state->rx_c_index & 0xFFFFu)) {
+		uint32_t bd_off = GENET_RX_DESCS_OFF +
+			state->rx_index * GENET_DMA_DESC_SIZE;
+		uint32_t status = genet_read(state, bd_off + 0);
+		uint16_t frame_len_total = (uint16_t)((status & BD_LEN_MASK) >> BD_LEN_SHIFT);
 
-		while (prod != (state->rx_c_index & 0xFFFFu)) {
-			uint32_t bd_off = GENET_RX_DESCS_OFF +
-				state->rx_index * GENET_DMA_DESC_SIZE;
-			uint32_t status = genet_read(state, bd_off + 0);
-			uint16_t frame_len_total = (uint16_t)((status & BD_LEN_MASK) >> BD_LEN_SHIFT);
+		/* GENET prepends a 66-byte block to every frame (2-byte
+		 * alignment + 64-byte status, see RBUF_64B_EN + RBUF_ALIGN_2B
+		 * during init). lwip is built with ETH_PAD_SIZE=2, so the pbuf
+		 * we hand up must reserve 2 bytes of head pad before the L2
+		 * header for ethernet_input's pbuf_remove_header. */
+		if (frame_len_total > GENET_RX_STATUS_PREFIX &&
+			(status & (BD_STATUS_SOP | BD_STATUS_EOP)) ==
+			(BD_STATUS_SOP | BD_STATUS_EOP) &&
+			(status & GENET_RX_STATUS_ERROR_MASK) == 0u) {
+			uint16_t pay_len = frame_len_total - GENET_RX_STATUS_PREFIX;
+			uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
+			uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
 
-			/* Print every RX so we can see ARP requests landing.
-			 * Show the destination MAC of the frame to distinguish
-			 * broadcast / unicast / multicast. */
-			{
-				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
-				uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
-				genet_printf(state,
-					"RX#%lu len=%u st=0x%08x dst=%02x:%02x:%02x:%02x:%02x:%02x type=0x%02x%02x",
-					state->rx_pkts_seen, frame_len_total, status,
-					frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
-					frame[12], frame[13]);
-			}
-
-			/* GENET prepends a 66-byte block to every frame
-			 * (2-byte alignment + 64-byte status, see RBUF_64B_EN +
-			 * RBUF_ALIGN_2B during init). Actual Ethernet frame starts
-			 * at buf+66.
-			 *
-			 * lwip is built with ETH_PAD_SIZE=2 (see lwipopts.h), which
-			 * means ethernet_input() does pbuf_remove_header(p, 2)
-			 * BEFORE casting payload to struct eth_hdr. The pbuf we
-			 * hand up must therefore have 2 bytes of head padding
-			 * BEFORE the actual L2 header. Without this, lwip reads
-			 * the eth header from frame[2..15] — i.e. src_mac mid-byte
-			 * — and silently drops the frame as a bad ethertype. */
-			if (frame_len_total > GENET_RX_STATUS_PREFIX &&
-				(status & (BD_STATUS_SOP | BD_STATUS_EOP)) ==
-				(BD_STATUS_SOP | BD_STATUS_EOP) &&
-				(status & GENET_RX_STATUS_ERROR_MASK) == 0u) {
-				uint16_t pay_len = frame_len_total - GENET_RX_STATUS_PREFIX;
-				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
-				uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
-
-				/* PBUF_RAM = contiguous heap allocation. Avoids the
-				 * pool-pbuf chain quirks where the first pbuf might
-				 * carry only a small portion of the payload, which
-				 * confuses ARP/ICMP parsers that expect the L2 + L3
-				 * header in one contiguous span. */
-				struct pbuf *p = pbuf_alloc(PBUF_RAW,
-					(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_RAM);
-				if (p != NULL) {
-					/* Zero the 2-byte pad, copy the L2+payload after it. */
-					((uint8_t *)p->payload)[0] = 0;
-					((uint8_t *)p->payload)[1] = 0;
-					if (pbuf_take_at(p, frame, pay_len, ETH_PAD_SIZE) == ERR_OK) {
-						if (state->netif->input(p, state->netif) != ERR_OK) {
-							pbuf_free(p);
-							state->rx_pkts_dropped++;
-						}
-					}
-					else {
+			struct pbuf *p = pbuf_alloc(PBUF_RAW,
+				(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_RAM);
+			if (p != NULL) {
+				((uint8_t *)p->payload)[0] = 0;
+				((uint8_t *)p->payload)[1] = 0;
+				if (pbuf_take_at(p, frame, pay_len, ETH_PAD_SIZE) == ERR_OK) {
+					if (state->netif->input(p, state->netif) != ERR_OK) {
 						pbuf_free(p);
 						state->rx_pkts_dropped++;
 					}
 				}
 				else {
+					pbuf_free(p);
 					state->rx_pkts_dropped++;
 				}
 			}
 			else {
-				/* Malformed BD (no SOP|EOP, error bits, or undersized
-				 * frame): drop silently, just advance. */
 				state->rx_pkts_dropped++;
 			}
-			state->rx_pkts_seen++;
-
-			state->rx_index = (state->rx_index + 1u) % GENET_TOTAL_DESC;
-			state->rx_c_index = (state->rx_c_index + 1u) & 0xFFFFu;
 		}
+		else {
+			state->rx_pkts_dropped++;
+		}
+		state->rx_pkts_seen++;
 
-		/* Hand all consumed BDs back to HW in one shot. */
-		genet_write(state, ring_off + GENET_RDMA_RING_CONS_INDEX,
-			state->rx_c_index);
+		state->rx_index = (state->rx_index + 1u) % GENET_TOTAL_DESC;
+		state->rx_c_index = (state->rx_c_index + 1u) & 0xFFFFu;
+	}
 
-		(void)last_bd0_status;
-		(void)ticks;
+	/* Hand all consumed BDs back to HW in one shot. */
+	genet_write(state, ring_off + GENET_RDMA_RING_CONS_INDEX,
+		state->rx_c_index);
+}
+
+
+/* INTRL2_0 IRQ handler — runs in interrupt context. Masks the bits it
+ * picks up so the line doesn't re-fire before the service thread drains
+ * the affected ring, then signals the cond for it to run. */
+static int genet_irqHandler(unsigned int n, void *arg)
+{
+	genet_state_t *state = arg;
+	uint32_t stat, mask, pending;
+
+	(void)n;
+
+	stat = genet_read(state, GENET_INTRL2_0_OFF + INTRL2_CPU_STAT);
+	mask = genet_read(state, GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_STAT);
+	pending = stat & ~mask;
+	if (pending == 0u) {
+		return 0;
+	}
+
+	/* Mask + clear-on-write so the wire doesn't re-assert before
+	 * genet_irqThread services it. */
+	genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_SET, pending);
+	genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_CLEAR, pending);
+
+	state->irq_events |= pending;
+	return 1;
+}
+
+
+static void genet_irqThread(void *arg)
+{
+	genet_state_t *state = arg;
+	uint32_t events;
+
+	mutexLock(state->irq_lock);
+	for (;;) {
+		while (state->irq_events == 0u) {
+			condWait(state->irq_cond, state->irq_lock, 0);
+		}
+		events = state->irq_events;
+		state->irq_events = 0u;
+		mutexUnlock(state->irq_lock);
+
+		if ((events & INTRL2_0_RX_DMA_DONE) != 0u) {
+			genet_drainRxRing(state);
+		}
+		/* TX_DMA_DONE / LINK_UP / LINK_DOWN are not unmasked today.
+		 * If they ever fire (spurious), the mask-then-clear in the
+		 * handler still leaves them safe to ignore here. */
+
+		/* Re-unmask the bits we just serviced so future events wake us. */
+		genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_CLEAR,
+			events);
+
+		mutexLock(state->irq_lock);
 	}
 }
 
@@ -685,45 +723,25 @@ static void genet_rxPollThread(void *arg)
 static void genet_dhcpStartCb(void *arg)
 {
 	struct netif *netif = arg;
+	ip4_addr_t ip, mask, gw;
 
 	netif_set_default(netif);
 
-	/* Tier 4 validation: assign a static IP and skip DHCP. This proves
-	 * RX → tcpip_input → ARP-reply → TX is fully wired end-to-end —
-	 * the host can `ping 10.42.0.99` and lwip's stack handles the ARP
-	 * + ICMP echo automatically. Once we confirm that, Tier 4b can
-	 * revisit autonomous DHCP (which on this lwip seems to reset the
-	 * netif IP back to 0.0.0.0 the moment dhcp_start runs, defeating
-	 * a pre-set static IP).
-	 *
-	 * 10.42.0.99 is outside the dnsmasq pool (.10..20) so it won't
-	 * collide with the bootloader's earlier DHCP lease. */
-	ip4_addr_t ip, mask, gw;
+	/* TODO(TD-Eth-DHCP): autonomous DHCP. On this lwip-port, dhcp_start
+	 * resets the netif's IP to 0.0.0.0 immediately, so the DISCOVER
+	 * never reaches the wire. A static address keeps the netif usable
+	 * while the lwip-port internals are investigated separately.
+	 * 10.42.0.99 sits outside the host dnsmasq pool (.10..20) on the
+	 * netboot bridge so it won't collide with leased addresses. */
 	IP4_ADDR(&ip, 10, 42, 0, 99);
 	IP4_ADDR(&mask, 255, 255, 255, 0);
 	IP4_ADDR(&gw, 10, 42, 0, 1);
 	netif_set_addr(netif, &ip, &mask, &gw);
-	printf("lwip: genet: static IP set; netif ip=0x%08x mask=0x%08x gw=0x%08x flags=0x%02x name=%c%c%u\n",
-		(unsigned)netif_ip4_addr(netif)->addr,
-		(unsigned)netif_ip4_netmask(netif)->addr,
-		(unsigned)netif_ip4_gw(netif)->addr,
-		netif->flags,
-		netif->name[0], netif->name[1], (unsigned)netif->num);
+	genet_printf((genet_state_t *)netif->state, "static IP 10.42.0.99/24 gw 10.42.0.1");
 
-	/* Verify the netif's output handlers are still wired up. If
-	 * netif->linkoutput is NULL or got clobbered by netif_set_addr,
-	 * lwip's etharp would call a stale pointer and we'd see no
-	 * frames on the wire. */
-	printf("lwip: genet: netif->output=%p netif->linkoutput=%p (genet_linkOutput=%p)\n",
-		(void *)netif->output, (void *)netif->linkoutput,
-		(void *)genet_linkOutput);
-
-	/* Emit one unsolicited (gratuitous) ARP to prove the ARP module +
-	 * linkoutput chain is functional from the tcpip-thread side. If
-	 * this appears on host tcpdump, the request-reply gap isn't TX or
-	 * etharp setup — it's somewhere in how requests reach etharp_input. */
-	err_t ge = etharp_gratuitous(netif);
-	printf("lwip: genet: etharp_gratuitous: %d\n", (int)ge);
+	/* Gratuitous ARP populates host caches and confirms the linkoutput
+	 * path is wired before the first inbound request arrives. */
+	(void)etharp_gratuitous(netif);
 }
 
 
@@ -847,7 +865,11 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	state->tx_prod_index = (state->tx_prod_index + 1u) & 0xFFFFu;
 	genet_write(state, ring_off + GENET_TDMA_RING_PROD_INDEX, state->tx_prod_index);
 
-	/* Polled completion — Tier 2 doesn't run IRQs yet. */
+	/* Polled completion. TX is single-slot synchronous: at most one
+	 * frame is in flight, so latency from condWait/IRQ would dominate
+	 * over the few microseconds it takes the MAC to drain a 1518B
+	 * frame at 1 Gbps (~12 us). When MQ TX lands this will move to
+	 * an IRQ + free-queue ring. */
 	gettime(&now, NULL);
 	deadline = now + GENET_TX_TIMEOUT_US;
 
@@ -858,6 +880,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 		}
 		gettime(&now, NULL);
 		if (now >= deadline) {
+			state->tx_timeouts++;
 			mutexUnlock(state->tx_lock);
 			genet_printf(state, "TX timeout (prod=%u cons=%u)",
 				state->tx_prod_index, cons & 0xFFFFu);
@@ -865,6 +888,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 		}
 	}
 
+	state->tx_pkts++;
 	mutexUnlock(state->tx_lock);
 	return ERR_OK;
 }
@@ -1037,7 +1061,7 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	genet_printf(state, "TX ring 16 ready (BD %u..%u, buf %p phys=0x%08x)",
 		0u, GENET_TOTAL_DESC - 1u, state->tx_buf, (unsigned)state->tx_buf_phys);
 
-	/* Tier 3: RX pool + ring + polling thread. */
+	/* RX pool + ring. */
 	err = genet_initRxRing(state);
 	if (err < 0) {
 		return err;
@@ -1045,12 +1069,42 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	genet_printf(state, "RX ring 16 ready (%u slots, BD 0..%u)",
 		GENET_RX_SLOTS, GENET_RX_SLOTS - 1u);
 
-	err = beginthread(genet_rxPollThread, 4, state->rx_poll_stack,
-		sizeof(state->rx_poll_stack), state);
-	if (err != 0) {
-		genet_printf(state, "rx poll thread failed: %d", err);
+	/* IRQ plumbing: mask everything in INTRL2_0/1 before registering
+	 * the handler (Linux's init_intrl2_set_mask), then enable just
+	 * RX_DMA_DONE. */
+	genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_SET, 0xFFFFFFFFu);
+	genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_CLEAR, 0xFFFFFFFFu);
+	genet_write(state, GENET_INTRL2_1_OFF + INTRL2_CPU_MASK_SET, 0xFFFFFFFFu);
+	genet_write(state, GENET_INTRL2_1_OFF + INTRL2_CPU_CLEAR, 0xFFFFFFFFu);
+
+	if (mutexCreate(&state->irq_lock) != 0) {
+		genet_printf(state, "irq_lock create failed");
+		return -ENOMEM;
+	}
+	if (condCreate(&state->irq_cond) != 0) {
+		genet_printf(state, "irq_cond create failed");
+		return -ENOMEM;
+	}
+
+	err = interrupt(state->irq_general, genet_irqHandler, state,
+		state->irq_cond, &state->irq_handle);
+	if (err < 0) {
+		genet_printf(state, "interrupt() register IRQ %d: %s (%d)",
+			state->irq_general, strerror(-err), err);
 		return err;
 	}
+	genet_printf(state, "IRQ %d registered (INTRL2_0)", state->irq_general);
+
+	err = beginthread(genet_irqThread, 4, state->irq_stack,
+		sizeof(state->irq_stack), state);
+	if (err != 0) {
+		genet_printf(state, "irq thread failed: %d", err);
+		return err;
+	}
+
+	/* Now unmask RX_DMA_DONE so the service thread starts taking work. */
+	genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_CLEAR,
+		INTRL2_0_RX_DMA_DONE);
 
 	/* ephy_init queries the PHY once. With irq:MAC there's no IRQ thread,
 	 * so we spin up our own 1 Hz poller that calls back into genet_setLinkState

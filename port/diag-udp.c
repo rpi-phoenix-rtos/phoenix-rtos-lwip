@@ -1086,11 +1086,29 @@ static int diag_sdhciCmd(volatile uint8_t *base, uint8_t cmd_index,
 
 	/* Program ARGUMENT then COMMAND. Use 32-bit write to TRANS_CMD
 	 * (offset 0x0C): low 16 = TRANSFER_MODE = 0 (no data), high 16 =
-	 * COMMAND. The combined write commits when bit 30:16 lands. */
+	 * COMMAND. The Arasan controller requires the combined 32-bit
+	 * write (per Linux sdhci_iproc_writew shadow pattern).
+	 *
+	 * COMMAND register (offset 0x0E, upper 16 bits of the dword)
+	 * layout:
+	 *   bits 31:24 (= COMMAND bits 15:8)  CMD_NUMBER
+	 *   bits 23:22 (= COMMAND bits 7:6)   CMD_TYPE
+	 *   bit  21    (= COMMAND bit 5)      DATA_PRESENT
+	 *   bit  20    (= COMMAND bit 4)      CMD_INDEX_CHECK_EN
+	 *   bit  19    (= COMMAND bit 3)      CMD_CRC_CHECK_EN
+	 *   bits 17:16 (= COMMAND bits 1:0)   RESPONSE_TYPE
+	 *
+	 * Earlier version stuck resp_type at bits 1:0 of the dword
+	 * (which lands in TRANSFER_MODE, NOT COMMAND), so every command
+	 * went out with RESPONSE_TYPE=0 (no response). The controller
+	 * dutifully asserted CMD_COMPLETE without sampling the bus,
+	 * giving the all-zero RESPONSE_0 mystery from the first SDIO
+	 * probe attempts. */
 	*(volatile uint32_t *)(base + SDHCI_ARGUMENT_1) = arg;
 	{
-		uint32_t cmd_word = (uint32_t)resp_type |
-			((uint32_t)cmd_index << 24);  /* CMD_NUMBER at bits 24..31 */
+		uint32_t cmd_word =
+			((uint32_t)resp_type << 16) |
+			((uint32_t)cmd_index << 24);
 		*(volatile uint32_t *)(base + SDHCI_TRANS_CMD) = cmd_word;
 	}
 

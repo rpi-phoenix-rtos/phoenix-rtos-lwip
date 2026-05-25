@@ -1348,9 +1348,242 @@ static int diag_format_dcbaa(char *buf, size_t cap)
 /* USBCMD bit definitions used by the HCRST test. */
 #define USB_XHCI_USBCMD_RS       0x00000001u  /* Run/Stop */
 #define USB_XHCI_USBCMD_HCRST    0x00000002u  /* Host Controller Reset */
+#define USB_XHCI_USBCMD_INTE     0x00000004u  /* Interrupter Enable */
+#define USB_XHCI_USBCMD_HSEE     0x00000008u  /* Host System Error Enable */
 #define USB_XHCI_USBSTS_HCH      0x00000001u  /* Host Controller Halted */
 #define USB_XHCI_USBSTS_HSE      0x00000004u  /* Host System Error */
 #define USB_XHCI_USBSTS_CNR      0x00000800u  /* Controller Not Ready */
+
+
+/* xHCI register offsets relative to operational base (CAP+caplength).
+ * (Re-stated here for the bring-up handler; USB_XHCI_OP_* above
+ * covers the read-only snapshot side.) */
+#define USB_XHCI_CAP_DBOFF          0x14u  /* doorbell array offset (in cap regs) */
+#define USB_XHCI_CAP_RTSOFF         0x18u  /* runtime registers offset */
+
+#define USB_XHCI_OP_CONFIG_MAXSLOTS 0x38u  /* operational CONFIG.MaxSlotsEn */
+
+/* Runtime register offsets, relative to (CAP + RTSOFF). Each
+ * interrupter is 32 bytes; interrupter 0 starts at RTSOFF+0x20. */
+#define USB_XHCI_RT_IR0_IMAN        0x20u  /* +0x00 */
+#define USB_XHCI_RT_IR0_IMOD        0x24u
+#define USB_XHCI_RT_IR0_ERSTSZ      0x28u
+#define USB_XHCI_RT_IR0_ERSTBA_LO   0x30u
+#define USB_XHCI_RT_IR0_ERSTBA_HI   0x34u
+#define USB_XHCI_RT_IR0_ERDP_LO     0x38u
+#define USB_XHCI_RT_IR0_ERDP_HI     0x3Cu
+
+
+/* USB resumption iteration L: end-to-end xHCI bring-up from lwip-port.
+ *
+ * Builds on iteration K (HCRST works from side process). Does the
+ * full xHCI 4.2-spec initialization sequence:
+ *
+ *   1. HCRST.
+ *   2. Wait for CNR clear.
+ *   3. Allocate DCBAA (1 page, dmammap, uncached, page-aligned).
+ *   4. Allocate event ring (1 page, dmammap).
+ *   5. Allocate ERST table (1 page; only 16 bytes used).
+ *   6. Build ERST entry [event_ring_PA_LO, _HI, ring_size, reserved].
+ *   7. Write CONFIG.MaxSlotsEn = 1.
+ *   8. Write DCBAAP_LO/HI.
+ *   9. Write ERSTSZ = 1 (one segment).
+ *  10. Write ERDP_LO/HI = event_ring_PA.
+ *  11. Write ERSTBA_LO/HI = erst_PA. THIS COMMITS the event ring.
+ *  12. Set USBCMD.R/S = 1.
+ *  13. Poll USBSTS for HCH = 0 (running) or HSE (failed).
+ *  14. Report final state.
+ *
+ * If R/S=1 → HCH=0 with no HSE, the controller is running from
+ * lwip-port's setup. usb-hcd's failure is then narrowed to something
+ * specific in its bring-up. If R/S=1 → HSE, we hit the same wall
+ * from a different process — silicon side is the leading cause again. */
+static int diag_format_xhci_bringup(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *mmio_page, *dcbaa_page, *evt_page, *erst_page, *cmd_page;
+	uintptr_t dcbaa_pa, evt_pa, erst_pa, cmd_pa;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 xhci-bringup\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	mmio_page = mmap(NULL, USB_XHCI_MMIO_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, USB_XHCI_MMIO_BASE);
+	if (mmio_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: xhci mmap failed\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+
+	/* Same allocation flags as drivers/physmmap.c::dmammap(). */
+	#define DMA_FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS)
+	dcbaa_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
+	evt_page   = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
+	erst_page  = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
+	cmd_page   = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
+	#undef DMA_FLAGS
+	if (dcbaa_page == MAP_FAILED || evt_page == MAP_FAILED ||
+		erst_page == MAP_FAILED || cmd_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: dmammap failed\n.\n");
+		if (dcbaa_page != MAP_FAILED) munmap(dcbaa_page, _PAGE_SIZE);
+		if (evt_page   != MAP_FAILED) munmap(evt_page, _PAGE_SIZE);
+		if (erst_page  != MAP_FAILED) munmap(erst_page, _PAGE_SIZE);
+		if (cmd_page   != MAP_FAILED) munmap(cmd_page, _PAGE_SIZE);
+		munmap(mmio_page, USB_XHCI_MMIO_SIZE);
+		return off + (r > 0 ? r : 0);
+	}
+
+	dcbaa_pa = (uintptr_t)va2pa(dcbaa_page);
+	evt_pa   = (uintptr_t)va2pa(evt_page);
+	erst_pa  = (uintptr_t)va2pa(erst_page);
+	cmd_pa   = (uintptr_t)va2pa(cmd_page);
+
+	memset(dcbaa_page, 0, _PAGE_SIZE);
+	memset(evt_page, 0, _PAGE_SIZE);
+	memset(erst_page, 0, _PAGE_SIZE);
+	memset(cmd_page, 0, _PAGE_SIZE);
+
+	/* Build the ERST entry: [seg_PA_LO, seg_PA_HI, ring_size, rsvd]. */
+	{
+		volatile uint32_t *erst = (volatile uint32_t *)erst_page;
+		erst[0] = (uint32_t)(evt_pa & 0xFFFFFFFFu);
+		erst[1] = (uint32_t)((uint64_t)evt_pa >> 32);
+		erst[2] = 256u;  /* event ring segment = 256 TRBs (page) */
+		erst[3] = 0u;
+	}
+
+	{
+		volatile uint8_t *base = (volatile uint8_t *)mmio_page;
+		uint32_t cap_dword = *(volatile uint32_t *)(base + USB_XHCI_CAP_CAPLENGTH_HCIVER);
+		uint8_t caplength = (uint8_t)(cap_dword & 0xFFu);
+		uint32_t rtsoff = *(volatile uint32_t *)(base + USB_XHCI_CAP_RTSOFF) & ~0x1Fu;
+		volatile uint8_t *op = base + caplength;
+		volatile uint8_t *rt = base + rtsoff;
+		uint32_t pre_usbsts, hcrst_iters, cnr_iters, rs_iters;
+		uint32_t post_usbcmd, post_usbsts;
+		uint32_t i;
+
+		pre_usbsts = *(volatile uint32_t *)(op + 0x04);
+
+		/* 1. R/S=0 + HCRST. */
+		*(volatile uint32_t *)(op + 0x00) = 0u;
+		for (i = 0; i < 100000u; ++i) {
+			if ((*(volatile uint32_t *)(op + 0x04) & USB_XHCI_USBSTS_HCH) != 0u) break;
+		}
+		*(volatile uint32_t *)(op + 0x00) = USB_XHCI_USBCMD_HCRST;
+		hcrst_iters = 0;
+		for (i = 0; i < 1000000u; ++i) {
+			if ((*(volatile uint32_t *)(op + 0x00) & USB_XHCI_USBCMD_HCRST) == 0u) {
+				hcrst_iters = i;
+				break;
+			}
+		}
+		cnr_iters = 0;
+		for (i = 0; i < 1000000u; ++i) {
+			if ((*(volatile uint32_t *)(op + 0x04) & USB_XHCI_USBSTS_CNR) == 0u) {
+				cnr_iters = i;
+				break;
+			}
+		}
+
+		/* 2. CONFIG.MaxSlotsEn = 1. */
+		*(volatile uint32_t *)(op + USB_XHCI_OP_CONFIG_MAXSLOTS) = 1u;
+
+		/* 3. DCBAAP. Bit 0..5 must be 0 (64-byte aligned). dmammap
+		 * returns page-aligned so this is satisfied. */
+		*(volatile uint32_t *)(op + 0x30) = (uint32_t)(dcbaa_pa & 0xFFFFFFFFu);
+		*(volatile uint32_t *)(op + 0x34) = (uint32_t)((uint64_t)dcbaa_pa >> 32);
+
+		/* 3b. Command Ring Control Register. CRCR_LO bit 0 is the
+		 * Ring Cycle State (RCS). First cycle = 1 (we own all TRBs). */
+		*(volatile uint32_t *)(op + 0x18) = (uint32_t)(cmd_pa & 0xFFFFFFC0u) | 1u;
+		*(volatile uint32_t *)(op + 0x1C) = (uint32_t)((uint64_t)cmd_pa >> 32);
+
+		/* 4. Interrupter 0 setup. ERSTSZ=1 first, then ERDP, then ERSTBA. */
+		*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERSTSZ) = 1u;
+		*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERDP_LO) = (uint32_t)(evt_pa & 0xFFFFFFF0u);
+		*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERDP_HI) = (uint32_t)((uint64_t)evt_pa >> 32);
+		*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERSTBA_LO) = (uint32_t)(erst_pa & 0xFFFFFFC0u);
+		*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERSTBA_HI) = (uint32_t)((uint64_t)erst_pa >> 32);
+
+		/* 5. Memory barrier + delay before R/S=1: ensure all the
+		 * preceding stores are visible to the controller's DMA reads.
+		 * Device-memory writes are strongly ordered on aarch64, but a
+		 * DSB SY also gates against any speculative reads on the
+		 * controller side. 10 ms slack is paranoid but cheap, and gives
+		 * the controller time to settle after the burst of register
+		 * writes. */
+		__asm__ volatile("dsb sy" ::: "memory");
+		usleep(10000);
+
+		/* 5b. Set USBCMD = R/S | INTE | HSEE in a single write, per
+		 * Linux xhci_run(). HSEE doesn't prevent HSE (it just controls
+		 * the interrupt assertion), but writing all three together
+		 * matches the order other working stacks use. */
+		*(volatile uint32_t *)(op + 0x00) =
+			USB_XHCI_USBCMD_RS |
+			USB_XHCI_USBCMD_INTE |
+			USB_XHCI_USBCMD_HSEE;
+		rs_iters = 0;
+		for (i = 0; i < 1000000u; ++i) {
+			uint32_t st = *(volatile uint32_t *)(op + 0x04);
+			if ((st & USB_XHCI_USBSTS_HSE) != 0u) {
+				rs_iters = i;
+				break;
+			}
+			if ((st & USB_XHCI_USBSTS_HCH) == 0u) {
+				rs_iters = i;
+				break;
+			}
+		}
+
+		post_usbcmd = *(volatile uint32_t *)(op + 0x00);
+		post_usbsts = *(volatile uint32_t *)(op + 0x04);
+
+		r = snprintf(buf + off, cap - off,
+			"caplength=0x%02x rtsoff=0x%08x\n"
+			"DCBAA  PA=0x%llx\n"
+			"EvtRng PA=0x%llx\n"
+			"ERST   PA=0x%llx\n"
+			"CmdRng PA=0x%llx\n"
+			"pre  USBSTS=0x%08x\n"
+			"HCRST cleared@%u  CNR cleared@%u\n"
+			"R/S=1 settle@%u\n"
+			"post USBCMD=0x%08x USBSTS=0x%08x\n"
+			"  %s  %s  %s\n",
+			caplength, (unsigned)rtsoff,
+			(unsigned long long)dcbaa_pa,
+			(unsigned long long)evt_pa,
+			(unsigned long long)erst_pa,
+			(unsigned long long)cmd_pa,
+			(unsigned)pre_usbsts,
+			(unsigned)hcrst_iters, (unsigned)cnr_iters,
+			(unsigned)rs_iters,
+			(unsigned)post_usbcmd, (unsigned)post_usbsts,
+			(post_usbsts & USB_XHCI_USBSTS_HSE) ? "HSE!" :
+				(post_usbsts & USB_XHCI_USBSTS_HCH) ? "still halted" : "RUNNING",
+			(post_usbsts & USB_XHCI_USBSTS_CNR) ? "CNR" : "ready",
+			(post_usbcmd & USB_XHCI_USBCMD_RS) ? "R/S=1" : "R/S=0");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	munmap(cmd_page, _PAGE_SIZE);
+	munmap(erst_page, _PAGE_SIZE);
+	munmap(evt_page, _PAGE_SIZE);
+	munmap(dcbaa_page, _PAGE_SIZE);
+	munmap(mmio_page, USB_XHCI_MMIO_SIZE);
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
 
 
 /* USB resumption iteration K: write test from a side process.
@@ -1954,6 +2187,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'R') {
 		len = diag_format_xhci_reset(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'X') {
+		len = diag_format_xhci_bringup(body, DIAG_REPLY_MAX);
 	}
 	else if (query == 'd') {
 		len = diag_format_dcbaa(body, DIAG_REPLY_MAX);

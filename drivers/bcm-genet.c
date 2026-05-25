@@ -688,6 +688,13 @@ static void genet_dhcpStartCb(void *arg)
 		(unsigned)netif_ip4_gw(netif)->addr,
 		netif->flags,
 		netif->name[0], netif->name[1], (unsigned)netif->num);
+
+	/* Emit one unsolicited (gratuitous) ARP to prove the ARP module +
+	 * linkoutput chain is functional from the tcpip-thread side. If
+	 * this appears on host tcpdump, the request-reply gap isn't TX or
+	 * etharp setup — it's somewhere in how requests reach etharp_input. */
+	err_t ge = etharp_gratuitous(netif);
+	printf("lwip: genet: etharp_gratuitous: %d\n", (int)ge);
 }
 
 

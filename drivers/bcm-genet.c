@@ -7,20 +7,28 @@
  *
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Tier 1 scope: link-up only — map MMIO, validate revision, read
- * pre-programmed MAC, reset UMAC, MDIO bus, RGMII config, drive
- * autoneg via ephy.c, report link state.
+ * Scope as of the head of agent/rpi4-genet:
+ *   - MMIO map, GENET v5 silicon ID validation, UMAC reset
+ *   - MDIO bus exposed to ephy.c (BCM54213PE)
+ *   - RGMII / SYS_PORT_CTRL / RBUF / DMA init per Linux + Circle refs
+ *   - TX: single-slot polled descriptor (verified on the wire via
+ *     host-side tcpdump)
+ *   - RX: 256-BD ring with per-BD pre-programmed phys address, 100 Hz
+ *     poll thread. HW writes to BD memory observed but RDMA_PROD_INDEX
+ *     advancement is still open — TODO(TD-Eth-RX). Diagnostic prints
+ *     in genet_rxPollThread are kept until that's resolved.
  *
- * No DMA, no IRQ — the linkoutput callback returns ERR_IF so lwIP
- * sees the netif as "device present but interface down". Tier 2
- * fills in TX, Tier 3 RX, Tier 4 IRQs + DHCP.
+ * No IRQ wiring yet (Tier 4+). DHCP / ARP / lwIP-level integration is
+ * Tier 4 once RX is unblocked. WiFi (BCM43455) is parked behind that.
  *
  * References (BEHAVIORAL only — fresh-code per CLAUDE.md
  * upstreamability guidance):
- *   - docs/research/ethernet-genet.md (Linux GENET)
- *   - docs/research/ethernet-genet-non-linux.md (FreeBSD if_genet,
- *     Circle bcm54213, U-Boot bcmgenet)
- *   - docs/notes/2026-05-24-eth-tier0-scout.md (Phoenix integration)
+ *   - Linux drivers/net/ethernet/broadcom/genet/bcmgenet.c
+ *   - U-Boot drivers/net/bcmgenet.c (BCM2711 path)
+ *   - Circle lib/bcm54213.cpp + bcm54213.h
+ *   - FreeBSD sys/arm/broadcom/bcm2835/bcm2835_genet.c
+ *   - docs/research/ethernet-genet.md, ethernet-genet-non-linux.md
+ *   - docs/notes/2026-05-24-eth-tier0-scout.md
  */
 #include "netif-driver.h"
 #include "physmmap.h"

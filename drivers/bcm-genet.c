@@ -65,8 +65,6 @@
 #define GENET_RX_SLOTS    16u
 
 
-/* Forward declaration: genet_setLinkState fires a TX smoke test via this. */
-static err_t genet_linkOutput(struct netif *netif, struct pbuf *p);
 
 
 typedef struct {
@@ -93,16 +91,16 @@ typedef struct {
 	handle_t tx_lock;
 	uint32_t tx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
 	uint32_t tx_prod_index;  /* 16-bit running counter the HW compares to CONS_INDEX */
-	int tx_smoke_test_done;
 
 	/* RX (Tier 3): per-slot buffers + polling thread. The BD's address
 	 * is programmed once at init — HW writes received frames into the
 	 * same physical buffer each time the BD comes back around. */
 	void *rx_bufs[GENET_RX_SLOTS];
 	addr_t rx_bufs_phys[GENET_RX_SLOTS];
-	uint32_t rx_index;       /* 0..GENET_RX_SLOTS-1 — BD index in MMIO */
+	uint32_t rx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
 	uint32_t rx_c_index;     /* SW's view, mirrors RDMA_RING_CONS_INDEX */
 	unsigned long rx_pkts_seen;
+	unsigned long rx_pkts_dropped;
 	uint32_t rx_poll_stack[2048] __attribute__((aligned(16)));
 } genet_state_t;
 
@@ -590,55 +588,44 @@ static void genet_rxPollThread(void *arg)
 		uint32_t prod = genet_read(state,
 			ring_off + GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu;
 
-		/* Extended diagnostic: track BD[0] and BD[1] status words plus
-		 * BD[0]'s addr fields. We've seen BD[0].status get a 0x007e7f80
-		 * write after smoke TX while prod_index stays at 0. Need to
-		 * distinguish (a) a real RX hitting BD[0] from (b) HW clobbering
-		 * the BD memory for some other reason, and (c) confirm we
-		 * didn't lose the buffer phys address. */
-		uint32_t bd0 = genet_read(state, GENET_RX_DESCS_OFF + 0);
-		if (++ticks <= 1000u && (ticks % 100u) == 0u) {
-			uint32_t bd0_lo = genet_read(state, GENET_RX_DESCS_OFF + 4);
-			uint32_t bd0_hi = genet_read(state, GENET_RX_DESCS_OFF + 8);
-			uint32_t bd1 = genet_read(state,
-				GENET_RX_DESCS_OFF + GENET_DMA_DESC_SIZE);
-			uint32_t status = genet_read(state, GENET_RDMA_REGS_OFF + GENET_TDMA_STATUS);
-			genet_printf(state,
-				"RDMA@%us prod=%u sw_c=%u bd0={st=0x%08x lo=0x%08x hi=0x%08x} bd1=0x%08x rdma_st=0x%08x",
-				ticks / 100u, prod, state->rx_c_index & 0xFFFFu,
-				bd0, bd0_lo, bd0_hi, bd1, status);
-		}
-		else if (bd0 != last_bd0_status && bd0 != 0u) {
-			genet_printf(state, "BD[0] status changed: 0x%08x -> 0x%08x (prod=%u)",
-				last_bd0_status, bd0, prod);
-		}
-		last_bd0_status = bd0;
-
 		while (prod != (state->rx_c_index & 0xFFFFu)) {
 			uint32_t bd_off = GENET_RX_DESCS_OFF +
 				state->rx_index * GENET_DMA_DESC_SIZE;
 			uint32_t status = genet_read(state, bd_off + 0);
-			uint16_t len = (uint16_t)((status & BD_LEN_MASK) >> BD_LEN_SHIFT);
+			uint16_t frame_len_total = (uint16_t)((status & BD_LEN_MASK) >> BD_LEN_SHIFT);
 
-			/* Tier 3 deliverable: confirm RX frames arrive. Log the
-			 * first 4 frames with header bytes so we can verify dst/src
-			 * MAC + ethertype against the netboot bridge's traffic.
-			 *
-			 * GENET prepends a 64-byte RX status block (RBUF_64B_EN'd
-			 * during init) before the actual frame, so the Ethernet
-			 * header lives at buf+64, not buf+0. The 64B prefix is the
-			 * same block whose length field we also see in `status`.
-			 * Buffer lookup uses rx_index % GENET_RX_SLOTS because the
-			 * BDs are aliased so multiple HW slots share each buffer. */
-			if (state->rx_pkts_seen < 4) {
+			/* GENET prepends a 64-byte RX status block to every frame
+			 * (RBUF_64B_EN set during init). The actual Ethernet frame
+			 * starts at buf+64 and has length status-encoded - 64. */
+			if (frame_len_total > GENET_RX_STATUS_PREFIX &&
+				(status & (BD_STATUS_SOP | BD_STATUS_EOP)) ==
+				(BD_STATUS_SOP | BD_STATUS_EOP) &&
+				(status & GENET_RX_STATUS_ERROR_MASK) == 0u) {
+				uint16_t pay_len = frame_len_total - GENET_RX_STATUS_PREFIX;
 				uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
-				uint8_t *frame = buf + 64;
-				genet_printf(state,
-					"RX[%u] %u B st=0x%08x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%02x%02x",
-					state->rx_index, len, status,
-					frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
-					frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
-					frame[12], frame[13]);
+				uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
+
+				struct pbuf *p = pbuf_alloc(PBUF_RAW, pay_len, PBUF_POOL);
+				if (p != NULL) {
+					if (pbuf_take(p, frame, pay_len) == ERR_OK) {
+						if (state->netif->input(p, state->netif) != ERR_OK) {
+							pbuf_free(p);
+							state->rx_pkts_dropped++;
+						}
+					}
+					else {
+						pbuf_free(p);
+						state->rx_pkts_dropped++;
+					}
+				}
+				else {
+					state->rx_pkts_dropped++;
+				}
+			}
+			else {
+				/* Malformed BD (no SOP|EOP, error bits, or undersized
+				 * frame): drop silently, just advance. */
+				state->rx_pkts_dropped++;
 			}
 			state->rx_pkts_seen++;
 
@@ -646,10 +633,12 @@ static void genet_rxPollThread(void *arg)
 			state->rx_c_index = (state->rx_c_index + 1u) & 0xFFFFu;
 		}
 
-		/* Hand all consumed BDs back to HW in one shot. RDMA CONS_INDEX
-		 * is at offset 0x0C (mirrored from TX layout). */
+		/* Hand all consumed BDs back to HW in one shot. */
 		genet_write(state, ring_off + GENET_RDMA_RING_CONS_INDEX,
 			state->rx_c_index);
+
+		(void)last_bd0_status;
+		(void)ticks;
 	}
 }
 
@@ -690,49 +679,6 @@ static void genet_setLinkState(void *arg, int state_up)
 	genet_macSetSpeed(state, speed, full_duplex);
 
 	netif_set_link_up(netif);
-
-	/* TODO(TD-Eth-Smoke): once Tier 4 wires DHCP/ARP, the natural protocol
-	 * traffic exercises TX so we can delete this. For Tier 2 we synthesize
-	 * a 60-byte broadcast Ethernet frame on the first link-up so the BD ring
-	 * actually advances and TDMA_RING_CONS_INDEX bumps. The payload is a
-	 * gratuitous-ARP-shaped probe so a host-side tcpdump can confirm the
-	 * frame really left the wire. */
-	if (state->tx_smoke_test_done == 0) {
-		uint8_t frame[60] = {
-			/* dst: broadcast */
-			0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-			/* src: filled in below */
-			0, 0, 0, 0, 0, 0,
-			/* ethertype: ARP */
-			0x08, 0x06,
-			/* HTYPE=1 (Ethernet), PTYPE=0x0800 (IPv4), HLEN=6, PLEN=4, OPER=1 (request) */
-			0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
-			/* SHA — filled below */
-			0, 0, 0, 0, 0, 0,
-			/* SPA: 10.42.0.42 (a free address in the netboot bridge subnet) */
-			10, 42, 0, 42,
-			/* THA: zeros */
-			0, 0, 0, 0, 0, 0,
-			/* TPA: 10.42.0.1 (netboot bridge gateway — guaranteed reply) */
-			10, 42, 0, 1,
-			/* padding to 60 bytes — minimum Ethernet frame */
-			0
-		};
-		struct pbuf pb;
-		err_t res;
-
-		memcpy(frame + 6, state->mac, 6);
-		memcpy(frame + 22, state->mac, 6);
-
-		pb.payload = frame;
-		pb.len = sizeof(frame);
-		pb.tot_len = sizeof(frame);
-		pb.next = NULL;
-
-		res = genet_linkOutput(netif, &pb);
-		genet_printf(state, "smoke-test TX (60 B grat-ARP) result=%d", (int)res);
-		state->tx_smoke_test_done = 1;
-	}
 }
 
 

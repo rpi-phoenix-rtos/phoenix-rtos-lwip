@@ -297,6 +297,22 @@
 #define BD_STATUS_TX_CRC     (1u << 6)    /* auto-append FCS */
 #define BD_STATUS_TX_CSUM    (1u << 4)    /* hardware checksum */
 
+/* RX-side BD status bits (low 7 = packet-filter / error flags). */
+#define BD_STATUS_RX_LG          (1u << 4)  /* frame too long */
+#define BD_STATUS_RX_NO          (1u << 3)  /* alignment error */
+#define BD_STATUS_RX_RXER        (1u << 2)  /* RX error */
+#define BD_STATUS_RX_CRC_ERROR   (1u << 1)  /* CRC error */
+#define BD_STATUS_RX_OV          (1u << 0)  /* overflow */
+#define GENET_RX_STATUS_ERROR_MASK \
+	(BD_STATUS_RX_LG | BD_STATUS_RX_NO | BD_STATUS_RX_RXER | \
+	 BD_STATUS_RX_CRC_ERROR | BD_STATUS_RX_OV)
+
+/* RBUF_64B_EN prepends 64 bytes of GENET-internal status before the
+ * actual Ethernet frame in every RX buffer. The length field in the
+ * BD status word counts those 64 bytes; subtract before handing the
+ * payload to lwIP. */
+#define GENET_RX_STATUS_PREFIX   64u
+
 #define GENET_MAX_FRAME      2048u /* per-buffer slot size */
 #define GENET_BUF_ALIGN      32u   /* skb alignment from Linux SKB_ALIGNMENT */
 

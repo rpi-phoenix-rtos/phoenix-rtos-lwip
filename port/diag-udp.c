@@ -50,10 +50,108 @@
 
 #define DIAG_UDP_PORT 9999u
 #define DIAG_REPLY_MAX 1400u  /* one fragment of stock 1500B MTU */
+#define DIAG_BURN_THREADS 4
+#define DIAG_BURN_DURATION_US (10ULL * 1000000ULL)  /* 10 s */
+#define DIAG_BURN_STACK 1024u
 
 
 static struct udp_pcb *diag_pcb;
 static time_t diag_boot_us;
+static volatile int diag_burn_active;
+static volatile time_t diag_burn_deadline_us;
+static volatile unsigned long long diag_burn_counters[DIAG_BURN_THREADS];
+static uint32_t diag_burn_stacks[DIAG_BURN_THREADS][DIAG_BURN_STACK]
+	__attribute__((aligned(16)));
+
+
+/* SMP Phase E saturation thread. Spawned by the 'b' command. Each
+ * instance pins itself to a busy loop incrementing a counter for
+ * DIAG_BURN_DURATION_US wall-clock microseconds. The kernel's per-CPU
+ * scheduler is expected to place each on its own core; verified
+ * externally by paired 't' probes seeing each [burner-N] thread's
+ * cpuTime advance at ~wall-clock rate. */
+static void diag_burnThread(void *arg)
+{
+	unsigned slot = (unsigned)(uintptr_t)arg;
+	time_t now_us;
+
+	for (;;) {
+		gettime(&now_us, NULL);
+		if (now_us >= diag_burn_deadline_us) {
+			break;
+		}
+		/* Inner unrolled loop to keep gettime overhead negligible. */
+		for (int i = 0; i < 4096; ++i) {
+			diag_burn_counters[slot]++;
+		}
+	}
+
+	if (__atomic_sub_fetch(&diag_burn_active, 1, __ATOMIC_RELAXED) == 0) {
+		/* Last burner out — leave counters readable by future
+		 * 't' probes; no cleanup needed. */
+	}
+
+	endthread();
+}
+
+
+static int diag_format_burn(char *buf, size_t cap)
+{
+	int r, off = 0;
+	time_t now_us;
+
+	gettime(&now_us, NULL);
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 burn\n");
+	if (r < 0) {
+		return -1;
+	}
+	off += r;
+
+	if (diag_burn_active > 0) {
+		long long remaining = (long long)diag_burn_deadline_us - (long long)now_us;
+		r = snprintf(buf + off, cap - off,
+			"burners_active: %d\nremaining_us: %lld\n",
+			diag_burn_active, remaining > 0 ? remaining : 0);
+	}
+	else {
+		/* Spawn fresh burner cohort. */
+		int spawned = 0;
+		diag_burn_deadline_us = now_us + (time_t)DIAG_BURN_DURATION_US;
+		for (int i = 0; i < DIAG_BURN_THREADS; ++i) {
+			diag_burn_counters[i] = 0;
+		}
+		for (int i = 0; i < DIAG_BURN_THREADS; ++i) {
+			int err = beginthread(diag_burnThread, 4,
+				diag_burn_stacks[i], sizeof(diag_burn_stacks[i]),
+				(void *)(uintptr_t)i);
+			if (err == 0) {
+				spawned++;
+			}
+		}
+		__atomic_store_n(&diag_burn_active, spawned, __ATOMIC_RELAXED);
+		r = snprintf(buf + off, cap - off,
+			"spawned: %d/%d\nduration_us: %llu\n",
+			spawned, DIAG_BURN_THREADS,
+			(unsigned long long)DIAG_BURN_DURATION_US);
+	}
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	for (int i = 0; i < DIAG_BURN_THREADS; ++i) {
+		r = snprintf(buf + off, cap - off,
+			"burner%d_count: %llu\n", i, diag_burn_counters[i]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
 
 
 /* Comparator for qsort: largest cpuTime first. */
@@ -219,6 +317,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	body = (char *)reply->payload;
 	if (query == 't') {
 		len = diag_format_threads(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'b') {
+		len = diag_format_burn(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

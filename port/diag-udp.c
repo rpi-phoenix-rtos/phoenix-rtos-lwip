@@ -2144,6 +2144,123 @@ static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
 }
 
 
+/* CMD53 (IO_RW_EXTENDED) block-mode WRITE via SDHCI PIO.
+ *
+ * Mirror of diag_sdioCmd53Read. Differences:
+ *   - arg bit 31 = 1 (write)
+ *   - TRANSFER_MODE bit 4 = 0 (write direction)
+ *   - polls BUFFER_WRITE_READY (bit 4 of INT_STATUS) instead of READ_READY
+ *   - writes DATA_PORT instead of reading it
+ *
+ * Source is little-endian byte buffer; each 4 bytes -> one 32-bit
+ * DATA_PORT write. buf must be at least block_count * block_size bytes. */
+#define SDHCI_INT_BUF_WR_READY   0x00000010u
+
+static int diag_sdioCmd53Write(volatile uint8_t *sdhci, int fn,
+	int incr_addr, uint32_t reg_addr,
+	uint32_t block_count, uint32_t block_size,
+	const uint8_t *buf)
+{
+	uint32_t arg, cmd_word;
+	uint32_t st;
+	uint32_t bytes_total = block_count * block_size;
+	uint32_t words_total = bytes_total / 4u;
+	uint32_t bytes_in_block = 0;
+	uint32_t i;
+	int deadline;
+
+	for (deadline = 100000; deadline > 0; --deadline) {
+		if ((*(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE) &
+			SDHCI_PRES_CMD_INHIBIT) == 0u) {
+			break;
+		}
+	}
+	if (deadline == 0) {
+		return -1;
+	}
+
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
+	*(volatile uint32_t *)(sdhci + SDHCI_BLOCK_SIZE_CNT) =
+		(block_count << 16) | (block_size & 0xFFFu);
+
+	/* CMD53 arg with R/W bit 31 = 1 (write). */
+	arg = (1u << 31) |
+		((uint32_t)(fn & 7u) << 28) |
+		(1u << 27) |
+		((incr_addr ? 1u : 0u) << 26) |
+		((reg_addr & 0x1FFFFu) << 9) |
+		(block_count & 0x1FFu);
+	*(volatile uint32_t *)(sdhci + SDHCI_ARGUMENT_1) = arg;
+
+	/* TRANSFER_MODE: BLOCK_COUNT_EN, MULTI_BLK if >1; bit 4 DAT_XFER_DIR=0 (write). */
+	cmd_word =
+		(1u << 1) |
+		((block_count > 1u ? 1u : 0u) << 5) |
+		((uint32_t)0x3Au << 16) |
+		((uint32_t)53u << 24);
+	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
+
+	for (deadline = 100000; deadline > 0; --deadline) {
+		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+			return -2;
+		}
+		if ((st & SDHCI_INT_CMD_COMPLETE) != 0u) {
+			break;
+		}
+	}
+	if (deadline == 0) {
+		return -3;
+	}
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
+
+	/* PIO write loop. */
+	for (i = 0; i < words_total; ++i) {
+		for (deadline = 100000; deadline > 0; --deadline) {
+			st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+			if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+				return -4;
+			}
+			if ((st & SDHCI_INT_BUF_WR_READY) != 0u) {
+				break;
+			}
+		}
+		if (deadline == 0) {
+			return -5;
+		}
+
+		{
+			uint32_t data = (uint32_t)buf[i * 4 + 0] |
+				((uint32_t)buf[i * 4 + 1] << 8) |
+				((uint32_t)buf[i * 4 + 2] << 16) |
+				((uint32_t)buf[i * 4 + 3] << 24);
+			*(volatile uint32_t *)(sdhci + SDHCI_DATA_PORT) = data;
+		}
+
+		bytes_in_block += 4u;
+		if (bytes_in_block >= block_size) {
+			bytes_in_block = 0u;
+			*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_BUF_WR_READY;
+		}
+	}
+
+	for (deadline = 100000; deadline > 0; --deadline) {
+		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+			return -6;
+		}
+		if ((st & SDHCI_INT_XFER_COMPLETE) != 0u) {
+			break;
+		}
+	}
+	if (deadline == 0) {
+		return -7;
+	}
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
+	return 0;
+}
+
+
 /* WiFi Tier 4: CIS read + Function 1 enable + chip-id readback.
  *
  * After the standard CMD5/3/7 enumeration (same as Tier 3), this:
@@ -3542,6 +3659,187 @@ static int diag_format_sdio_block(char *buf, size_t cap)
 }
 
 
+/* WiFi P3: CMD53 block-mode WRITE smoke test.
+ *
+ * Does a CMD53 write of a 64-byte pattern into SOCRAM at chip-internal
+ * 0x00198000 (brcmfmac rambase for BCM43455), then CMD53 read-back at
+ * the same address, then byte-compare. SOCRAM is writable from host
+ * while ARM is held in reset (POR default per Tier-4 results
+ * 'A' sub-command — 0x83C ResetCtrl bit 0 = 1 at boot).
+ *
+ * Successful round-trip validates the bidirectional CMD53 data path,
+ * which is the final piece required to actually download
+ * brcmfmac43455-sdio.bin into SOCRAM during P3 firmware load. */
+static int diag_format_sdio_blockwrite(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int ready_iters = 0, rdy_iters = 0;
+	int rc_w = -100, rc_r = -100;
+	uint16_t rca = 0;
+	uint8_t wbuf[64], rbuf[64];
+	int i, match_count;
+
+	for (i = 0; i < 64; ++i) {
+		wbuf[i] = (uint8_t)(0x40 + i);
+		rbuf[i] = 0;
+	}
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-blockwrite\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		/* Set F1 IOBLOCK_SIZE = 64 in FBR1 (CCCR 0x110/0x111). */
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
+
+		/* Window the SBADDR to chip-internal SOCRAM start (0x00198000):
+		 *   LOW  bit 7 = bit 15 of addr = (0x198000 >> 15) & 1 = 1 -> 0x80
+		 *   MID  byte  = bits[23:16] = 0x19
+		 *   HIGH byte  = bits[31:24] = 0x00
+		 *   F1 window offset = addr & 0x7FFF = 0x0000 */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+
+		/* CMD53 write 64 bytes to F1 reg 0 -> chip-internal 0x00198000. */
+		rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, wbuf);
+
+		/* CMD53 read back the same 64 bytes. */
+		if (rc_w == 0) {
+			rc_r = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+				/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, rbuf);
+		}
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5=%d/%d C=%d RCA=0x%04x CMD7=%d IORDY=0x%02x rdy=%d\n",
+		rc_ocr, rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	(void)rc_iordy;
+
+	r = snprintf(buf + off, cap - off,
+		"CMD53 write rc=%d  CMD53 read rc=%d  SOCRAM @ chip-internal 0x00198000\n",
+		rc_w, rc_r);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	if (rc_w == 0 && rc_r == 0) {
+		match_count = 0;
+		for (i = 0; i < 64; ++i) {
+			if (rbuf[i] == wbuf[i]) {
+				++match_count;
+			}
+		}
+		r = snprintf(buf + off, cap - off,
+			"round-trip: %d/64 bytes match%s\n",
+			match_count,
+			(match_count == 64) ? " (PASS)" : " (FAIL)");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		/* Dump first 16 bytes of read-back for sanity. */
+		r = snprintf(buf + off, cap - off,
+			"  rbuf[0..15] %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			rbuf[0], rbuf[1], rbuf[2], rbuf[3],
+			rbuf[4], rbuf[5], rbuf[6], rbuf[7],
+			rbuf[8], rbuf[9], rbuf[10], rbuf[11],
+			rbuf[12], rbuf[13], rbuf[14], rbuf[15]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -3796,6 +4094,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'B') {
 		len = diag_format_sdio_block(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'W') {
+		len = diag_format_sdio_blockwrite(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

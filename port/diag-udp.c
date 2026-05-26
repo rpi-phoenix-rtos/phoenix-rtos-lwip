@@ -1572,6 +1572,138 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 		if (r > 0 && (size_t)r < cap - off) {
 			off += r;
 		}
+
+		/* FIX-14 decisive probe: only meaningful if the controller is
+		 * RUNNING (not HSE/halted). Place a No-Op Command TRB (type 23)
+		 * in the command ring, ring doorbell 0, wait, then look for the
+		 * Command Completion Event (type 33) the controller should DMA
+		 * into the event ring. If it never appears in evt_page, scan a
+		 * window of DRAM for a TRB whose parameter == cmd_pa (the
+		 * completion event carries the completed command's address) —
+		 * found elsewhere => wrong-PA/aliasing; found nowhere => the
+		 * inbound DMA WRITE genuinely isn't happening.
+		 *
+		 * NB: this path allocates rings with MAP_CONTIGUOUS (unlike
+		 * usb_allocAligned in the kernel driver, which omits it), so a
+		 * positive result here also implicates MAP_CONTIGUOUS. */
+		if ((post_usbsts & (USB_XHCI_USBSTS_HSE | USB_XHCI_USBSTS_HCH)) == 0u) {
+			volatile uint32_t *cmd = (volatile uint32_t *)cmd_page;
+			volatile uint32_t *evt = (volatile uint32_t *)evt_page;
+			uint32_t dboff = *(volatile uint32_t *)(base + USB_XHCI_CAP_DBOFF) & ~0x3u;
+			int found_idx = -1;
+			int k;
+
+			/* No-Op Command TRB: param=0, status=0, control=(23<<10)|C. */
+			cmd[0] = 0u;
+			cmd[1] = 0u;
+			cmd[2] = 0u;
+			cmd[3] = (23u << 10) | 1u;
+			__asm__ volatile("dsb sy" ::: "memory");
+
+			/* Ring command-ring doorbell (DB[0], target 0). */
+			if (dboff < USB_XHCI_MMIO_SIZE) {
+				*(volatile uint32_t *)(base + dboff) = 0u;
+				__asm__ volatile("dsb sy" ::: "memory");
+			}
+			usleep(50000);
+
+			/* Scan the event-ring page for ANY valid event TRB (type
+			 * 1..39) and separately for the No-Op Command Completion
+			 * (type 33). A Port Status Change (type 34) or any other
+			 * controller-generated event proves inbound DMA WRITES
+			 * work; a missing type-33 with a present type-34 means the
+			 * command-ring READ/processing is the gap, not writes. */
+			int any_evt_idx = -1;
+			int any_evt_type = 0;
+			for (k = 0; k < 256; ++k) {
+				uint32_t ctrl = evt[k * 4 + 3];
+				uint32_t ty = (ctrl >> 10) & 0x3Fu;
+				if (any_evt_idx < 0 && ty >= 1u && ty <= 39u) {
+					any_evt_idx = k;
+					any_evt_type = (int)ty;
+				}
+				if (ty == 33u) {
+					found_idx = k;
+				}
+			}
+
+			r = snprintf(buf + off, cap - off,
+				"FIX14: dboff=0x%x  noop rung\n"
+				"  evt[0..3]=%08x %08x %08x %08x  evt[4..7]=%08x %08x %08x %08x\n"
+				"  any-event: %s (type=%d @idx %d)  cmd-completion(type33): %s\n",
+				(unsigned)dboff,
+				evt[0], evt[1], evt[2], evt[3],
+				evt[4], evt[5], evt[6], evt[7],
+				(any_evt_idx >= 0) ? "PRESENT -> inbound WRITES WORK" : "none",
+				any_evt_type, any_evt_idx,
+				(found_idx >= 0) ? "FOUND" : "absent");
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+			if (found_idx >= 0) {
+				r = snprintf(buf + off, cap - off,
+					"  type33 @idx %d cmdptr_lo=%08x (cmd_pa_lo=%08x) %s\n",
+					found_idx, evt[found_idx * 4],
+					(uint32_t)(cmd_pa & 0xFFFFFFFFu),
+					(evt[found_idx * 4] == (uint32_t)(cmd_pa & 0xFFFFFFFFu))
+						? "MATCH -> cmd ring processed!" : "ptr mismatch");
+				if (r > 0 && (size_t)r < cap - off) {
+					off += r;
+				}
+			}
+			else if (any_evt_idx < 0) {
+				/* Decisive DRAM scan: map a 4 MB window starting 2 MB
+				 * below evt_pa (page-aligned) and look for the
+				 * completion TRB's parameter == cmd_pa anywhere. */
+				uintptr_t scan_base = (evt_pa > 0x200000u)
+					? ((evt_pa - 0x200000u) & ~0xFFFu) : 0u;
+				size_t scan_len = 0x400000u;  /* 4 MB */
+				void *scan = mmap(NULL, scan_len, PROT_READ,
+					MAP_PHYSMEM | MAP_UNCACHED | MAP_ANONYMOUS, -1,
+					(off_t)scan_base);
+				if (scan != MAP_FAILED) {
+					volatile uint32_t *w = (volatile uint32_t *)scan;
+					uint32_t want = (uint32_t)(cmd_pa & 0xFFFFFFFFu);
+					size_t nw = scan_len / 4u;
+					size_t j;
+					long hit = -1;
+					for (j = 0; j + 3 < nw; j += 4) {
+						if (w[j] == want && ((w[j + 3] >> 10) & 0x3Fu) == 33u) {
+							hit = (long)j;
+							break;
+						}
+					}
+					r = snprintf(buf + off, cap - off,
+						"  DRAM scan [0x%llx..+4MB] for cmdptr=%08x type33: %s",
+						(unsigned long long)scan_base, want,
+						(hit >= 0) ? "HIT" : "no hit");
+					if (r > 0 && (size_t)r < cap - off) {
+						off += r;
+					}
+					if (hit >= 0) {
+						r = snprintf(buf + off, cap - off,
+							" @PA 0x%llx (evt_pa=0x%llx) -> controller wrote to WRONG PA\n",
+							(unsigned long long)(scan_base + (uintptr_t)hit * 4u),
+							(unsigned long long)evt_pa);
+					}
+					else {
+						r = snprintf(buf + off, cap - off,
+							" -> inbound WRITE not happening at all\n");
+					}
+					if (r > 0 && (size_t)r < cap - off) {
+						off += r;
+					}
+					munmap(scan, scan_len);
+				}
+				else {
+					r = snprintf(buf + off, cap - off,
+						"  DRAM scan mmap failed\n");
+					if (r > 0 && (size_t)r < cap - off) {
+						off += r;
+					}
+				}
+			}
+		}
 	}
 
 	munmap(cmd_page, _PAGE_SIZE);

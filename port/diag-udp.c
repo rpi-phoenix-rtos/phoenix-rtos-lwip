@@ -1893,6 +1893,8 @@ static int diag_format_sdio_enum(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
 		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
 		usleep(150 * 1000);
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
@@ -2062,6 +2064,8 @@ static int diag_format_sdio_f1(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
 		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
 		usleep(150 * 1000);
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
@@ -2329,6 +2333,8 @@ static int diag_format_sdio_cores(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
 		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
 		usleep(150 * 1000);
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
@@ -2626,6 +2632,8 @@ static int diag_format_sdio_erom(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
 		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
 		usleep(150 * 1000);
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
@@ -2860,6 +2868,8 @@ static int diag_format_sdio(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
 		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
 		usleep(150 * 1000);
 

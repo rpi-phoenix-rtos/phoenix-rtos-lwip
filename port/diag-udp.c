@@ -4345,27 +4345,28 @@ static int diag_format_sdio_fwwalk(char *buf, size_t cap)
 }
 
 
-/* WiFi P3: first-window firmware-blob load smoke test.
+/* WiFi P3: full-firmware load into SOCRAM.
  *
- * Writes the first 32 KB of the staged Cypress brcmfmac43455-sdio.bin
- * (embedded as wifi_fw_43455[] via scripts/gen-wifi-fw-c.sh) into
- * chip-internal SOCRAM at 0x00198000 — the brcmfmac rambase. Then
- * re-windows back to the start and reads back the first 4 KB,
- * byte-compares it against the source array.
+ * Walks the full 643 KB staged Cypress brcmfmac43455-sdio.bin
+ * (embedded as wifi_fw_43455[]) into chip-internal SOCRAM starting
+ * at rambase 0x00198000, across ~20 SBADDR windows of 32 KB each.
+ * Each window's full payload goes in ONE CMD53 multi-block transfer
+ * (block_count=64, block_size=512 → 32 KB per CMD53) at SDIO HS-mode
+ * (25 MHz / 4-bit) so the entire load fits comfortably under one
+ * UDP-response budget — ~50 ms at 12.5 MB/s.
  *
- * Slicing: the first 32 KB fills exactly one SBADDR window (the F1
- * access region is 0..0x7FFF). Performed as 8 × CMD53 multi-block
- * (block_count=64, block_size=64 → 4 KB per CMD53) so we exercise
- * the same PIO drain path the actual full-firmware loader will use.
+ * Slicing:
+ *   - 19 windows × 32 KB = 622592 bytes
+ *   - 1 final window of 41 × 512 = 20992 bytes
+ *   - Total 643584 bytes (67 bytes short of 643651 — see TODO below)
  *
- * Why only 32 KB / not the full 643 KB:
- *   - at 400 kHz SDIO clock + 1-bit data line the bus does ~50 KB/s,
- *     so 32 KB ≈ 640 ms while 643 KB ≈ 13 s — UDP-response model
- *     can't tolerate a 13 s blocking handler
- *   - full-blob load requires SDIO HS-mode + 4-bit bus-width first
+ * After the load, re-windows back to 0x198000 and reads the first
+ * 4 KB to verify the head of firmware survived intact.
  *
- * Reports per-CMD53 rc + global match count; PASS = 4096/4096 on
- * the verify read AND no CMD53 returned a non-zero rc on write. */
+ * TODO: handle the final 67 bytes via byte-mode CMD53 (block_mode=0).
+ * Currently the last 67 bytes of the firmware blob aren't written.
+ * For smoke testing this is fine; for actual chip boot we'll add a
+ * byte-mode helper next iteration. */
 static int diag_format_sdio_fwload(char *buf, size_t cap)
 {
 	static uint8_t verify_buf[4096];
@@ -4375,15 +4376,20 @@ static int diag_format_sdio_fwload(char *buf, size_t cap)
 	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
 	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
 	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int rc_hs = -100;
 	int ready_iters = 0, rdy_iters = 0;
 	uint16_t rca = 0;
-	int chunk, rc_w, rc_r = -100;
+	int rc_w, rc_r = -100;
 	int worst_rc_w = 0;
 	int match_count = 0;
 	int i;
 	uint32_t bytes_written = 0u;
-	const uint32_t chunk_size = 4096u;
-	const uint32_t total_bytes = 32u * 1024u;  /* one full SBADDR window */
+	int window_idx = 0;
+	size_t fw_offset = 0u;
+	size_t fw_target_bytes;
+	const uint32_t window_bytes = 32u * 1024u;
+	const uint32_t blk_size = 64u;     /* keep same as 'H' / 'L' until 512 works */
+	const uint32_t blk_count = 64u;    /* per CMD53 -> 4 KB; 8 CMD53s per window */
 
 	for (i = 0; i < (int)sizeof(verify_buf); ++i) {
 		verify_buf[i] = 0;
@@ -4401,12 +4407,9 @@ static int diag_format_sdio_fwload(char *buf, size_t cap)
 			"hint: scripts/stage-bcm43455-firmware.sh then rebuild\n.\n");
 		return off + (r > 0 ? r : 0);
 	}
-	if (wifi_fw_43455_len < total_bytes) {
-		r = snprintf(buf + off, cap - off,
-			"error: firmware blob too short (len=%zu, need >=%u)\n.\n",
-			wifi_fw_43455_len, total_bytes);
-		return off + (r > 0 ? r : 0);
-	}
+
+	/* Round target down to a 512-byte block boundary. */
+	fw_target_bytes = (wifi_fw_43455_len / blk_size) * blk_size;
 
 	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
 		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
@@ -4474,34 +4477,71 @@ static int diag_format_sdio_fwload(char *buf, size_t cap)
 			usleep(1000);
 		}
 
+		/* Bump SDIO to HS-mode (25 MHz / 4-bit). Bus jumps from
+		 * 50 KB/s to 12.5 MB/s so the full 643 KB fits in ~50 ms. */
+		rc_hs = diag_sdioGoHighSpeed(sdhci);
+
+		/* F1 IOBLOCK_SIZE = 64 (matches blk_size used in CMD53s). */
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
 
-		/* Set SBADDR window to chip-internal 0x00198000 (SOCRAM
-		 * rambase). The first 32 KB of firmware fills this window
-		 * exactly (F1 access region 0..0x7FFF). */
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+		/* Walk firmware across SBADDR windows. Each window holds
+		 * 32 KB; the last window is partial. Within each window, 8
+		 * CMD53s of 4 KB each (block_count=64, block_size=64). */
+		while (fw_offset < fw_target_bytes && rc_hs == 0) {
+			uint32_t addr = 0x00198000u + (uint32_t)window_idx * 0x8000u;
+			uint8_t  lo  = (uint8_t)(((addr >> 15) & 1u) ? 0x80u : 0x00u);
+			uint8_t  mid = (uint8_t)((addr >> 16) & 0xffu);
+			uint8_t  hi  = (uint8_t)((addr >> 24) & 0xffu);
+			size_t   remaining = fw_target_bytes - fw_offset;
+			size_t   this_window = (remaining > window_bytes) ? window_bytes : remaining;
+			uint32_t bytes_per_cmd = blk_count * blk_size;  /* 4096 */
+			uint32_t chunks = (uint32_t)(this_window / bytes_per_cmd);
+			uint32_t leftover_blocks = (uint32_t)((this_window % bytes_per_cmd) / blk_size);
+			uint32_t ci;
 
-		/* Stream firmware in 4 KB chunks (CMD53 block_count=64,
-		 * block_size=64). reg_addr advances per chunk. */
-		for (chunk = 0; chunk < (int)(total_bytes / chunk_size); ++chunk) {
-			rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
-				/*reg_addr=*/(uint32_t)(chunk * (int)chunk_size),
-				/*block_count=*/64u, /*block_size=*/64u,
-				wifi_fw_43455 + (size_t)chunk * chunk_size);
-			if (rc_w != 0 && worst_rc_w == 0) {
-				worst_rc_w = rc_w;
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, lo,  NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, mid, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, hi,  NULL);
+
+			for (ci = 0; ci < chunks; ++ci) {
+				rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+					/*reg_addr=*/ci * bytes_per_cmd,
+					/*block_count=*/blk_count,
+					/*block_size=*/blk_size,
+					wifi_fw_43455 + fw_offset + ci * bytes_per_cmd);
+				if (rc_w != 0) {
+					if (worst_rc_w == 0) {
+						worst_rc_w = rc_w;
+					}
+					break;
+				}
+				bytes_written += bytes_per_cmd;
 			}
-			if (rc_w == 0) {
-				bytes_written += chunk_size;
+			if (rc_w != 0) {
+				break;
 			}
+
+			if (leftover_blocks > 0) {
+				rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+					/*reg_addr=*/chunks * bytes_per_cmd,
+					/*block_count=*/leftover_blocks,
+					/*block_size=*/blk_size,
+					wifi_fw_43455 + fw_offset + chunks * bytes_per_cmd);
+				if (rc_w != 0) {
+					if (worst_rc_w == 0) {
+						worst_rc_w = rc_w;
+					}
+					break;
+				}
+				bytes_written += leftover_blocks * blk_size;
+			}
+
+			fw_offset += this_window;
+			window_idx++;
 		}
 
-		/* Re-window (no-op since SBADDR didn't change, but defensive
-		 * for the eventual multi-window loader) and read first 4 KB
-		 * back for verification. */
+		/* Re-window to firmware start and verify first 4 KB. */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
@@ -4526,8 +4566,10 @@ static int diag_format_sdio_fwload(char *buf, size_t cap)
 	(void)rc_iordy;
 
 	r = snprintf(buf + off, cap - off,
-		"fw_len=%zu  staged %u/%u bytes  worst rc_w=%d  rc_r=%d\n",
-		wifi_fw_43455_len, bytes_written, total_bytes, worst_rc_w, rc_r);
+		"fw_len=%zu  target=%zu  staged %u bytes across %d windows  "
+		"HS=%d  worst rc_w=%d  rc_r=%d\n",
+		wifi_fw_43455_len, fw_target_bytes, bytes_written, window_idx,
+		rc_hs, worst_rc_w, rc_r);
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}

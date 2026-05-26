@@ -1590,6 +1590,8 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 			volatile uint32_t *cmd = (volatile uint32_t *)cmd_page;
 			volatile uint32_t *evt = (volatile uint32_t *)evt_page;
 			uint32_t dboff = *(volatile uint32_t *)(base + USB_XHCI_CAP_DBOFF) & ~0x3u;
+			uint32_t crcr_before, crcr_after, usbsts_after, iman_after, db_rb;
+			uint32_t cmd_post0, cmd_post3;
 			int found_idx = -1;
 			int k;
 
@@ -1600,12 +1602,35 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 			cmd[3] = (23u << 10) | 1u;
 			__asm__ volatile("dsb sy" ::: "memory");
 
+			/* CRCR before ringing (CRR bit 3 readable; pointer reads 0). */
+			crcr_before = *(volatile uint32_t *)(op + 0x18);
+
 			/* Ring command-ring doorbell (DB[0], target 0). */
 			if (dboff < USB_XHCI_MMIO_SIZE) {
 				*(volatile uint32_t *)(base + dboff) = 0u;
 				__asm__ volatile("dsb sy" ::: "memory");
 			}
-			usleep(50000);
+			/* Poll up to ~300 ms for the command completion to land. */
+			for (k = 0; k < 60; ++k) {
+				int kk;
+				for (kk = 0; kk < 256; ++kk) {
+					if (((evt[kk * 4 + 3] >> 10) & 0x3Fu) == 33u) {
+						break;
+					}
+				}
+				if (kk < 256) {
+					break;
+				}
+				usleep(5000);
+			}
+
+			crcr_after = *(volatile uint32_t *)(op + 0x18);
+			usbsts_after = *(volatile uint32_t *)(op + 0x04);
+			iman_after = *(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_IMAN);
+			db_rb = (dboff < USB_XHCI_MMIO_SIZE)
+				? *(volatile uint32_t *)(base + dboff) : 0xFFFFFFFFu;
+			cmd_post0 = cmd[0];
+			cmd_post3 = cmd[3];
 
 			/* Scan the event-ring page for ANY valid event TRB (type
 			 * 1..39) and separately for the No-Op Command Completion
@@ -1637,6 +1662,26 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 				(any_evt_idx >= 0) ? "PRESENT -> inbound WRITES WORK" : "none",
 				any_evt_type, any_evt_idx,
 				(found_idx >= 0) ? "FOUND" : "absent");
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+
+			/* Command-ring diagnostics: CRCR.CRR (bit 3) tells us if the
+			 * ring is still 'running' (stuck) or went empty (consumed).
+			 * USBSTS.EINT (bit 3) = event interrupt pending. IMAN.IP
+			 * (bit 0) = interrupter pending. cmd_post3 cycle bit: the
+			 * controller does not modify command TRBs, so cmd_post
+			 * should equal what we wrote — a sanity check that we're
+			 * looking at the right page. */
+			r = snprintf(buf + off, cap - off,
+				"  cmdring: CRCR before=0x%08x after=0x%08x (CRR=%u)  "
+				"USBSTS=0x%08x (EINT=%u)  IMAN=0x%08x (IP=%u)  DB_rb=0x%08x\n"
+				"  cmd_pa=0x%llx  cmd_post[0]=%08x [3]=%08x (wrote 00000000 / %08x)\n",
+				crcr_before, crcr_after, (unsigned)((crcr_after >> 3) & 1u),
+				usbsts_after, (unsigned)((usbsts_after >> 3) & 1u),
+				iman_after, (unsigned)(iman_after & 1u), db_rb,
+				(unsigned long long)cmd_pa, cmd_post0, cmd_post3,
+				(23u << 10) | 1u);
 			if (r > 0 && (size_t)r < cap - off) {
 				off += r;
 			}

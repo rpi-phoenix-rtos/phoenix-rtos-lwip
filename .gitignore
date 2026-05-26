@@ -7,3 +7,5 @@ netsrv.map
 # the gitignored .firmware/ blob — Cypress EULA, not BSD, not vendored.
 port/wifi-fw-43455.c
 port/wifi-fw-43455.h
+port/wifi-nvram-43455.c
+port/wifi-nvram-43455.h

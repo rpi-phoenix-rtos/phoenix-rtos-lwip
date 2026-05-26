@@ -2553,6 +2553,262 @@ static int diag_format_sdio_cores(char *buf, size_t cap)
 }
 
 
+/* WiFi P3 prep: walk first 16 EROM entries to enumerate cores.
+ *
+ * The EROM (Enumeration ROM) table at backplane address
+ * ChipCommon[0xFC] contains one 4-byte entry per attribute of every
+ * core in the chip:
+ *   - CompIdent (type=1): identifies a core (Designer + PartNumber).
+ *   - AddrDesc  (type=5): one or more follow, giving the core's
+ *     backplane base address(es) + size encoding.
+ *   - end       (type=0): table terminator.
+ *   - misc      (type=6/7): wrapper / per-port descriptors.
+ *
+ * For BCM43455 the table is ~80 bytes (20 entries); 16 entries is
+ * usually enough to reach the SDIO + ARM-CR4 + SOCRAM cores, the
+ * three the P3 firmware-download path will need to address.
+ *
+ * 64 bytes of EROM fits inside a single 32KB SBADDR window, so we
+ * program the window once and walk via F1-reg-offset reads. */
+static int diag_format_sdio_erom(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	uint32_t eromptr_resp[4][4] = {{0}};
+	int rc_eromptr[4] = {-1, -1, -1, -1};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int ready_iters = 0, rdy_iters = 0;
+	uint16_t rca = 0;
+	uint32_t erom_ptr = 0;
+	int i, j;
+
+	enum { N_ENTRIES = 16 };
+	uint32_t entries[N_ENTRIES] = {0};
+	int rc_entry[N_ENTRIES] = {0};
+	uint32_t entry_resp[N_ENTRIES][4][4];
+
+	memset(entry_resp, 0, sizeof(entry_resp));
+	for (i = 0; i < N_ENTRIES; ++i) {
+		rc_entry[i] = -1;
+	}
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-erom\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		/* Window is at 0x18000000 by default. Read CC[0xFC..0xFF] =
+		 * EROM pointer. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+		for (j = 0; j < 4; ++j) {
+			rc_eromptr[j] = diag_sdioCmd52(sdhci, 0, 1,
+				0xFCu + (uint32_t)j, 0u, eromptr_resp[j]);
+		}
+		erom_ptr = (eromptr_resp[0][0] & 0xffu) |
+			((eromptr_resp[1][0] & 0xffu) << 8) |
+			((eromptr_resp[2][0] & 0xffu) << 16) |
+			((eromptr_resp[3][0] & 0xffu) << 24);
+
+		/* Move SBADDR window to align with EROM page. Window is
+		 * 32KB-aligned; offset within window = erom_ptr & 0x7FFF. */
+		if ((erom_ptr & 0xff000000u) == 0x18000000u) {
+			uint32_t erom_lo = (uint8_t)((erom_ptr >> 15) & 0x1u) << 7;
+			uint32_t erom_mid = (uint8_t)((erom_ptr >> 16) & 0xffu);
+			uint32_t erom_hi = (uint8_t)((erom_ptr >> 24) & 0xffu);
+			uint32_t erom_win_off = erom_ptr & 0x7fffu;
+
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, (uint8_t)erom_lo, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, (uint8_t)erom_mid, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, (uint8_t)erom_hi, NULL);
+
+			/* Walk 16 entries × 4 bytes each = 64 CMD52 reads. If
+			 * any byte read errors, recover SDHCI state and continue
+			 * with the next entry. */
+			for (i = 0; i < N_ENTRIES; ++i) {
+				int entry_ok = 1;
+				for (j = 0; j < 4; ++j) {
+					uint32_t reg = erom_win_off + (uint32_t)(i * 4 + j);
+					int rc = diag_sdioCmd52(sdhci, 0, 1, reg, 0u, entry_resp[i][j]);
+					if (rc != 0) {
+						entry_ok = 0;
+						*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xffffffffu;
+						(void)diag_sdhciResetCmdDat(sdhci);
+						break;
+					}
+				}
+				if (entry_ok) {
+					entries[i] = (entry_resp[i][0][0] & 0xffu) |
+						((entry_resp[i][1][0] & 0xffu) << 8) |
+						((entry_resp[i][2][0] & 0xffu) << 16) |
+						((entry_resp[i][3][0] & 0xffu) << 24);
+					rc_entry[i] = 0;
+				}
+			}
+		}
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5=0/%d C=%d RCA=0x%04x CMD7=%d IORDY=0x%02x rdy=%d  EROMPTR=0x%08x\n",
+		rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters,
+		(unsigned)erom_ptr);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	(void)rc_ocr;
+	(void)rc_iordy;
+	(void)rc_eromptr;
+
+	/* EROM entry type field is bits[3:0] (4-bit), not bits[1:0]:
+	 *   0x0 EMPTY     — skip
+	 *   0x1 COMP      — component descriptor (followed by another
+	 *                   type=1 second word, then MASTER_PORT/ADDRESS)
+	 *   0x3 MASTER_PORT
+	 *   0x5 ADDRESS   — slave wrapper backplane address
+	 *   0x7 ADDRESS_EXT
+	 *   0xF EOT       — end of table
+	 * Walk continues past EMPTY; terminates on EOT. */
+	for (i = 0; i < N_ENTRIES; ++i) {
+		uint32_t e = entries[i];
+		uint32_t type4 = e & 0xfu;
+		if (rc_entry[i] != 0) {
+			r = snprintf(buf + off, cap - off,
+				"[%02d] @0x%08x rc=%d\n",
+				i, (unsigned)(erom_ptr + (uint32_t)(i * 4)),
+				rc_entry[i]);
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+			continue;
+		}
+		if (type4 == 0xfu || e == 0xFFFFFFFFu) {
+			r = snprintf(buf + off, cap - off,
+				"[%02d] 0x%08x  EOT\n", i, (unsigned)e);
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+			break;
+		}
+		if (type4 == 0x1u) {
+			/* COMP: word 0 has Designer/Part/Class; word 1 has rev/
+			 * wrappers. Two consecutive type=1 entries form one
+			 * logical component descriptor. */
+			r = snprintf(buf + off, cap - off,
+				"[%02d] 0x%08x  comp  Des=0x%03x Part=0x%03x cls=%x\n",
+				i, (unsigned)e,
+				(unsigned)((e >> 20) & 0xfffu),
+				(unsigned)((e >> 8) & 0xfffu),
+				(unsigned)((e >> 4) & 0xfu));
+		}
+		else if (type4 == 0x3u) {
+			r = snprintf(buf + off, cap - off,
+				"[%02d] 0x%08x  master-port\n", i, (unsigned)e);
+		}
+		else if (type4 == 0x5u || type4 == 0x7u) {
+			/* ADDRESS: bits[31:12] = base, bits[11:8] = SizeType */
+			uint32_t base = e & 0xfffff000u;
+			r = snprintf(buf + off, cap - off,
+				"[%02d] 0x%08x  addr  base=0x%08x szT=%x\n",
+				i, (unsigned)e, (unsigned)base,
+				(unsigned)((e >> 8) & 0xfu));
+		}
+		else if (type4 == 0x0u) {
+			r = snprintf(buf + off, cap - off,
+				"[%02d] 0x%08x  empty\n", i, (unsigned)e);
+		}
+		else {
+			r = snprintf(buf + off, cap - off,
+				"[%02d] 0x%08x  misc t=0x%x\n",
+				i, (unsigned)e, (unsigned)type4);
+		}
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -2793,6 +3049,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'F') {
 		len = diag_format_sdio_cores(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'E') {
+		len = diag_format_sdio_erom(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

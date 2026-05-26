@@ -3840,25 +3840,27 @@ static int diag_format_sdio_blockwrite(char *buf, size_t cap)
 }
 
 
-/* WiFi P3: firmware-loader smoke test at the ARM-CR4 reset vector.
+/* WiFi P3: 4 KB firmware-loader smoke test at SOCRAM rambase.
  *
  * Writes 4 KB of test pattern (byte i = i & 0xff) into chip-internal
- * SOCRAM address 0x00000000 via one multi-block CMD53 (block_count=64,
- * block_size=64), then reads it back via the symmetric CMD53 and
- * byte-compares. ARM-CR4 fetches its first instruction from
- * chip-internal 0x0 after ResetCtrl bit 0 is cleared at backplane
- * 0x18103800; this command validates that the address is writable by
- * the host while ARM is held in reset (POR default).
+ * SOCRAM address 0x00198000 (brcmfmac rambase for BCM43455) via one
+ * multi-block CMD53 (block_count=64, block_size=64), then reads it
+ * back via the symmetric CMD53 and byte-compares.
  *
  * Extends the 'W' (sdio-blockwrite) coverage in two ways:
- *   - target address is 0x0 instead of 0x00198000 (some BCM chips map
- *     ROM at 0 unless the BootROM-remap bit in ChipCommon is cleared,
- *     so this is a real open question for 43455c0)
- *   - block_count=64 instead of 1, exercising the BUF_WR_READY /
- *     BUF_RD_READY PIO drain across many blocks in a single CMD53
+ *   - 4 KB transfer in one CMD53 instead of 64 bytes — exercises the
+ *     BUF_WR_READY / BUF_RD_READY PIO drain across many blocks
+ *   - validates SOCRAM is writable for at least a full window-fraction
+ *     before we commit to walking the entire 32 KB SBADDR window
  *
- * Successful round-trip is the last prerequisite before staging the
- * real brcmfmac43455-sdio.bin blob (643 KB) into SOCRAM. */
+ * Note on chip-internal 0x0: an earlier revision of this command
+ * targeted 0x0 and found it is BootROM (read-only for bytes 32+).
+ * ARM-CR4 fetches from 0x0 after reset release, but the BootROM
+ * there trampolines to 0x198000 where the downloaded firmware lives,
+ * per the standard brcmfmac convention.
+ *
+ * Successful 4 KB round-trip is the last prerequisite before walking
+ * SBADDR through the 643 KB brcmfmac43455-sdio.bin blob. */
 static int diag_format_sdio_fwloadtest(char *buf, size_t cap)
 {
 	static uint8_t wbuf[4096];
@@ -3956,11 +3958,14 @@ static int diag_format_sdio_fwloadtest(char *buf, size_t cap)
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
 
-		/* Window SBADDR to chip-internal 0x00000000 (ARM-CR4 reset
-		 * vector). LOW bit 7 = bit 15 of addr = 0; MID = 0; HIGH = 0;
-		 * F1 window offset = addr & 0x7FFF = 0. */
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		/* Window SBADDR to chip-internal 0x00198000 (SOCRAM rambase
+		 * for BCM43455 per brcmfmac):
+		 *   LOW  bit 7 = bit 15 of addr = (0x198000 >> 15) & 1 = 1 -> 0x80
+		 *   MID  byte  = bits[23:16] = 0x19
+		 *   HIGH byte  = bits[31:24] = 0x00
+		 *   F1 window offset = addr & 0x7FFF = 0 */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
 
 		rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
@@ -3987,7 +3992,7 @@ static int diag_format_sdio_fwloadtest(char *buf, size_t cap)
 	(void)rc_iordy;
 
 	r = snprintf(buf + off, cap - off,
-		"CMD53 write rc=%d  CMD53 read rc=%d  target chip-internal 0x00000000 (4 KB)\n",
+		"CMD53 write rc=%d  CMD53 read rc=%d  target chip-internal 0x00198000 (4 KB)\n",
 		rc_w, rc_r);
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;

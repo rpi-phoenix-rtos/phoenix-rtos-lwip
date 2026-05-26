@@ -4051,6 +4051,235 @@ static int diag_format_sdio_fwloadtest(char *buf, size_t cap)
 }
 
 
+/* WiFi P3: SBADDR multi-window walk smoke test.
+ *
+ * Writes two distinct 4 KB patterns to two adjacent SBADDR windows
+ * (chip-internal 0x00198000 and 0x001A0000 — 32 KB apart, the F1
+ * window granularity), then reads each back independently and
+ * byte-compares.
+ *
+ * Patterns are deliberately different per window:
+ *   window 0 @ 0x198000:  byte i =  i        (0x00..0xff, repeating)
+ *   window 1 @ 0x1A0000:  byte i = ~i        (0xff..0x00, repeating)
+ *
+ * Three things validated by a clean run:
+ *   1. SBADDR LOW/MID/HIGH walk works — writing window 1 doesn't
+ *      clobber window 0, reading window 0 doesn't return window 1.
+ *   2. The 32 KB window boundary is at the address we think it is.
+ *   3. The host PIO drain handles back-to-back CMD53 reissues on the
+ *      same F1 with no inter-command reset.
+ *
+ * This is the last verification step before staging the actual
+ * 643 KB brcmfmac43455-sdio.bin blob and walking it across ~21
+ * SBADDR windows for the real firmware download. */
+static int diag_format_sdio_fwwalk(char *buf, size_t cap)
+{
+	static uint8_t wbuf0[4096];
+	static uint8_t wbuf1[4096];
+	static uint8_t rbuf0[4096];
+	static uint8_t rbuf1[4096];
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int ready_iters = 0, rdy_iters = 0;
+	int rc_w0 = -100, rc_w1 = -100, rc_r0 = -100, rc_r1 = -100;
+	uint16_t rca = 0;
+	int i, m0, m1, m_cross;
+
+	for (i = 0; i < (int)sizeof(wbuf0); ++i) {
+		wbuf0[i] = (uint8_t)(i & 0xff);
+		wbuf1[i] = (uint8_t)(~i & 0xff);
+		rbuf0[i] = 0;
+		rbuf1[i] = 0;
+	}
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-fwwalk\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
+
+		/* Window 0: chip-internal 0x00198000
+		 *   LOW bit 7 = bit 15 of addr = 1 -> 0x80
+		 *   MID = bits[23:16] = 0x19
+		 *   HIGH = bits[31:24] = 0x00 */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+
+		rc_w0 = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/64u, /*block_size=*/64u, wbuf0);
+
+		/* Window 1: chip-internal 0x001A0000
+		 *   LOW bit 7 = bit 15 of addr = 0 -> 0x00
+		 *   MID = bits[23:16] = 0x1A
+		 *   HIGH = bits[31:24] = 0x00 */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x1Au, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+
+		rc_w1 = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/64u, /*block_size=*/64u, wbuf1);
+
+		/* Read back window 1 first (current SBADDR position). */
+		rc_r1 = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/64u, /*block_size=*/64u, rbuf1);
+
+		/* Re-window to 0x198000 and read back window 0. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+
+		rc_r0 = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/64u, /*block_size=*/64u, rbuf0);
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5=%d/%d C=%d RCA=0x%04x CMD7=%d IORDY=0x%02x rdy=%d\n",
+		rc_ocr, rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	(void)rc_iordy;
+
+	r = snprintf(buf + off, cap - off,
+		"win0 @0x198000  write rc=%d  read rc=%d\n",
+		rc_w0, rc_r0);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	r = snprintf(buf + off, cap - off,
+		"win1 @0x1A0000  write rc=%d  read rc=%d\n",
+		rc_w1, rc_r1);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	if (rc_w0 == 0 && rc_w1 == 0 && rc_r0 == 0 && rc_r1 == 0) {
+		m0 = 0;
+		m1 = 0;
+		m_cross = 0;
+		for (i = 0; i < (int)sizeof(wbuf0); ++i) {
+			if (rbuf0[i] == wbuf0[i]) {
+				++m0;
+			}
+			if (rbuf1[i] == wbuf1[i]) {
+				++m1;
+			}
+			/* Cross-window bleed indicator: did either readback
+			 * happen to return the OTHER window's pattern? */
+			if (rbuf0[i] == wbuf1[i]) {
+				++m_cross;
+			}
+		}
+		r = snprintf(buf + off, cap - off,
+			"win0 match %d/%d  win1 match %d/%d  cross-bleed %d/%d  %s\n",
+			m0, (int)sizeof(wbuf0),
+			m1, (int)sizeof(wbuf1),
+			m_cross, (int)sizeof(wbuf0),
+			(m0 == (int)sizeof(wbuf0) && m1 == (int)sizeof(wbuf1)) ?
+				"(PASS)" : "(FAIL)");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		r = snprintf(buf + off, cap - off,
+			"  win0[0..7] %02x %02x %02x %02x %02x %02x %02x %02x  "
+			"win1[0..7] %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			rbuf0[0], rbuf0[1], rbuf0[2], rbuf0[3],
+			rbuf0[4], rbuf0[5], rbuf0[6], rbuf0[7],
+			rbuf1[0], rbuf1[1], rbuf1[2], rbuf1[3],
+			rbuf1[4], rbuf1[5], rbuf1[6], rbuf1[7]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -4311,6 +4540,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'L') {
 		len = diag_format_sdio_fwloadtest(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'M') {
+		len = diag_format_sdio_fwwalk(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

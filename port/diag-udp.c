@@ -1404,7 +1404,10 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 {
 	int off = 0, r;
 	void *mmio_page, *dcbaa_page, *evt_page, *erst_page, *cmd_page;
+	void *scratch_arr_page = MAP_FAILED, *scratch_bufs_page = MAP_FAILED;
 	uintptr_t dcbaa_pa, evt_pa, erst_pa, cmd_pa;
+	uintptr_t scratch_arr_pa = 0, scratch_bufs_pa = 0;
+	unsigned n_scratch = 0;
 
 	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 xhci-bringup\n");
 	if (r < 0 || (size_t)r >= cap - off) {
@@ -1420,12 +1423,29 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 		return off + (r > 0 ? r : 0);
 	}
 
+	/* xHCI requires the scratchpad buffer array (HCSPARAMS2 Max
+	 * Scratchpad Bufs) to be allocated and DCBAA[0] pointed at it
+	 * BEFORE R/S=1, or the command engine never produces completion
+	 * events (Intel xHCI errata; matches our CRR=0 minimal-bringup
+	 * stall). VL805 reports HCSPARAMS2=0xfc000031 => 31 buffers,
+	 * mandatory. Count = (Hi[25:21] << 5) | Lo[31:27]. */
+	{
+		uint32_t hp2 = *(volatile uint32_t *)((volatile uint8_t *)mmio_page +
+			USB_XHCI_CAP_HCSPARAMS2);
+		n_scratch = (((hp2 >> 16) & 0x3E0u) | ((hp2 >> 27) & 0x1Fu));
+	}
+
 	/* Same allocation flags as drivers/physmmap.c::dmammap(). */
 	#define DMA_FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS)
 	dcbaa_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
 	evt_page   = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
 	erst_page  = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
 	cmd_page   = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
+	scratch_arr_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
+	if (n_scratch > 0u) {
+		scratch_bufs_page = mmap(NULL, (size_t)n_scratch * _PAGE_SIZE,
+			PROT_READ | PROT_WRITE, DMA_FLAGS, -1, 0);
+	}
 	#undef DMA_FLAGS
 	if (dcbaa_page == MAP_FAILED || evt_page == MAP_FAILED ||
 		erst_page == MAP_FAILED || cmd_page == MAP_FAILED) {
@@ -1434,6 +1454,8 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 		if (evt_page   != MAP_FAILED) munmap(evt_page, _PAGE_SIZE);
 		if (erst_page  != MAP_FAILED) munmap(erst_page, _PAGE_SIZE);
 		if (cmd_page   != MAP_FAILED) munmap(cmd_page, _PAGE_SIZE);
+		if (scratch_arr_page  != MAP_FAILED) munmap(scratch_arr_page, _PAGE_SIZE);
+		if (scratch_bufs_page != MAP_FAILED) munmap(scratch_bufs_page, (size_t)n_scratch * _PAGE_SIZE);
 		munmap(mmio_page, USB_XHCI_MMIO_SIZE);
 		return off + (r > 0 ? r : 0);
 	}
@@ -1447,6 +1469,27 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 	memset(evt_page, 0, _PAGE_SIZE);
 	memset(erst_page, 0, _PAGE_SIZE);
 	memset(cmd_page, 0, _PAGE_SIZE);
+
+	/* Scratchpad: fill the array with PAGESIZE-aligned buffer PAs and
+	 * point DCBAA[0] at the array (xHCI §4.20 / §6.1). MUST precede
+	 * DCBAAP program + R/S below. */
+	if (n_scratch > 0u && scratch_arr_page != MAP_FAILED &&
+		scratch_bufs_page != MAP_FAILED) {
+		volatile uint32_t *arr = (volatile uint32_t *)scratch_arr_page;
+		volatile uint32_t *dcbaa = (volatile uint32_t *)dcbaa_page;
+		unsigned si;
+		scratch_arr_pa = (uintptr_t)va2pa(scratch_arr_page);
+		scratch_bufs_pa = (uintptr_t)va2pa(scratch_bufs_page);
+		memset(scratch_arr_page, 0, _PAGE_SIZE);
+		for (si = 0u; si < n_scratch; ++si) {
+			uint64_t bufpa = (uint64_t)scratch_bufs_pa + (uint64_t)si * _PAGE_SIZE;
+			arr[si * 2u] = (uint32_t)(bufpa & 0xFFFFFFFFu);
+			arr[si * 2u + 1u] = (uint32_t)(bufpa >> 32);
+		}
+		dcbaa[0] = (uint32_t)(scratch_arr_pa & 0xFFFFFFFFu);
+		dcbaa[1] = (uint32_t)((uint64_t)scratch_arr_pa >> 32);
+		__asm__ volatile("dsb sy" ::: "memory");
+	}
 
 	/* Build the ERST entry: [seg_PA_LO, seg_PA_HI, ring_size, rsvd]. */
 	{
@@ -1699,7 +1742,8 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 				"USBSTS=0x%08x (EINT=%u)  IMAN=0x%08x (IP=%u)  DB_rb=0x%08x\n"
 				"  cmd_pa=0x%llx  cmd_post[0]=%08x [3]=%08x (wrote 00000000 / %08x)\n"
 				"  layout: HCSPARAMS1=0x%08x (slots=%u ports=%u)  HCCPARAMS1=0x%08x (AC64=%u CSZ=%u)\n"
-				"          DBOFF_raw=0x%08x RTSOFF_raw=0x%08x caplen=0x%02x\n",
+				"          DBOFF_raw=0x%08x RTSOFF_raw=0x%08x caplen=0x%02x\n"
+				"  scratchpad: n=%u arr_pa=0x%llx bufs_pa=0x%llx (DCBAA[0] set)\n",
 				crcr_before, crr_immediate, crcr_after, (unsigned)((crcr_after >> 3) & 1u),
 				usbsts_after, (unsigned)((usbsts_after >> 3) & 1u),
 				iman_after, (unsigned)(iman_after & 1u), db_rb,
@@ -1709,7 +1753,9 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 				(unsigned)((hcsparams1 >> 24) & 0xFFu),
 				hccparams1, (unsigned)(hccparams1 & 1u),
 				(unsigned)((hccparams1 >> 2) & 1u),
-				dboff_raw, rtsoff_raw, caplength);
+				dboff_raw, rtsoff_raw, caplength,
+				n_scratch, (unsigned long long)scratch_arr_pa,
+				(unsigned long long)scratch_bufs_pa);
 			if (r > 0 && (size_t)r < cap - off) {
 				off += r;
 			}
@@ -1779,6 +1825,12 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 		}
 	}
 
+	if (scratch_bufs_page != MAP_FAILED) {
+		munmap(scratch_bufs_page, (size_t)n_scratch * _PAGE_SIZE);
+	}
+	if (scratch_arr_page != MAP_FAILED) {
+		munmap(scratch_arr_page, _PAGE_SIZE);
+	}
 	munmap(cmd_page, _PAGE_SIZE);
 	munmap(erst_page, _PAGE_SIZE);
 	munmap(evt_page, _PAGE_SIZE);

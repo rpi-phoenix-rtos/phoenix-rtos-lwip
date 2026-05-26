@@ -2591,7 +2591,7 @@ static int diag_format_sdio_erom(char *buf, size_t cap)
 	uint32_t erom_ptr = 0;
 	int i, j;
 
-	enum { N_ENTRIES = 16 };
+	enum { N_ENTRIES = 24 };
 	uint32_t entries[N_ENTRIES] = {0};
 	int rc_entry[N_ENTRIES] = {0};
 	uint32_t entry_resp[N_ENTRIES][4][4];

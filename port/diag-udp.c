@@ -3058,7 +3058,7 @@ static int diag_format_sdio_socram(char *buf, size_t cap)
 	int ready_iters = 0, rdy_iters = 0;
 	uint16_t rca = 0;
 
-	enum { N_TARGETS = 2 };
+	enum { N_TARGETS = 2, DUMP_WORDS = 8 };
 	static const uint32_t target_addr[N_TARGETS] = {
 		0x00000000u,
 		0x00198000u
@@ -3067,10 +3067,12 @@ static int diag_format_sdio_socram(char *buf, size_t cap)
 		"BootROM @0x00000000",
 		"SOCRAM  @0x00198000 (brcmfmac rambase)"
 	};
-	uint32_t target_word[N_TARGETS] = {0};
+	uint32_t target_words[N_TARGETS][DUMP_WORDS];
 	int target_rc[N_TARGETS] = { -1, -1 };
-	uint32_t resp_buf[4][4];
-	int t, j;
+	uint32_t resp_buf[4];
+	int t, w, j;
+
+	memset(target_words, 0, sizeof(target_words));
 
 	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-socram\n");
 	if (r < 0 || (size_t)r >= cap - off) {
@@ -3145,8 +3147,8 @@ static int diag_format_sdio_socram(char *buf, size_t cap)
 			usleep(1000);
 		}
 
-		/* For each target, set SBADDR to its 32KB-aligned base and
-		 * read 4 bytes at the in-window offset. */
+		/* For each target, set SBADDR and read DUMP_WORDS words
+		 * (32 bytes) at the in-window offset. */
 		for (t = 0; t < N_TARGETS; ++t) {
 			uint32_t addr = target_addr[t];
 			uint8_t sb_lo = (uint8_t)(((addr >> 15) & 0x1u) << 7);
@@ -3159,25 +3161,26 @@ static int diag_format_sdio_socram(char *buf, size_t cap)
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, sb_mid, NULL);
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, sb_hi, NULL);
 
-			memset(resp_buf, 0, sizeof(resp_buf));
-			for (j = 0; j < 4; ++j) {
-				int rc = diag_sdioCmd52(sdhci, 0, 1,
-					win_off + (uint32_t)j, 0u, resp_buf[j]);
-				if (rc != 0) {
-					probe_ok = 0;
-					target_rc[t] = rc;
-					*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xffffffffu;
-					(void)diag_sdhciResetCmdDat(sdhci);
+			for (w = 0; w < DUMP_WORDS; ++w) {
+				uint32_t word_off = win_off + (uint32_t)(w * 4);
+				int word_ok = 1;
+				for (j = 0; j < 4; ++j) {
+					int rc = diag_sdioCmd52(sdhci, 0, 1,
+						word_off + (uint32_t)j, 0u, resp_buf);
+					if (rc != 0) {
+						word_ok = 0;
+						probe_ok = 0;
+						*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xffffffffu;
+						(void)diag_sdhciResetCmdDat(sdhci);
+						break;
+					}
+					target_words[t][w] |= (resp_buf[0] & 0xffu) << (j * 8);
+				}
+				if (!word_ok) {
 					break;
 				}
 			}
-			if (probe_ok) {
-				target_rc[t] = 0;
-				target_word[t] = (resp_buf[0][0] & 0xffu) |
-					((resp_buf[1][0] & 0xffu) << 8) |
-					((resp_buf[2][0] & 0xffu) << 16) |
-					((resp_buf[3][0] & 0xffu) << 24);
-			}
+			target_rc[t] = probe_ok ? 0 : -2;
 		}
 	}
 
@@ -3197,10 +3200,17 @@ static int diag_format_sdio_socram(char *buf, size_t cap)
 
 	for (t = 0; t < N_TARGETS; ++t) {
 		r = snprintf(buf + off, cap - off,
-			"%s  rc=%d  word=0x%08x\n",
-			target_name[t], target_rc[t], (unsigned)target_word[t]);
+			"%s  rc=%d\n", target_name[t], target_rc[t]);
 		if (r > 0 && (size_t)r < cap - off) {
 			off += r;
+		}
+		for (w = 0; w < DUMP_WORDS; ++w) {
+			r = snprintf(buf + off, cap - off,
+				"  +0x%02x  0x%08x\n",
+				(unsigned)(w * 4), (unsigned)target_words[t][w]);
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
 		}
 	}
 

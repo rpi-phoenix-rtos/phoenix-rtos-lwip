@@ -2808,6 +2808,203 @@ static int diag_format_sdio_erom(char *buf, size_t cap)
 }
 
 
+/* WiFi P3 prep: read ARM-CR4 control region.
+ *
+ * From the 40-entry EROM walk: BCM43455's ARM-CR4 has TWO logical
+ * regions in the backplane:
+ *
+ *   0x18002000  ARM-CR4 main port (Part 0x83E)
+ *   0x18003000  ARM-CR4 control region (Part 0x83C) — this is what
+ *               brcmfmac calls "armcore_base", where ResetCtrl and
+ *               IoCtrl live. ResetCtrl bit 0 = hold-in-reset.
+ *
+ * This sub-command moves the F1 SBADDR window onto 0x18003000 and
+ * READS:
+ *
+ *   F1 reg 0x408 = IoCtrl     (ARM ioctl bits, including clk_en)
+ *   F1 reg 0x800 = ResetCtrl  (bit 0 = ARM held in reset)
+ *
+ * Read-only. Writing ResetCtrl=0 (release ARM) here would jump the
+ * CR4 into uninitialized SOCRAM — that step belongs to the P3
+ * firmware-download driver, not the diagnostic probe.
+ *
+ * Expected first-cycle value: ResetCtrl = 0x1 (in reset) since the
+ * Pi 4 boots with the chip's CR4 not yet released by any host
+ * driver. */
+static int diag_format_sdio_arm(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int ready_iters = 0, rdy_iters = 0;
+	uint16_t rca = 0;
+
+	/* Probe both 0x83C @ 0x18003000 (brcmfmac's "armcore_base")
+	 * AND 0x83E ARM-CR4 wrapper @ 0x18005000 at standard offsets
+	 * +0x0 (sanity), +0x408 (IoCtrl), +0x800 (ResetCtrl). */
+	enum { N_PROBES = 6 };
+	static const uint32_t probe_offs[N_PROBES] = {
+		0x3000u, 0x3408u, 0x3800u,
+		0x5000u, 0x5408u, 0x5800u };
+	static const char *probe_names[N_PROBES] = {
+		"0x83C+0x000", "0x83C+0x408 (IoCtrl)", "0x83C+0x800 (ResetCtrl)",
+		"0x83E+0x000", "0x83E+0x408 (IoCtrl)", "0x83E+0x800 (ResetCtrl)" };
+	uint32_t probe_words[N_PROBES] = {0};
+	int probe_rc[N_PROBES] = { -1, -1, -1, -1, -1, -1 };
+	uint32_t pw[N_PROBES][4][4];
+	int p, j;
+	memset(pw, 0, sizeof(pw));
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-arm\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+		int i;
+
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		/* Move SBADDR window to 0x18003000 (ARM control region per
+		 * EROM Part 0x83C). The 32KB window covers 0x18000000 ..
+		 * 0x18007FFF when H=0x18 M=0x00 L=0x00 -- so F1 reg 0x3000
+		 * maps to backplane 0x18003000. We already had window at
+		 * 0x18000000 from the boilerplate path, no SBADDR update
+		 * needed. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+
+		for (p = 0; p < N_PROBES; ++p) {
+			int probe_ok = 1;
+			for (j = 0; j < 4; ++j) {
+				int rc = diag_sdioCmd52(sdhci, 0, 1,
+					probe_offs[p] + (uint32_t)j, 0u, pw[p][j]);
+				if (rc != 0) {
+					probe_ok = 0;
+					probe_rc[p] = rc;
+					*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xffffffffu;
+					(void)diag_sdhciResetCmdDat(sdhci);
+					break;
+				}
+			}
+			if (probe_ok) {
+				probe_rc[p] = 0;
+				probe_words[p] = (pw[p][0][0] & 0xffu) |
+					((pw[p][1][0] & 0xffu) << 8) |
+					((pw[p][2][0] & 0xffu) << 16) |
+					((pw[p][3][0] & 0xffu) << 24);
+			}
+		}
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5=%d/%d C=%d RCA=0x%04x CMD7=%d IORDY=0x%02x rdy=%d\n",
+		rc_ocr, rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	(void)rc_iordy;
+
+	for (p = 0; p < N_PROBES; ++p) {
+		r = snprintf(buf + off, cap - off,
+			"%s rc=%d word=0x%08x\n",
+			probe_names[p], probe_rc[p], (unsigned)probe_words[p]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+	/* If 0x83E ResetCtrl read succeeded, decode reset bit. */
+	if (probe_rc[5] == 0) {
+		r = snprintf(buf + off, cap - off,
+			"  -> ARM-CR4 (0x83E) ResetCtrl bit 0 = %u  %s\n",
+			(unsigned)(probe_words[5] & 0x1u),
+			(probe_words[5] & 0x1u) ? "(held in reset)" : "(released)");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -3053,6 +3250,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'E') {
 		len = diag_format_sdio_erom(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'A') {
+		len = diag_format_sdio_arm(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

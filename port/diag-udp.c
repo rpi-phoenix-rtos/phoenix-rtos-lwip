@@ -1992,6 +1992,158 @@ static int diag_sdioCmd52(volatile uint8_t *sdhci, int write, int fn,
 }
 
 
+/* CMD53 (IO_RW_EXTENDED) block-mode READ via SDHCI PIO.
+ *
+ * arg layout per SD/SDIO spec:
+ *   bit  31    R/W   (0 = read)
+ *   bits 30:28 FN
+ *   bit  27    block_mode (1)
+ *   bit  26    op_code (0 = fixed F1 reg, 1 = incrementing)
+ *   bits 25:9  REG   (17-bit F1 register address)
+ *   bits 8:0   count (block count if block_mode, byte count otherwise; 0 -> 512)
+ *
+ * Sets BLOCK_SIZE + BLOCK_COUNT, programs TRANSFER_MODE for read,
+ * issues CMD53, polls CMD_COMPLETE, then drains DATA_PORT (offset
+ * 0x20) one 32-bit word at a time as BUFFER_READ_READY fires.
+ * Waits for TRANSFER_COMPLETE before returning.
+ *
+ * buf must point to a 4-byte-aligned destination of at least
+ * block_count * block_size bytes. */
+#define SDHCI_BLOCK_SIZE_CNT  0x04u  /* BLOCK_SIZE (low 16) + BLOCK_COUNT (high 16) */
+#define SDHCI_DATA_PORT       0x20u  /* PIO FIFO */
+#define SDHCI_INT_XFER_COMPLETE  0x00000002u
+#define SDHCI_INT_BUF_RD_READY   0x00000020u
+
+static int diag_sdioCmd53Read(volatile uint8_t *sdhci, int fn,
+	int incr_addr, uint32_t reg_addr,
+	uint32_t block_count, uint32_t block_size,
+	uint8_t *buf)
+{
+	uint32_t arg, cmd_word;
+	uint32_t st;
+	uint32_t bytes_total = block_count * block_size;
+	uint32_t words_total = bytes_total / 4u;
+	uint32_t block_words = block_size / 4u;
+	uint32_t bytes_in_block = 0;
+	uint32_t i;
+	int deadline;
+
+	/* Wait for CMD line idle. */
+	for (deadline = 100000; deadline > 0; --deadline) {
+		if ((*(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE) &
+			SDHCI_PRES_CMD_INHIBIT) == 0u) {
+			break;
+		}
+	}
+	if (deadline == 0) {
+		return -1;
+	}
+
+	/* Clear INT_STATUS so we can poll for fresh CMD_COMPLETE +
+	 * BUFFER_READ_READY + TRANSFER_COMPLETE bits. */
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
+
+	/* Program BLOCK_SIZE + BLOCK_COUNT. */
+	*(volatile uint32_t *)(sdhci + SDHCI_BLOCK_SIZE_CNT) =
+		(block_count << 16) | (block_size & 0xFFFu);
+
+	/* CMD53 argument. */
+	arg = (0u << 31) |
+		((uint32_t)(fn & 7u) << 28) |
+		(1u << 27) |  /* block_mode */
+		((incr_addr ? 1u : 0u) << 26) |
+		((reg_addr & 0x1FFFFu) << 9) |
+		(block_count & 0x1FFu);
+	*(volatile uint32_t *)(sdhci + SDHCI_ARGUMENT_1) = arg;
+
+	/* TRANSFER_MODE (low 16 bits) + COMMAND (upper 16) dword write at
+	 * offset 0x0C:
+	 *   bit 0  DMA_EN          = 0 (PIO)
+	 *   bit 1  BLOCK_COUNT_EN  = 1
+	 *   bit 4  DAT_XFER_DIR    = 1 (read)
+	 *   bit 5  MULTI_BLK_SEL   = (block_count > 1)
+	 *   bits 17:16 RESP_TYPE   = 2 (R1/R5 short response)
+	 *   bit 19 CRC_CHECK_EN    = 1
+	 *   bit 20 INDEX_CHECK_EN  = 1
+	 *   bit 21 DATA_PRESENT    = 1
+	 *   bits 31:24 CMD_NUMBER  = 53
+	 */
+	cmd_word =
+		(1u << 1) |
+		(1u << 4) |
+		((block_count > 1u ? 1u : 0u) << 5) |
+		((uint32_t)0x3Au << 16) |
+		((uint32_t)53u << 24);
+	*(volatile uint32_t *)(sdhci + SDHCI_TRANS_CMD) = cmd_word;
+
+	/* Wait CMD_COMPLETE. */
+	for (deadline = 100000; deadline > 0; --deadline) {
+		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+			return -2;
+		}
+		if ((st & SDHCI_INT_CMD_COMPLETE) != 0u) {
+			break;
+		}
+	}
+	if (deadline == 0) {
+		return -3;
+	}
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_CMD_COMPLETE;
+
+	/* PIO read loop: drain DATA_PORT one word at a time. After each
+	 * block-worth, clear BUFFER_READ_READY and the next block will
+	 * (re-)assert it. */
+	for (i = 0; i < words_total; ++i) {
+		for (deadline = 100000; deadline > 0; --deadline) {
+			st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+			if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+				return -4;
+			}
+			if ((st & SDHCI_INT_BUF_RD_READY) != 0u) {
+				break;
+			}
+		}
+		if (deadline == 0) {
+			return -5;
+		}
+
+		{
+			uint32_t data = *(volatile uint32_t *)(sdhci + SDHCI_DATA_PORT);
+			if (buf != NULL) {
+				buf[i * 4 + 0] = (uint8_t)(data & 0xffu);
+				buf[i * 4 + 1] = (uint8_t)((data >> 8) & 0xffu);
+				buf[i * 4 + 2] = (uint8_t)((data >> 16) & 0xffu);
+				buf[i * 4 + 3] = (uint8_t)((data >> 24) & 0xffu);
+			}
+		}
+
+		bytes_in_block += 4u;
+		if (bytes_in_block >= block_size) {
+			bytes_in_block = 0u;
+			*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = SDHCI_INT_BUF_RD_READY;
+		}
+		(void)block_words;
+	}
+
+	/* Wait TRANSFER_COMPLETE. */
+	for (deadline = 100000; deadline > 0; --deadline) {
+		st = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);
+		if ((st & SDHCI_INT_ERR_ANY) != 0u) {
+			return -6;
+		}
+		if ((st & SDHCI_INT_XFER_COMPLETE) != 0u) {
+			break;
+		}
+	}
+	if (deadline == 0) {
+		return -7;
+	}
+	*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xFFFFFFFFu;
+	return 0;
+}
+
+
 /* WiFi Tier 4: CIS read + Function 1 enable + chip-id readback.
  *
  * After the standard CMD5/3/7 enumeration (same as Tier 3), this:
@@ -3222,6 +3374,174 @@ static int diag_format_sdio_socram(char *buf, size_t cap)
 }
 
 
+/* WiFi P3: CMD53 block-mode read smoke test.
+ *
+ * After SDIO + F1 enable + SBADDR=0x18000000, issues a single-block
+ * CMD53 IO_RW_EXTENDED read of 64 bytes starting at F1 reg 0
+ * (= backplane 0x18000000, ChipCommon). Compares the first 4 bytes
+ * against the known CMD52 chip-id value (0x45 0x43 0x26 0x15 LE)
+ * to validate that the block transfer path works end-to-end.
+ *
+ * 64-byte block is the BCM43455 SDIO default (CCCR FN0BS / FN1BS).
+ * Setting BLOCK_SIZE = 64 matches what brcmfmac uses for control
+ * transfers; firmware bulk download eventually uses 512-byte blocks
+ * once SDIO clock has been bumped past 400 kHz init speed. */
+static int diag_format_sdio_block(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int ready_iters = 0, rdy_iters = 0;
+	int rc_cmd53 = -100;
+	uint16_t rca = 0;
+	uint8_t block[64] = {0};
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-block\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+		int i;
+
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		/* Program F1 IOBLOCK_SIZE to 64 via FBR1 (CCCR regs 0x110
+		 * /0x111). Without this CMD53 block-mode data-phase stalls
+		 * because the chip doesn't know what block size to emit. */
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);  /* LSB = 64 */
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);  /* MSB */
+
+		/* Window at 0x18000000 (default). Issue CMD53 read of one
+		 * 64-byte block at F1 reg 0 -> backplane 0x18000000 (CC). */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+
+		rc_cmd53 = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, block);
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5=%d/%d C=%d RCA=0x%04x CMD7=%d IORDY=0x%02x rdy=%d\n",
+		rc_ocr, rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	(void)rc_iordy;
+
+	r = snprintf(buf + off, cap - off,
+		"CMD53 read 1 block * 64B @ F1 reg 0 (CC):  rc=%d\n",
+		rc_cmd53);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	if (rc_cmd53 == 0) {
+		int w;
+		for (w = 0; w < 16; ++w) {
+			uint32_t word = block[w * 4] |
+				((uint32_t)block[w * 4 + 1] << 8) |
+				((uint32_t)block[w * 4 + 2] << 16) |
+				((uint32_t)block[w * 4 + 3] << 24);
+			r = snprintf(buf + off, cap - off,
+				"  +0x%02x  0x%08x\n", w * 4, (unsigned)word);
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+		{
+			int chip_id_match = (block[0] == 0x45u && block[1] == 0x43u
+				&& block[2] == 0x26u && block[3] == 0x15u);
+			r = snprintf(buf + off, cap - off,
+				"chip-id match (expect 45 43 26 15): %s\n",
+				chip_id_match ? "YES" : "NO");
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -3473,6 +3793,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'S') {
 		len = diag_format_sdio_socram(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'B') {
+		len = diag_format_sdio_block(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

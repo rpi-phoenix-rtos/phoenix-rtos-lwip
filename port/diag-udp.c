@@ -4795,6 +4795,311 @@ static int diag_format_sdio_hs(char *buf, size_t cap)
 }
 
 
+/* WiFi P3 final: full-firmware load + release ARM-CR4 + look for fw boot.
+ *
+ * Same load pipeline as 'I' (enum → F1 enable → HS-mode → walk 643 KB
+ * into SOCRAM), then:
+ *
+ *   1. Re-window SBADDR to chip-internal 0x18100000 (ARM-CR4 wrapper
+ *      window 0x18103000 lives here at F1 offset 0x3000).
+ *   2. Read ResetCtrl at F1 offset 0x3800 — expect 0x01 (POR: held).
+ *   3. Write 0x00 to ResetCtrl — release ARM-CR4. The core fetches
+ *      its first instruction from BootROM at chip-internal 0x0,
+ *      which trampolines to SOCRAM @ 0x198000 where we just dropped
+ *      the Cypress firmware.
+ *   4. Sleep ~100 ms to let firmware initialize.
+ *   5. Re-window SBADDR to chip-internal 0x198000 and CMD53-read
+ *      the first 64 bytes of SOCRAM.
+ *   6. Compare against the source blob's first 64 bytes: if firmware
+ *      has booted and written anything to its own image, the bytes
+ *      will differ — that's the "fw running" signal (the SOCRAM
+ *      head usually holds the firmware's startup data area).
+ *
+ * No NVRAM is loaded yet, so the chip won't fully come up; we expect
+ * SOME firmware activity (changed bytes in SOCRAM head, or
+ * SBINTSTATUS bits set) but not a full BCDC hello. This is the
+ * pre-flight check that the load pipeline + ARM release work. */
+static int diag_format_sdio_fwrelease(char *buf, size_t cap)
+{
+	static uint8_t pre_buf[64];
+	static uint8_t post_buf[64];
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	uint32_t rc_pre_resp[4] = {0}, rc_post_resp[4] = {0};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int rc_hs = -100;
+	int ready_iters = 0, rdy_iters = 0;
+	uint16_t rca = 0;
+	int rc_w, rc_r_pre = -100, rc_r_post = -100;
+	int worst_rc_w = 0;
+	int i, pre_match, post_match, diff_count;
+	uint32_t bytes_written = 0u;
+	int window_idx = 0;
+	size_t fw_offset = 0u;
+	size_t fw_target_bytes;
+	const uint32_t window_bytes = 32u * 1024u;
+	const uint32_t blk_size = 64u;
+	const uint32_t blk_count = 64u;
+
+	for (i = 0; i < (int)sizeof(pre_buf); ++i) {
+		pre_buf[i] = 0;
+		post_buf[i] = 0;
+	}
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-fwrelease\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	if (wifi_fw_43455_len == 0u) {
+		r = snprintf(buf + off, cap - off,
+			"error: firmware blob not staged\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+	fw_target_bytes = (wifi_fw_43455_len / blk_size) * blk_size;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		rc_hs = diag_sdioGoHighSpeed(sdhci);
+
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
+
+		while (fw_offset < fw_target_bytes && rc_hs == 0) {
+			uint32_t addr = 0x00198000u + (uint32_t)window_idx * 0x8000u;
+			uint8_t  lo  = (uint8_t)(((addr >> 15) & 1u) ? 0x80u : 0x00u);
+			uint8_t  mid = (uint8_t)((addr >> 16) & 0xffu);
+			uint8_t  hi  = (uint8_t)((addr >> 24) & 0xffu);
+			size_t   remaining = fw_target_bytes - fw_offset;
+			size_t   this_window = (remaining > window_bytes) ? window_bytes : remaining;
+			uint32_t bytes_per_cmd = blk_count * blk_size;
+			uint32_t chunks = (uint32_t)(this_window / bytes_per_cmd);
+			uint32_t leftover_blocks = (uint32_t)((this_window % bytes_per_cmd) / blk_size);
+			uint32_t ci;
+
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, lo,  NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, mid, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, hi,  NULL);
+
+			for (ci = 0; ci < chunks; ++ci) {
+				rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+					/*reg_addr=*/ci * bytes_per_cmd,
+					/*block_count=*/blk_count,
+					/*block_size=*/blk_size,
+					wifi_fw_43455 + fw_offset + ci * bytes_per_cmd);
+				if (rc_w != 0) {
+					if (worst_rc_w == 0) worst_rc_w = rc_w;
+					break;
+				}
+				bytes_written += bytes_per_cmd;
+			}
+			if (rc_w != 0) break;
+
+			if (leftover_blocks > 0) {
+				rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+					/*reg_addr=*/chunks * bytes_per_cmd,
+					/*block_count=*/leftover_blocks,
+					/*block_size=*/blk_size,
+					wifi_fw_43455 + fw_offset + chunks * bytes_per_cmd);
+				if (rc_w != 0) {
+					if (worst_rc_w == 0) worst_rc_w = rc_w;
+					break;
+				}
+				bytes_written += leftover_blocks * blk_size;
+			}
+
+			fw_offset += this_window;
+			window_idx++;
+		}
+
+		/* Snapshot SOCRAM[0..63] BEFORE release — should match
+		 * source firmware byte-identically. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+		rc_r_pre = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, pre_buf);
+
+		/* Re-window to ARM-CR4 wrapper window 0x18100000 (so F1
+		 * offset 0x3800 = chip-internal 0x18103800 = ResetCtrl). */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x10u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+
+		/* Read ResetCtrl (expect 0x01 = held in reset). */
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x3800u, 0u, rc_pre_resp);
+
+		/* RELEASE ARM-CR4 — write 0 to ResetCtrl bit 0. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x3800u, 0x00u, NULL);
+
+		usleep(100 * 1000);  /* let firmware initialize */
+
+		/* Read ResetCtrl back (expect 0x00 = released). */
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x3800u, 0u, rc_post_resp);
+
+		/* Re-window to SOCRAM and capture post-release snapshot. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+		rc_r_post = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, post_buf);
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5=%d/%d C=%d RCA=0x%04x CMD7=%d IORDY=0x%02x rdy=%d\n",
+		rc_ocr, rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	(void)rc_iordy;
+
+	r = snprintf(buf + off, cap - off,
+		"fw_load: staged %u bytes across %d windows  HS=%d  worst rc_w=%d\n",
+		bytes_written, window_idx, rc_hs, worst_rc_w);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"ResetCtrl pre=0x%02x  post=0x%02x  (expect pre=0x01 held, post=0x00 released)\n",
+		(unsigned)(rc_pre_resp[0] & 0xff),
+		(unsigned)(rc_post_resp[0] & 0xff));
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	if (rc_r_pre == 0 && rc_r_post == 0) {
+		pre_match = 0;
+		post_match = 0;
+		diff_count = 0;
+		for (i = 0; i < (int)sizeof(pre_buf); ++i) {
+			if (pre_buf[i] == wifi_fw_43455[i]) ++pre_match;
+			if (post_buf[i] == wifi_fw_43455[i]) ++post_match;
+			if (pre_buf[i] != post_buf[i]) ++diff_count;
+		}
+		r = snprintf(buf + off, cap - off,
+			"SOCRAM[0..63] pre vs fw: %d/64 match (load check)\n",
+			pre_match);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		r = snprintf(buf + off, cap - off,
+			"SOCRAM[0..63] post vs fw: %d/64 match  pre-vs-post diff: %d/64 bytes\n",
+			post_match, diff_count);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		r = snprintf(buf + off, cap - off,
+			"  fw[0..7]   %02x %02x %02x %02x %02x %02x %02x %02x\n"
+			"  pre[0..7]  %02x %02x %02x %02x %02x %02x %02x %02x\n"
+			"  post[0..7] %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			wifi_fw_43455[0], wifi_fw_43455[1], wifi_fw_43455[2], wifi_fw_43455[3],
+			wifi_fw_43455[4], wifi_fw_43455[5], wifi_fw_43455[6], wifi_fw_43455[7],
+			pre_buf[0], pre_buf[1], pre_buf[2], pre_buf[3],
+			pre_buf[4], pre_buf[5], pre_buf[6], pre_buf[7],
+			post_buf[0], post_buf[1], post_buf[2], post_buf[3],
+			post_buf[4], post_buf[5], post_buf[6], post_buf[7]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		if (diff_count > 0) {
+			r = snprintf(buf + off, cap - off,
+				"  -> SOCRAM CHANGED after release: firmware appears to be running\n");
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+		else {
+			r = snprintf(buf + off, cap - off,
+				"  -> SOCRAM unchanged: firmware may not have started (need NVRAM?)\n");
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -5064,6 +5369,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'H') {
 		len = diag_format_sdio_hs(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'G') {
+		len = diag_format_sdio_fwrelease(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

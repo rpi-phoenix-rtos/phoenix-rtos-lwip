@@ -4839,6 +4839,7 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	int rc_tail = -100;
 	uint8_t chipclk_samples[8] = {0};
 	uint8_t socram_tail[16] = {0};
+	uint8_t ht_clk_csr = 0u;
 	unsigned card_intr = 0u;
 	int worst_rc_w = 0;
 	int i, pre_match, post_match, diff_count;
@@ -4935,6 +4936,39 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		}
 
 		rc_hs = diag_sdioGoHighSpeed(sdhci);
+
+		/* Force the backplane HT clock BEFORE downloading firmware.
+		 * brcmfmac does brcmf_sdio_clkctl(CLK_AVAIL) here: write
+		 * CHIPCLKCSR (F1 0x1000E) HT_AVAIL_REQ (0x10) and poll for
+		 * HT_AVAIL (0x80). Without the HT/PLL clock the SOCRAM/CR4
+		 * backplane runs only on ALP (0x40) and the CR4 never gets a
+		 * proper run clock — which is why an earlier revision left
+		 * CHIPCLKCSR stuck at 0x40 and the firmware never started. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x10u, NULL);
+		for (i = 0; i < 250; ++i) {
+			uint32_t cc[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Eu, 0u, cc);
+			ht_clk_csr = (uint8_t)(cc[0] & 0xffu);
+			if ((ht_clk_csr & 0x80u) != 0u) {
+				break;
+			}
+			usleep(2000);  /* up to ~500 ms on HT_AVAIL_REQ */
+		}
+		/* Fallback: if HT_AVAIL_REQ alone didn't bring the PLL up,
+		 * try FORCE_HT (0x02) which unconditionally forces the HT
+		 * clock on. Poll another ~500 ms. */
+		if ((ht_clk_csr & 0x80u) == 0u) {
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x12u, NULL);
+			for (i = 0; i < 250; ++i) {
+				uint32_t cc[4] = {0};
+				(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Eu, 0u, cc);
+				ht_clk_csr = (uint8_t)(cc[0] & 0xffu);
+				if ((ht_clk_csr & 0x80u) != 0u) {
+					break;
+				}
+				usleep(2000);
+			}
+		}
 
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
@@ -5139,10 +5173,10 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	}
 
 	r = snprintf(buf + off, cap - off,
-		"nvram: %zu bytes -> chip 0x%06x  rc_nvram_w=%d\n",
+		"nvram: %zu bytes -> chip 0x%06x  rc_nvram_w=%d  HT_clk_csr=0x%02x (HT_AVAIL=0x80)\n",
 		wifi_nvram_43455_len,
 		(unsigned)(0x238000u - (uint32_t)wifi_nvram_43455_len),
-		rc_nvram_w);
+		rc_nvram_w, (unsigned)ht_clk_csr);
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}

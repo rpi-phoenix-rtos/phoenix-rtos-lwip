@@ -1610,9 +1610,22 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 			/* CRCR before ringing (CRR bit 3 readable; pointer reads 0). */
 			crcr_before = *(volatile uint32_t *)(op + 0x18);
 
+			/* Re-publish the CRCR pointer right before the doorbell.
+			 * The real xhci.c driver does this (cmdExec) because the
+			 * controller can lose the cmd-ring pointer between the
+			 * initial CRCR write and the doorbell amid bridge MMIO
+			 * churn. Without it, an earlier minimal bring-up left
+			 * CRR=0 (ring never started). Spec 5.4.5: CRCR writes are
+			 * honored only while CRR=0, which holds here. */
+			*(volatile uint32_t *)(op + 0x1C) = (uint32_t)((uint64_t)cmd_pa >> 32);
+			*(volatile uint32_t *)(op + 0x18) = (uint32_t)(cmd_pa & 0xFFFFFFC0u) | 1u;
+			(void)*(volatile uint32_t *)(op + 0x04);  /* posted-write flush */
+			__asm__ volatile("dsb sy" ::: "memory");
+
 			/* Ring command-ring doorbell (DB[0], target 0). */
 			if (dboff < USB_XHCI_MMIO_SIZE) {
 				*(volatile uint32_t *)(base + dboff) = 0u;
+				(void)*(volatile uint32_t *)(op + 0x04);  /* flush doorbell */
 				__asm__ volatile("dsb sy" ::: "memory");
 			}
 			/* Sample CRR immediately (catch a transient CRR=1 that the

@@ -1466,6 +1466,11 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 		volatile uint8_t *rt = base + rtsoff;
 		uint32_t pre_usbsts, hcrst_iters, cnr_iters, rs_iters;
 		uint32_t post_usbcmd, post_usbsts;
+		uint32_t hcsparams1 = *(volatile uint32_t *)(base + USB_XHCI_CAP_HCSPARAMS1);
+		uint32_t hccparams1 = *(volatile uint32_t *)(base + USB_XHCI_CAP_HCCPARAMS1);
+		uint32_t dboff_raw = *(volatile uint32_t *)(base + USB_XHCI_CAP_DBOFF);
+		uint32_t rtsoff_raw = *(volatile uint32_t *)(base + USB_XHCI_CAP_RTSOFF);
+		uint32_t crr_immediate = 0u;
 		uint32_t i;
 
 		pre_usbsts = *(volatile uint32_t *)(op + 0x04);
@@ -1610,6 +1615,9 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 				*(volatile uint32_t *)(base + dboff) = 0u;
 				__asm__ volatile("dsb sy" ::: "memory");
 			}
+			/* Sample CRR immediately (catch a transient CRR=1 that the
+			 * 300 ms poll would miss if the command completes fast). */
+			crr_immediate = *(volatile uint32_t *)(op + 0x18);
 			/* Poll up to ~300 ms for the command completion to land. */
 			for (k = 0; k < 60; ++k) {
 				int kk;
@@ -1674,14 +1682,21 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 			 * should equal what we wrote — a sanity check that we're
 			 * looking at the right page. */
 			r = snprintf(buf + off, cap - off,
-				"  cmdring: CRCR before=0x%08x after=0x%08x (CRR=%u)  "
+				"  cmdring: CRCR before=0x%08x crr_now=0x%08x after=0x%08x (CRR=%u)  "
 				"USBSTS=0x%08x (EINT=%u)  IMAN=0x%08x (IP=%u)  DB_rb=0x%08x\n"
-				"  cmd_pa=0x%llx  cmd_post[0]=%08x [3]=%08x (wrote 00000000 / %08x)\n",
-				crcr_before, crcr_after, (unsigned)((crcr_after >> 3) & 1u),
+				"  cmd_pa=0x%llx  cmd_post[0]=%08x [3]=%08x (wrote 00000000 / %08x)\n"
+				"  layout: HCSPARAMS1=0x%08x (slots=%u ports=%u)  HCCPARAMS1=0x%08x (AC64=%u CSZ=%u)\n"
+				"          DBOFF_raw=0x%08x RTSOFF_raw=0x%08x caplen=0x%02x\n",
+				crcr_before, crr_immediate, crcr_after, (unsigned)((crcr_after >> 3) & 1u),
 				usbsts_after, (unsigned)((usbsts_after >> 3) & 1u),
 				iman_after, (unsigned)(iman_after & 1u), db_rb,
 				(unsigned long long)cmd_pa, cmd_post0, cmd_post3,
-				(23u << 10) | 1u);
+				(23u << 10) | 1u,
+				hcsparams1, (unsigned)(hcsparams1 & 0xFFu),
+				(unsigned)((hcsparams1 >> 24) & 0xFFu),
+				hccparams1, (unsigned)(hccparams1 & 1u),
+				(unsigned)((hccparams1 >> 2) & 1u),
+				dboff_raw, rtsoff_raw, caplength);
 			if (r > 0 && (size_t)r < cap - off) {
 				off += r;
 			}

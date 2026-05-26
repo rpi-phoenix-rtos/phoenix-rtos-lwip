@@ -2842,16 +2842,30 @@ static int diag_format_sdio_arm(char *buf, size_t cap)
 	int ready_iters = 0, rdy_iters = 0;
 	uint16_t rca = 0;
 
-	/* Probe both 0x83C @ 0x18003000 (brcmfmac's "armcore_base")
-	 * AND 0x83E ARM-CR4 wrapper @ 0x18005000 at standard offsets
-	 * +0x0 (sanity), +0x408 (IoCtrl), +0x800 (ResetCtrl). */
+	/* The previous attempt at 0x18003000 / 0x18005000 (cores' main
+	 * ports in the 0x18000000 window) all failed rc=-2. Per EROM
+	 * walk, each core also has a "wrapper" address in the
+	 * 0x18100000 page:
+	 *   ChipCommon (CC)   main 0x18000000  wrapper 0x18100000
+	 *   D11 MAC           main 0x18001000  wrapper 0x18101000
+	 *   ARM-CR4 (0x83E)   main 0x18002000  wrapper 0x18102000
+	 *   0x83C             main 0x18003000  wrapper 0x18103000
+	 * The wrapper region is where AXI-bus ResetCtrl + IoCtrl live
+	 * per standard Broadcom siutils. Probe both ARM-CR4 wrapper
+	 * (0x18102000) and 0x83C wrapper (0x18103000) at standard
+	 * offsets +0x0 / +0x408 / +0x800. Window programmed to
+	 * 0x18100000 first (SBADDR L=0x00 M=0x10 H=0x18). */
 	enum { N_PROBES = 6 };
 	static const uint32_t probe_offs[N_PROBES] = {
-		0x3000u, 0x3408u, 0x3800u,
-		0x5000u, 0x5408u, 0x5800u };
+		0x2000u, 0x2408u, 0x2800u,
+		0x3000u, 0x3408u, 0x3800u };
 	static const char *probe_names[N_PROBES] = {
-		"0x83C+0x000", "0x83C+0x408 (IoCtrl)", "0x83C+0x800 (ResetCtrl)",
-		"0x83E+0x000", "0x83E+0x408 (IoCtrl)", "0x83E+0x800 (ResetCtrl)" };
+		"0x18102000+0x000 (0x83E wrap)",
+		"0x18102000+0x408 IoCtrl",
+		"0x18102000+0x800 ResetCtrl",
+		"0x18103000+0x000 (0x83C wrap)",
+		"0x18103000+0x408 IoCtrl",
+		"0x18103000+0x800 ResetCtrl" };
 	uint32_t probe_words[N_PROBES] = {0};
 	int probe_rc[N_PROBES] = { -1, -1, -1, -1, -1, -1 };
 	uint32_t pw[N_PROBES][4][4];
@@ -2931,14 +2945,11 @@ static int diag_format_sdio_arm(char *buf, size_t cap)
 			usleep(1000);
 		}
 
-		/* Move SBADDR window to 0x18003000 (ARM control region per
-		 * EROM Part 0x83C). The 32KB window covers 0x18000000 ..
-		 * 0x18007FFF when H=0x18 M=0x00 L=0x00 -- so F1 reg 0x3000
-		 * maps to backplane 0x18003000. We already had window at
-		 * 0x18000000 from the boilerplate path, no SBADDR update
-		 * needed. */
+		/* Window to 0x18100000 (wrappers page). F1 reg 0x2000 maps
+		 * to backplane 0x18102000 (ARM-CR4 wrapper), F1 reg 0x3000
+		 * maps to 0x18103000 (0x83C wrapper). */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x10u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
 
 		for (p = 0; p < N_PROBES; ++p) {
@@ -2986,12 +2997,20 @@ static int diag_format_sdio_arm(char *buf, size_t cap)
 			off += r;
 		}
 	}
-	/* If 0x83E ResetCtrl read succeeded, decode reset bit. */
+	if (probe_rc[2] == 0) {
+		r = snprintf(buf + off, cap - off,
+			"  -> 0x83E (ARM-CR4) @0x18102800 ResetCtrl bit0 = %u  %s\n",
+			(unsigned)(probe_words[2] & 0x1u),
+			(probe_words[2] & 0x1u) ? "(held in reset)" : "(released)");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
 	if (probe_rc[5] == 0) {
 		r = snprintf(buf + off, cap - off,
-			"  -> ARM-CR4 (0x83E) ResetCtrl bit 0 = %u  %s\n",
+			"  -> 0x83C (brcmfmac armcore) @0x18103800 ResetCtrl bit0 = %u  %s\n",
 			(unsigned)(probe_words[5] & 0x1u),
-			(probe_words[5] & 0x1u) ? "(held in reset)" : "(released)");
+			(probe_words[5] & 0x1u) ? "(HELD IN RESET, ready for firmware-release)" : "(released)");
 		if (r > 0 && (size_t)r < cap - off) {
 			off += r;
 		}

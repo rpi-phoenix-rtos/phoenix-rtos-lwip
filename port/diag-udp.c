@@ -5018,33 +5018,63 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		rc_r_pre = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
 			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, pre_buf);
 
-		/* Re-window to ARM-CR4 wrapper window 0x18100000 (so F1
-		 * offset 0x2408 = chip-internal 0x18102408 = ARMCR4 IoCtrl,
-		 * F1 offset 0x3800 = 0x18103800 = the OTHER core's
-		 * ResetCtrl, kept here for legacy comparison). */
+		/* brcmfmac CR4 activation, step 1: write the firmware reset
+		 * vector (first word of the blob) to chip-internal address 0.
+		 * The SDIO `activate` callback does exactly this via ramrw.
+		 * The low 32 bytes of address 0 are a writable vector-table
+		 * overlay (confirmed by the 'L' probe); the CR4 fetches its
+		 * reset vector from here when it leaves reset. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x0u, wifi_fw_43455[0], NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1u, wifi_fw_43455[1], NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2u, wifi_fw_43455[2], NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x3u, wifi_fw_43455[3], NULL);
+
+		/* Re-window to ARM-CR4 wrapper window 0x18100000:
+		 *   F1 0x2408 = chip-internal 0x18102408 = BCMA_IOCTL
+		 *   F1 0x2800 = chip-internal 0x18102800 = BCMA_RESET_CTL */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x10u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
 
-		/* Read ARMCR4 IoCtrl pre-release (POR: 0x21 = CPUHALT|clock_en).
-		 * brcmfmac convention: clearing bit 5 (CPUHALT) is what
-		 * actually starts the CR4 executing the firmware; the OTHER
-		 * core's ResetCtrl at 0x18103800 is for the wake/debug
-		 * helper, not the firmware-running CR4. */
+		/* Read IOCTL pre (POR observed 0x21 = CPUHALT|CLK). */
 		(void)diag_sdioCmd52(sdhci, 0, 1, 0x2408u, 0u, rc_pre_resp);
 
-		/* CLEAR CPUHALT: write IoCtrl bit 5 = 0, keep bit 0 (clock_en)
-		 * = 1. With CPUHALT clear and reset already released (POR
-		 * state was 0), CR4 starts fetching from BootROM at chip-
-		 * internal 0x0, which trampolines into firmware at 0x198000. */
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2408u, 0x01u, NULL);
-
-		/* Also clear the other core's ResetCtrl for completeness. */
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x3800u, 0x00u, NULL);
+		/* brcmfmac CR4 activation, step 2: full AXI resetcore toggle,
+		 * resetcore(core, prereset=CPUHALT(0x20), reset=0, postreset=0):
+		 *
+		 *   coredisable(prereset=0x20, reset=0):
+		 *     IOCTL      = prereset | FGC(0x02) | CLK(0x01) = 0x23
+		 *     RESET_CTL  = RESET(0x01)
+		 *     IOCTL      = reset(0) | FGC | CLK            = 0x03
+		 *   deassert:
+		 *     RESET_CTL  = 0  (then poll until clear)
+		 *   finalize:
+		 *     IOCTL      = postreset(0) | CLK              = 0x01
+		 *
+		 * Bit values are byte-0-only (CPUHALT=0x20, FGC=0x02, CLK=0x01,
+		 * RESET=0x01), so single-byte CMD52 to F1 0x2408 / 0x2800
+		 * suffices; the upper 3 bytes of these AXI regs stay zero. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2408u, 0x23u, NULL);   /* IOCTL CPUHALT|FGC|CLK */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2800u, 0x01u, NULL);   /* RESET_CTL assert */
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x2800u, 0u, NULL);      /* readback settle */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2408u, 0x03u, NULL);   /* IOCTL FGC|CLK (reset=0) */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2800u, 0x00u, NULL);   /* RESET_CTL deassert */
+		for (i = 0; i < 50; ++i) {
+			uint32_t rcv[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x2800u, 0u, rcv);
+			if ((rcv[0] & 0x01u) == 0u) {
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2408u, 0x01u, NULL);   /* IOCTL CLK (CPU runs) */
 
 		usleep(300 * 1000);  /* firmware init: NVRAM parse + chip-self-test */
 
-		/* Read ARMCR4 IoCtrl post (expect 0x01 = clock_en only). */
+		/* Read IOCTL post (expect 0x01 = CLK only, CPU running). */
 		(void)diag_sdioCmd52(sdhci, 0, 1, 0x2408u, 0u, rc_post_resp);
 
 		/* Re-window to SOCRAM and capture post-release snapshot. */

@@ -4935,15 +4935,58 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			usleep(1000);
 		}
 
+		/* KSO (Keep-SDIO-On) enable. SDIO core rev >= 12 (43455 qualifies)
+		 * gates the backplane clock on KSO; without it the device can
+		 * drop the clock and HT_AVAIL never latches. SLEEPCSR (F1
+		 * 0x1001F) bit 0 = KSO_EN. RMW. (bwfm bwfm_sdio_attach /
+		 * brcmfmac brcmf_sdio_kso_init.) */
+		{
+			uint32_t kso[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x1001Fu, 0u, kso);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1001Fu,
+				(uint8_t)((kso[0] | 0x01u) & 0xffu), NULL);
+		}
+
 		rc_hs = diag_sdioGoHighSpeed(sdhci);
 
-		/* Force the backplane HT clock BEFORE downloading firmware.
-		 * brcmfmac does brcmf_sdio_clkctl(CLK_AVAIL) here: write
-		 * CHIPCLKCSR (F1 0x1000E) HT_AVAIL_REQ (0x10) and poll for
-		 * HT_AVAIL (0x80). Without the HT/PLL clock the SOCRAM/CR4
-		 * backplane runs only on ALP (0x40) and the CR4 never gets a
-		 * proper run clock — which is why an earlier revision left
-		 * CHIPCLKCSR stuck at 0x40 and the firmware never started. */
+		/* PMU resource-reload kick. On 43455 the HT/PLL resource is
+		 * not auto-requested on a clean boot, so HT_AVAIL_REQ latches
+		 * (CHIPCLKCSR=0x50) but HT_AVAIL (0x80) never grants. bwfm
+		 * writes PMUCONTROL RES_RELOAD before requesting HT.
+		 *   PMUCONTROL = ChipCommon base 0x18000000 + 0x600
+		 *   RES_RELOAD = 0x2 << RES_SHIFT(13) = 0x4000  (byte 1 bit 6)
+		 * Window SBADDR to ChipCommon (L=0x00 M=0x00 H=0x18), RMW the
+		 * 32-bit reg via byte access (the field is wholly in byte 1). */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+		{
+			uint32_t pmuc1[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x0601u, 0u, pmuc1);  /* PMUCONTROL byte 1 */
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x0601u,
+				(uint8_t)((pmuc1[0] | 0x40u) & 0xffu), NULL);       /* set bit 6 = RES_RELOAD */
+		}
+		usleep(2000);
+
+		/* CHIPCLKCSR clock bring-up (F1 0x1000E), brcmfmac/bwfm order:
+		 *   1. ALP_AVAIL_REQ|FORCE_HW_CLKREQ_OFF (0x08|0x20=0x28); poll ALP_AVAIL(0x40)
+		 *   2. FORCE_ALP|FORCE_HW_CLKREQ_OFF (0x01|0x20=0x21); brief settle
+		 *   3. HT_AVAIL_REQ (0x10, FORCE_HW_CLKREQ_OFF cleared so HW can
+		 *      auto-request HT); poll HT_AVAIL(0x80). FORCE_HT(0x02)
+		 *      fallback. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x28u, NULL);
+		for (i = 0; i < 250; ++i) {
+			uint32_t cc[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Eu, 0u, cc);
+			ht_clk_csr = (uint8_t)(cc[0] & 0xffu);
+			if ((ht_clk_csr & 0x40u) != 0u) {
+				break;
+			}
+			usleep(2000);
+		}
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x21u, NULL);
+		usleep(1000);
+
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x10u, NULL);
 		for (i = 0; i < 250; ++i) {
 			uint32_t cc[4] = {0};
@@ -4952,11 +4995,8 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			if ((ht_clk_csr & 0x80u) != 0u) {
 				break;
 			}
-			usleep(2000);  /* up to ~500 ms on HT_AVAIL_REQ */
+			usleep(2000);
 		}
-		/* Fallback: if HT_AVAIL_REQ alone didn't bring the PLL up,
-		 * try FORCE_HT (0x02) which unconditionally forces the HT
-		 * clock on. Poll another ~500 ms. */
 		if ((ht_clk_csr & 0x80u) == 0u) {
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x12u, NULL);
 			for (i = 0; i < 250; ++i) {

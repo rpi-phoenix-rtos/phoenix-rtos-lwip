@@ -4836,6 +4836,10 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	uint16_t rca = 0;
 	int rc_w, rc_r_pre = -100, rc_r_post = -100;
 	int rc_nvram_w = -100;
+	int rc_tail = -100;
+	uint8_t chipclk_samples[8] = {0};
+	uint8_t socram_tail[16] = {0};
+	unsigned card_intr = 0u;
 	int worst_rc_w = 0;
 	int i, pre_match, post_match, diff_count;
 	uint32_t bytes_written = 0u;
@@ -5049,6 +5053,38 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
 		rc_r_post = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
 			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, post_buf);
+
+		/* Firmware-running probes:
+		 *
+		 * 1. CHIPCLKCSR (F1 reg 0x1000E): HT_AVAIL (bit 7, 0x80) goes
+		 *    high once the booted firmware requests the high-throughput
+		 *    backplane clock. Poll it across ~240 ms to catch the
+		 *    transition.
+		 * 2. SDHCI INT_STATUS CARD_INTR (bit 8): the chip asserts its
+		 *    SDIO interrupt line when firmware has a mailbox message
+		 *    (the BCDC "fw ready" hello).
+		 * 3. SOCRAM trailer at chip-internal 0x237FFC (the NVRAM
+		 *    length-magic word we wrote): firmware overwrites this
+		 *    region after parsing NVRAM, so a changed value here is
+		 *    another "fw alive" tell. */
+		for (i = 0; i < 8; ++i) {
+			uint32_t ccsr[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Eu, 0u, ccsr);
+			chipclk_samples[i] = (uint8_t)(ccsr[0] & 0xffu);
+			usleep(30 * 1000);
+		}
+
+		card_intr = (*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS)
+			>> 8) & 1u;
+
+		/* SOCRAM tail trailer: window 19 (0x230000), F1 offset 0x7FF0
+		 * = chip-internal 0x237FF0. Read 16 bytes ending at 0x237FFF. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x23u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+		rc_tail = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0x7FF0u, /*block_count=*/1u, /*block_size=*/16u,
+			socram_tail);
 	}
 
 	munmap(sdhci_page, _PAGE_SIZE);
@@ -5136,6 +5172,42 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			if (r > 0 && (size_t)r < cap - off) {
 				off += r;
 			}
+		}
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"CHIPCLKCSR poll: %02x %02x %02x %02x %02x %02x %02x %02x (HT_AVAIL=bit7 0x80)\n",
+		chipclk_samples[0], chipclk_samples[1], chipclk_samples[2],
+		chipclk_samples[3], chipclk_samples[4], chipclk_samples[5],
+		chipclk_samples[6], chipclk_samples[7]);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"SDHCI CARD_INTR=%u  SOCRAM-tail rc=%d  trailer[12..15]=%02x %02x %02x %02x (wrote ab 01 50 fe)\n",
+		card_intr, rc_tail,
+		socram_tail[12], socram_tail[13], socram_tail[14], socram_tail[15]);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	{
+		int fw_alive = 0;
+		for (i = 0; i < 8; ++i) {
+			if ((chipclk_samples[i] & 0x80u) != 0u) {
+				fw_alive = 1;
+			}
+		}
+		if (card_intr != 0u) {
+			fw_alive = 1;
+		}
+		r = snprintf(buf + off, cap - off,
+			"  -> fw_alive=%d %s\n", fw_alive,
+			fw_alive ? "(HT_AVAIL or CARD_INTR asserted -- firmware booted!)"
+				: "(no HT_AVAIL / no CARD_INTR -- firmware not confirmed running)");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
 		}
 	}
 

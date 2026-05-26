@@ -39,6 +39,7 @@
 #include "lwip/tcpip.h"
 #include "lwip/stats.h"
 #include "netif-driver.h"
+#include "wifi-fw-43455.h"
 
 #include <sys/mman.h>
 
@@ -4280,6 +4281,227 @@ static int diag_format_sdio_fwwalk(char *buf, size_t cap)
 }
 
 
+/* WiFi P3: first-window firmware-blob load smoke test.
+ *
+ * Writes the first 32 KB of the staged Cypress brcmfmac43455-sdio.bin
+ * (embedded as wifi_fw_43455[] via scripts/gen-wifi-fw-c.sh) into
+ * chip-internal SOCRAM at 0x00198000 — the brcmfmac rambase. Then
+ * re-windows back to the start and reads back the first 4 KB,
+ * byte-compares it against the source array.
+ *
+ * Slicing: the first 32 KB fills exactly one SBADDR window (the F1
+ * access region is 0..0x7FFF). Performed as 8 × CMD53 multi-block
+ * (block_count=64, block_size=64 → 4 KB per CMD53) so we exercise
+ * the same PIO drain path the actual full-firmware loader will use.
+ *
+ * Why only 32 KB / not the full 643 KB:
+ *   - at 400 kHz SDIO clock + 1-bit data line the bus does ~50 KB/s,
+ *     so 32 KB ≈ 640 ms while 643 KB ≈ 13 s — UDP-response model
+ *     can't tolerate a 13 s blocking handler
+ *   - full-blob load requires SDIO HS-mode + 4-bit bus-width first
+ *
+ * Reports per-CMD53 rc + global match count; PASS = 4096/4096 on
+ * the verify read AND no CMD53 returned a non-zero rc on write. */
+static int diag_format_sdio_fwload(char *buf, size_t cap)
+{
+	static uint8_t verify_buf[4096];
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1, rc_iordy = -1;
+	int ready_iters = 0, rdy_iters = 0;
+	uint16_t rca = 0;
+	int chunk, rc_w, rc_r = -100;
+	int worst_rc_w = 0;
+	int match_count = 0;
+	int i;
+	uint32_t bytes_written = 0u;
+	const uint32_t chunk_size = 4096u;
+	const uint32_t total_bytes = 32u * 1024u;  /* one full SBADDR window */
+
+	for (i = 0; i < (int)sizeof(verify_buf); ++i) {
+		verify_buf[i] = 0;
+	}
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-fwload\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	if (wifi_fw_43455_len == 0u) {
+		r = snprintf(buf + off, cap - off,
+			"error: firmware blob not staged (wifi_fw_43455_len=0)\n"
+			"hint: scripts/stage-bcm43455-firmware.sh then rebuild\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+	if (wifi_fw_43455_len < total_bytes) {
+		r = snprintf(buf + off, cap - off,
+			"error: firmware blob too short (len=%zu, need >=%u)\n.\n",
+			wifi_fw_43455_len, total_bytes);
+		return off + (r > 0 ? r : 0);
+	}
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+		usleep(50 * 1000);
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x111u, 0x00u, NULL);
+
+		/* Set SBADDR window to chip-internal 0x00198000 (SOCRAM
+		 * rambase). The first 32 KB of firmware fills this window
+		 * exactly (F1 access region 0..0x7FFF). */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+
+		/* Stream firmware in 4 KB chunks (CMD53 block_count=64,
+		 * block_size=64). reg_addr advances per chunk. */
+		for (chunk = 0; chunk < (int)(total_bytes / chunk_size); ++chunk) {
+			rc_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+				/*reg_addr=*/(uint32_t)(chunk * (int)chunk_size),
+				/*block_count=*/64u, /*block_size=*/64u,
+				wifi_fw_43455 + (size_t)chunk * chunk_size);
+			if (rc_w != 0 && worst_rc_w == 0) {
+				worst_rc_w = rc_w;
+			}
+			if (rc_w == 0) {
+				bytes_written += chunk_size;
+			}
+		}
+
+		/* Re-window (no-op since SBADDR didn't change, but defensive
+		 * for the eventual multi-window loader) and read first 4 KB
+		 * back for verification. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x19u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x00u, NULL);
+
+		rc_r = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+			/*reg_addr=*/0u, /*block_count=*/64u, /*block_size=*/64u,
+			verify_buf);
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5=%d/%d C=%d RCA=0x%04x CMD7=%d IORDY=0x%02x rdy=%d\n",
+		rc_ocr, rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	(void)rc_iordy;
+
+	r = snprintf(buf + off, cap - off,
+		"fw_len=%zu  staged %u/%u bytes  worst rc_w=%d  rc_r=%d\n",
+		wifi_fw_43455_len, bytes_written, total_bytes, worst_rc_w, rc_r);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	if (rc_r == 0 && worst_rc_w == 0) {
+		match_count = 0;
+		for (i = 0; i < (int)sizeof(verify_buf); ++i) {
+			if (verify_buf[i] == wifi_fw_43455[i]) {
+				++match_count;
+			}
+		}
+		r = snprintf(buf + off, cap - off,
+			"verify first 4KB: %d/%d match  %s\n",
+			match_count, (int)sizeof(verify_buf),
+			(match_count == (int)sizeof(verify_buf)) ? "(PASS)" : "(FAIL)");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		r = snprintf(buf + off, cap - off,
+			"  fw[0..7] %02x %02x %02x %02x %02x %02x %02x %02x  "
+			"rb[0..7] %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			wifi_fw_43455[0], wifi_fw_43455[1], wifi_fw_43455[2], wifi_fw_43455[3],
+			wifi_fw_43455[4], wifi_fw_43455[5], wifi_fw_43455[6], wifi_fw_43455[7],
+			verify_buf[0], verify_buf[1], verify_buf[2], verify_buf[3],
+			verify_buf[4], verify_buf[5], verify_buf[6], verify_buf[7]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -4543,6 +4765,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'M') {
 		len = diag_format_sdio_fwwalk(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'I') {
+		len = diag_format_sdio_fwload(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

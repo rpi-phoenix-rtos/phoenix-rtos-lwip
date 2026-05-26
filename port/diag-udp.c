@@ -40,6 +40,7 @@
 #include "lwip/stats.h"
 #include "netif-driver.h"
 #include "wifi-fw-43455.h"
+#include "wifi-nvram-43455.h"
 
 #include <sys/mman.h>
 
@@ -4834,6 +4835,7 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	int ready_iters = 0, rdy_iters = 0;
 	uint16_t rca = 0;
 	int rc_w, rc_r_pre = -100, rc_r_post = -100;
+	int rc_nvram_w = -100;
 	int worst_rc_w = 0;
 	int i, pre_match, post_match, diff_count;
 	uint32_t bytes_written = 0u;
@@ -4980,6 +4982,30 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			window_idx++;
 		}
 
+		/* NVRAM load: chip-ready blob (stripped + length-magic
+		 * trailer) goes at chip-internal (rambase + ramsize -
+		 * wifi_nvram_43455_len) = 0x238000 - 1728 = 0x237940,
+		 * inside SBADDR window 19. The python preprocessor pads
+		 * the blob to a 64-byte boundary, so it lands as a single
+		 * CMD53 multi-block write. */
+		{
+			uint32_t nv_start = 0x238000u - (uint32_t)wifi_nvram_43455_len;
+			uint8_t  nv_lo  = (uint8_t)(((nv_start >> 15) & 1u) ? 0x80u : 0x00u);
+			uint8_t  nv_mid = (uint8_t)((nv_start >> 16) & 0xffu);
+			uint8_t  nv_hi  = (uint8_t)((nv_start >> 24) & 0xffu);
+			uint32_t nv_f1_offset = nv_start & 0x7FFFu;
+			uint32_t nv_blocks = (uint32_t)(wifi_nvram_43455_len / 64u);
+
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, nv_lo,  NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, nv_mid, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, nv_hi,  NULL);
+
+			rc_nvram_w = diag_sdioCmd53Write(sdhci, 1, /*incr=*/1,
+				/*reg_addr=*/nv_f1_offset,
+				/*block_count=*/nv_blocks,
+				/*block_size=*/64u, wifi_nvram_43455);
+		}
+
 		/* Snapshot SOCRAM[0..63] BEFORE release — should match
 		 * source firmware byte-identically. */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
@@ -4989,21 +5015,33 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, pre_buf);
 
 		/* Re-window to ARM-CR4 wrapper window 0x18100000 (so F1
-		 * offset 0x3800 = chip-internal 0x18103800 = ResetCtrl). */
+		 * offset 0x2408 = chip-internal 0x18102408 = ARMCR4 IoCtrl,
+		 * F1 offset 0x3800 = 0x18103800 = the OTHER core's
+		 * ResetCtrl, kept here for legacy comparison). */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x10u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
 
-		/* Read ResetCtrl (expect 0x01 = held in reset). */
-		(void)diag_sdioCmd52(sdhci, 0, 1, 0x3800u, 0u, rc_pre_resp);
+		/* Read ARMCR4 IoCtrl pre-release (POR: 0x21 = CPUHALT|clock_en).
+		 * brcmfmac convention: clearing bit 5 (CPUHALT) is what
+		 * actually starts the CR4 executing the firmware; the OTHER
+		 * core's ResetCtrl at 0x18103800 is for the wake/debug
+		 * helper, not the firmware-running CR4. */
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x2408u, 0u, rc_pre_resp);
 
-		/* RELEASE ARM-CR4 — write 0 to ResetCtrl bit 0. */
+		/* CLEAR CPUHALT: write IoCtrl bit 5 = 0, keep bit 0 (clock_en)
+		 * = 1. With CPUHALT clear and reset already released (POR
+		 * state was 0), CR4 starts fetching from BootROM at chip-
+		 * internal 0x0, which trampolines into firmware at 0x198000. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2408u, 0x01u, NULL);
+
+		/* Also clear the other core's ResetCtrl for completeness. */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x3800u, 0x00u, NULL);
 
-		usleep(100 * 1000);  /* let firmware initialize */
+		usleep(300 * 1000);  /* firmware init: NVRAM parse + chip-self-test */
 
-		/* Read ResetCtrl back (expect 0x00 = released). */
-		(void)diag_sdioCmd52(sdhci, 0, 1, 0x3800u, 0u, rc_post_resp);
+		/* Read ARMCR4 IoCtrl post (expect 0x01 = clock_en only). */
+		(void)diag_sdioCmd52(sdhci, 0, 1, 0x2408u, 0u, rc_post_resp);
 
 		/* Re-window to SOCRAM and capture post-release snapshot. */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x80u, NULL);
@@ -5035,7 +5073,16 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	}
 
 	r = snprintf(buf + off, cap - off,
-		"ResetCtrl pre=0x%02x  post=0x%02x  (expect pre=0x01 held, post=0x00 released)\n",
+		"nvram: %zu bytes -> chip 0x%06x  rc_nvram_w=%d\n",
+		wifi_nvram_43455_len,
+		(unsigned)(0x238000u - (uint32_t)wifi_nvram_43455_len),
+		rc_nvram_w);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"ARMCR4 IoCtrl pre=0x%02x  post=0x%02x  (expect pre=0x21 CPUHALT+clk, post=0x01 clk-only)\n",
 		(unsigned)(rc_pre_resp[0] & 0xff),
 		(unsigned)(rc_post_resp[0] & 0xff));
 	if (r > 0 && (size_t)r < cap - off) {

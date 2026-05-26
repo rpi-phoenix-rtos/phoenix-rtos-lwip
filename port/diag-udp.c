@@ -2283,6 +2283,13 @@ static int diag_format_sdio_cores(char *buf, size_t cap)
 	uint32_t probe_resp[N_PROBES][4][4];
 	int rc_probe[N_PROBES][4];
 
+	/* EROM pointer (ChipCommon offset 0xFC) and first EROM entry. */
+	uint32_t eromptr_resp[4][4] = {{0}};
+	int rc_eromptr[4] = {-1, -1, -1, -1};
+	uint32_t erom_entry0_resp[4][4] = {{0}};
+	int rc_erom_entry0[4] = {-1, -1, -1, -1};
+	uint32_t erom_ptr = 0;
+
 	memset(probe_resp, 0, sizeof(probe_resp));
 	for (i = 0; i < N_PROBES; ++i) {
 		for (j = 0; j < 4; ++j) {
@@ -2370,9 +2377,58 @@ static int diag_format_sdio_cores(char *buf, size_t cap)
 		rc_sbaddr_r2 = diag_sdioCmd52(sdhci, 0, 1, 0x1000Cu, 0u, sbaddr_h_after_w2);
 
 		/* Belt-and-suspenders: re-program L=0, M=0 explicitly before
-		 * the multi-offset walk so window alignment is unambiguous. */
+		 * any further F1 reads so window alignment is unambiguous. */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+
+		/* Read ChipCommon[0xFC..0xFF] = EROM pointer FIRST, while the
+		 * SDHCI host is in a clean state. The probe loop below
+		 * deliberately exercises unmapped backplane addresses and
+		 * accumulates SDHCI error state that's hard to fully recover
+		 * from, so reading important registers up-front avoids cascade
+		 * failures masking the EROM value. */
+		for (j = 0; j < 4; ++j) {
+			rc_eromptr[j] = diag_sdioCmd52(sdhci, 0, 1,
+				0xFCu + (uint32_t)j, 0u, eromptr_resp[j]);
+			if (rc_eromptr[j] != 0) {
+				*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xffffffffu;
+				(void)diag_sdhciResetCmdDat(sdhci);
+				break;
+			}
+		}
+		erom_ptr = (eromptr_resp[0][0] & 0xffu) |
+			((eromptr_resp[1][0] & 0xffu) << 8) |
+			((eromptr_resp[2][0] & 0xffu) << 16) |
+			((eromptr_resp[3][0] & 0xffu) << 24);
+
+		/* If EROMPTR looks like a backplane address, read first
+		 * 4-byte entry from EROM (also in clean state). */
+		if ((erom_ptr & 0xff000000u) == 0x18000000u) {
+			uint32_t erom_lo = (uint8_t)((erom_ptr >> 15) & 0x1u) << 7;
+			uint32_t erom_mid = (uint8_t)((erom_ptr >> 16) & 0xffu);
+			uint32_t erom_hi = (uint8_t)((erom_ptr >> 24) & 0xffu);
+			uint32_t erom_win_off = erom_ptr & 0x7fffu;
+
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, (uint8_t)erom_lo, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, (uint8_t)erom_mid, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, (uint8_t)erom_hi, NULL);
+
+			for (j = 0; j < 4; ++j) {
+				rc_erom_entry0[j] = diag_sdioCmd52(sdhci, 0, 1,
+					erom_win_off + (uint32_t)j, 0u, erom_entry0_resp[j]);
+				if (rc_erom_entry0[j] != 0) {
+					*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xffffffffu;
+					(void)diag_sdhciResetCmdDat(sdhci);
+					break;
+				}
+			}
+
+			/* Restore window back to ChipCommon (0x18000000) for the
+			 * subsequent probe loop. */
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+		}
 
 		/* Walk 8 backplane offsets inside the 32 KB window. Each probe
 		 * is byte-wise (4 CMD52 reads). Backplane addresses pointing
@@ -2430,6 +2486,60 @@ static int diag_format_sdio_cores(char *buf, size_t cap)
 			(unsigned)(probe_resp[i][2][0] & 0xff),
 			(unsigned)(probe_resp[i][3][0] & 0xff),
 			(unsigned)word);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"EROMPTR @0xFC rc=%d/%d/%d/%d  %02x %02x %02x %02x  -> 0x%08x\n",
+		rc_eromptr[0], rc_eromptr[1], rc_eromptr[2], rc_eromptr[3],
+		(unsigned)(eromptr_resp[0][0] & 0xff),
+		(unsigned)(eromptr_resp[1][0] & 0xff),
+		(unsigned)(eromptr_resp[2][0] & 0xff),
+		(unsigned)(eromptr_resp[3][0] & 0xff),
+		(unsigned)erom_ptr);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	if ((erom_ptr & 0xff000000u) == 0x18000000u) {
+		uint32_t entry = (erom_entry0_resp[0][0] & 0xffu) |
+			((erom_entry0_resp[1][0] & 0xffu) << 8) |
+			((erom_entry0_resp[2][0] & 0xffu) << 16) |
+			((erom_entry0_resp[3][0] & 0xffu) << 24);
+		const char *etype_str;
+		switch (entry & 0x3u) {
+			case 0: etype_str = "end"; break;
+			case 1: etype_str = "CompIdent"; break;
+			case 5: etype_str = "AddrDesc"; break;
+			default: etype_str = "misc"; break;
+		}
+		r = snprintf(buf + off, cap - off,
+			"EROM[0] @0x%08x rc=%d/%d/%d/%d  word=0x%08x  type=%s",
+			(unsigned)erom_ptr,
+			rc_erom_entry0[0], rc_erom_entry0[1], rc_erom_entry0[2], rc_erom_entry0[3],
+			(unsigned)entry, etype_str);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		if ((entry & 0x3u) == 1u) {
+			/* CompIdent entry layout (Broadcom EROM):
+			 *   bits[31:20] = Designer (0x4bf = Broadcom)
+			 *   bits[19:8]  = PartNumber (component ID, e.g. 0x800 = CC)
+			 *   bits[7:4]   = ClassCode
+			 *   bits[3:2]   = NumSlavePorts / NumMasters
+			 *   bits[1:0]   = 1 (CompIdent)
+			 */
+			r = snprintf(buf + off, cap - off,
+				"  Designer=0x%03x PartNum=0x%03x",
+				(unsigned)((entry >> 20) & 0xfffu),
+				(unsigned)((entry >> 8) & 0xfffu));
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+		r = snprintf(buf + off, cap - off, "\n");
 		if (r > 0 && (size_t)r < cap - off) {
 			off += r;
 		}

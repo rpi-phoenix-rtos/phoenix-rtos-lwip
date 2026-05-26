@@ -2240,6 +2240,209 @@ static int diag_format_sdio_f1(char *buf, size_t cap)
 }
 
 
+/* WiFi P3 prep: deep F1 backplane probe.
+ *
+ * After the standard SDIO enumeration + F1 enable, this:
+ *
+ *   1. Runs an F1 SBADDR write round-trip: write H=0x19 (window
+ *      points at 0x19000000, unused address space), read back,
+ *      write H=0x18 (back to ChipCommon window), read back.
+ *      Validates CMD52 writes to F1 register space succeed.
+ *
+ *   2. Walks 8 backplane offsets (4 KB stride) within the 32 KB
+ *      window starting at 0x18000000 — ChipCommon, +0x1000,
+ *      +0x2000, ... +0x7000. Each probe is 4 CMD52 reads
+ *      forming a 32-bit word from the bus's perspective.
+ *
+ * Output is the raw first word at each offset. 0xFFFFFFFF means
+ * "no core wired at that backplane address" (bus error returns
+ * all-ones); anything else is a component-id-or-control register
+ * for a real core. The pattern across the 8 probes is a fingerprint
+ * of the chip's wrapper-block layout. */
+static int diag_format_sdio_cores(char *buf, size_t cap)
+{
+	int off = 0, r;
+	void *gpio_page, *sdhci_page;
+	uint32_t ocr_resp[4] = {0}, claim_resp[4] = {0};
+	uint32_t rca_resp[4] = {0}, sel_resp[4] = {0};
+	uint32_t ioen_pre_resp[4] = {0}, iordy_resp[4] = {0};
+	uint32_t sbaddr_h_after_w1[4] = {0}, sbaddr_h_after_w2[4] = {0};
+	int rc_ocr = -1, rc_claim = -1, rc_sel = -1;
+	int rc_iordy = -1;
+	int rc_sbaddr_w1 = -1, rc_sbaddr_r1 = -1;
+	int rc_sbaddr_w2 = -1, rc_sbaddr_r2 = -1;
+	int ready_iters = 0, rdy_iters = 0;
+	uint16_t rca = 0;
+	int i, j;
+
+	enum { N_PROBES = 8 };
+	static const uint32_t probe_offsets[N_PROBES] = {
+		0x0000u, 0x1000u, 0x2000u, 0x3000u,
+		0x4000u, 0x5000u, 0x6000u, 0x7000u
+	};
+	uint32_t probe_resp[N_PROBES][4][4];
+	int rc_probe[N_PROBES][4];
+
+	memset(probe_resp, 0, sizeof(probe_resp));
+	for (i = 0; i < N_PROBES; ++i) {
+		for (j = 0; j < 4; ++j) {
+			rc_probe[i][j] = -1;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 sdio-cores\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	gpio_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, BCM2711_GPIO_BASE);
+	sdhci_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, 0xfe300000u);
+
+	if (gpio_page == MAP_FAILED || sdhci_page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: mmap failed\n.\n");
+		if (gpio_page != MAP_FAILED) {
+			munmap(gpio_page, _PAGE_SIZE);
+		}
+		if (sdhci_page != MAP_FAILED) {
+			munmap(sdhci_page, _PAGE_SIZE);
+		}
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *gpio = (volatile uint8_t *)gpio_page;
+		volatile uint8_t *sdhci = (volatile uint8_t *)sdhci_page;
+
+		/* Re-assert Tier 1c power-on (idempotent). */
+		for (i = 34; i <= 39; ++i) {
+			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
+		}
+		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+		usleep(150 * 1000);
+		(void)diag_sdhciSetClockKHz(sdhci, 400u);
+		(void)diag_sdhciResetCmdDat(sdhci);
+
+		/* SDIO enumeration (same as Tier 3). */
+		(void)diag_sdhciCmd(sdhci, 0u, 0u, SDHCI_RESP_R0, NULL);
+		usleep(1000);
+		rc_ocr = diag_sdhciCmd(sdhci, 5u, 0u, SDHCI_RESP_R4, ocr_resp);
+		for (ready_iters = 0; ready_iters < 50; ++ready_iters) {
+			rc_claim = diag_sdhciCmd(sdhci, 5u, ocr_resp[0] & 0x00ffffffu,
+				SDHCI_RESP_R4, claim_resp);
+			if (rc_claim != 0) {
+				break;
+			}
+			if ((claim_resp[0] & 0x80000000u) != 0u) {
+				ready_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+		(void)diag_sdhciCmd(sdhci, 3u, 0u, SDHCI_RESP_R6, rca_resp);
+		rca = (uint16_t)((rca_resp[0] >> 16) & 0xFFFFu);
+		rc_sel = diag_sdhciCmd(sdhci, 7u, (uint32_t)rca << 16, SDHCI_RESP_R1, sel_resp);
+
+		/* Enable F1 (same as 'f'). */
+		(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_pre_resp);
+		(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+			(uint8_t)((ioen_pre_resp[0] | 0x02u) & 0xffu), NULL);
+		for (rdy_iters = 0; rdy_iters < 50; ++rdy_iters) {
+			rc_iordy = diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, iordy_resp);
+			if (rc_iordy != 0) {
+				break;
+			}
+			if ((iordy_resp[0] & 0x02u) != 0u) {
+				rdy_iters++;
+				break;
+			}
+			usleep(1000);
+		}
+
+		/* F1 SBADDR write round-trip: H=0x19 then back to H=0x18. */
+		rc_sbaddr_w1 = diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x19u, NULL);
+		rc_sbaddr_r1 = diag_sdioCmd52(sdhci, 0, 1, 0x1000Cu, 0u, sbaddr_h_after_w1);
+		rc_sbaddr_w2 = diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+		rc_sbaddr_r2 = diag_sdioCmd52(sdhci, 0, 1, 0x1000Cu, 0u, sbaddr_h_after_w2);
+
+		/* Belt-and-suspenders: re-program L=0, M=0 explicitly before
+		 * the multi-offset walk so window alignment is unambiguous. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+
+		/* Walk 8 backplane offsets inside the 32 KB window. Each probe
+		 * is byte-wise (4 CMD52 reads). Backplane addresses pointing
+		 * at unmapped wrapper blocks raise an SDHCI CMD-line error
+		 * (timeout/CRC); to avoid cascade failure that masks later
+		 * probes, clear INT_STATUS error bits and reset the CMD line
+		 * after any failed transfer before moving on. */
+		for (i = 0; i < N_PROBES; ++i) {
+			uint32_t off_base = probe_offsets[i];
+			for (j = 0; j < 4; ++j) {
+				rc_probe[i][j] = diag_sdioCmd52(sdhci, 0, 1,
+					off_base + (uint32_t)j, 0u, probe_resp[i][j]);
+				if (rc_probe[i][j] != 0) {
+					*(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS) = 0xffffffffu;
+					(void)diag_sdhciResetCmdDat(sdhci);
+					break;
+				}
+			}
+		}
+	}
+
+	munmap(sdhci_page, _PAGE_SIZE);
+	munmap(gpio_page, _PAGE_SIZE);
+
+	r = snprintf(buf + off, cap - off,
+		"enum: CMD5(0) rc=%d, CMD5(ocr) rc=%d C=%d, CMD3 RCA=0x%04x, CMD7 rc=%d, F1 IORDY=0x%02x rdy=%d\n",
+		rc_ocr, rc_claim,
+		(int)((claim_resp[0] >> 31) & 1u),
+		(unsigned)rca, rc_sel,
+		(unsigned)(iordy_resp[0] & 0xff), rdy_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"F1 SBADDR-H write-trip:  0x19 rc=%d  read=0x%02x (rc=%d)  0x18 rc=%d  read=0x%02x (rc=%d)\n",
+		rc_sbaddr_w1, (unsigned)(sbaddr_h_after_w1[0] & 0xff), rc_sbaddr_r1,
+		rc_sbaddr_w2, (unsigned)(sbaddr_h_after_w2[0] & 0xff), rc_sbaddr_r2);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	for (i = 0; i < N_PROBES; ++i) {
+		uint32_t bp_addr = 0x18000000u + probe_offsets[i];
+		uint32_t word = (probe_resp[i][0][0] & 0xffu) |
+			((probe_resp[i][1][0] & 0xffu) << 8) |
+			((probe_resp[i][2][0] & 0xffu) << 16) |
+			((probe_resp[i][3][0] & 0xffu) << 24);
+		r = snprintf(buf + off, cap - off,
+			"@0x%08x rc=%d/%d/%d/%d  %02x %02x %02x %02x  word=0x%08x\n",
+			(unsigned)bp_addr,
+			rc_probe[i][0], rc_probe[i][1], rc_probe[i][2], rc_probe[i][3],
+			(unsigned)(probe_resp[i][0][0] & 0xff),
+			(unsigned)(probe_resp[i][1][0] & 0xff),
+			(unsigned)(probe_resp[i][2][0] & 0xff),
+			(unsigned)(probe_resp[i][3][0] & 0xff),
+			(unsigned)word);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+	}
+
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
+
 /* WiFi Tier 2: full bring-up sequence to CMD0 + CMD5 (SDIO chip
  * discovery). After the Tier 1c power-on, issue:
  *   CMD0  GO_IDLE_STATE       arg=0, no response
@@ -2477,6 +2680,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'f') {
 		len = diag_format_sdio_f1(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'F') {
+		len = diag_format_sdio_cores(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

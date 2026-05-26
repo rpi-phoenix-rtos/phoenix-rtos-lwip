@@ -2591,7 +2591,7 @@ static int diag_format_sdio_erom(char *buf, size_t cap)
 	uint32_t erom_ptr = 0;
 	int i, j;
 
-	enum { N_ENTRIES = 24 };
+	enum { N_ENTRIES = 40 };
 	uint32_t entries[N_ENTRIES] = {0};
 	int rc_entry[N_ENTRIES] = {0};
 	uint32_t entry_resp[N_ENTRIES][4][4];
@@ -2773,36 +2773,27 @@ static int diag_format_sdio_erom(char *buf, size_t cap)
 			break;
 		}
 		if (type4 == 0x1u) {
-			/* COMP: word 0 has Designer/Part/Class; word 1 has rev/
-			 * wrappers. Two consecutive type=1 entries form one
-			 * logical component descriptor. */
 			r = snprintf(buf + off, cap - off,
-				"[%02d] 0x%08x  comp  Des=0x%03x Part=0x%03x cls=%x\n",
-				i, (unsigned)e,
+				"[%02d] c %03x/%03x\n",
+				i,
 				(unsigned)((e >> 20) & 0xfffu),
-				(unsigned)((e >> 8) & 0xfffu),
-				(unsigned)((e >> 4) & 0xfu));
+				(unsigned)((e >> 8) & 0xfffu));
 		}
 		else if (type4 == 0x3u) {
-			r = snprintf(buf + off, cap - off,
-				"[%02d] 0x%08x  master-port\n", i, (unsigned)e);
+			r = snprintf(buf + off, cap - off, "[%02d] mp\n", i);
 		}
 		else if (type4 == 0x5u || type4 == 0x7u) {
-			/* ADDRESS: bits[31:12] = base, bits[11:8] = SizeType */
-			uint32_t base = e & 0xfffff000u;
 			r = snprintf(buf + off, cap - off,
-				"[%02d] 0x%08x  addr  base=0x%08x szT=%x\n",
-				i, (unsigned)e, (unsigned)base,
-				(unsigned)((e >> 8) & 0xfu));
+				"[%02d] a 0x%08x\n",
+				i, (unsigned)(e & 0xfffff000u));
 		}
 		else if (type4 == 0x0u) {
-			r = snprintf(buf + off, cap - off,
-				"[%02d] 0x%08x  empty\n", i, (unsigned)e);
+			r = snprintf(buf + off, cap - off, "[%02d] -\n", i);
 		}
 		else {
 			r = snprintf(buf + off, cap - off,
-				"[%02d] 0x%08x  misc t=0x%x\n",
-				i, (unsigned)e, (unsigned)type4);
+				"[%02d] t=%x 0x%08x\n",
+				i, (unsigned)type4, (unsigned)e);
 		}
 		if (r > 0 && (size_t)r < cap - off) {
 			off += r;

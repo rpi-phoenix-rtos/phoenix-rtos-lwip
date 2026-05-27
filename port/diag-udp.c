@@ -5577,9 +5577,11 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	}
 
 	r = snprintf(buf + off, cap - off,
-		"SDHCI CARD_INTR=%u  SOCRAM-tail rc=%d  trailer[12..15]=%02x %02x %02x %02x (wrote ab 01 50 fe)\n",
+		"SDHCI CARD_INTR=%u  SOCRAM-tail rc=%d  trailer[12..15]=%02x %02x %02x %02x (blob trailer=%02x %02x %02x %02x)\n",
 		card_intr, rc_tail,
-		socram_tail[12], socram_tail[13], socram_tail[14], socram_tail[15]);
+		socram_tail[12], socram_tail[13], socram_tail[14], socram_tail[15],
+		wifi_nvram_43455[wifi_nvram_43455_len - 4], wifi_nvram_43455[wifi_nvram_43455_len - 3],
+		wifi_nvram_43455[wifi_nvram_43455_len - 2], wifi_nvram_43455[wifi_nvram_43455_len - 1]);
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}

@@ -55,7 +55,7 @@
 
 
 #define DIAG_UDP_PORT 9999u
-#define DIAG_REPLY_MAX 1400u  /* one fragment of stock 1500B MTU */
+#define DIAG_REPLY_MAX 1472u  /* max UDP payload in one 1500B Ethernet frame (1500-20-8) */
 #define DIAG_BURN_THREADS 4
 #define DIAG_BURN_DURATION_US (10ULL * 1000000ULL)  /* 10 s */
 #define DIAG_BURN_STACK 1024u
@@ -1888,6 +1888,158 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 					es_idx, es_cc, es_slot);
 				if (r > 0 && (size_t)r < cap - off) {
 					off += r;
+				}
+
+				/* ENUM STEP 2: Address Device (TRB type 11) — the DECISIVE
+				 * cross-process DMA test. Unlike No-Op/Enable Slot, this
+				 * forces the controller to DMA-READ an Input Context we
+				 * build in host DRAM (slot ctx + EP0 ctx), then DMA-WRITE
+				 * the Output Device Context (slot state -> Addressed). If
+				 * this completes cc=1 from the lwip process, a separate
+				 * process can do real device-context DMA, not just ring
+				 * commands. CSZ=0 here (HCCPARAMS1) => 32-byte contexts. */
+				if (es_idx >= 0 && es_slot > 0) {
+					uint32_t nports = (hcsparams1 >> 24) & 0xFFu;
+					int port_idx = -1;
+					uint32_t port_speed = 0u, psc_pre = 0u, psc_post = 0u;
+					int did_reset = 0;
+					uint32_t pidx;
+
+					/* Find the connected root-hub port (CCS=1). The K120 is
+					 * USB2 (LS/FS), so after HCRST its port needs a reset to
+					 * reach Enabled before Address Device with BSR=0. */
+					for (pidx = 1u; pidx <= nports && pidx <= 15u; ++pidx) {
+						uint32_t psc = *(volatile uint32_t *)(op + 0x400u + (pidx - 1u) * 0x10u);
+						if ((psc & 0x1u) != 0u) {
+							port_idx = (int)pidx;
+							break;
+						}
+					}
+
+					if (port_idx > 0) {
+						volatile uint32_t *pscreg =
+							(volatile uint32_t *)(op + 0x400u + ((uint32_t)port_idx - 1u) * 0x10u);
+						uint32_t rwc = 0x00FE0000u;  /* RW1C change bits CSC..CEC */
+						psc_pre = *pscreg;
+						if ((psc_pre & 0x2u) == 0u) {  /* PED=0 -> USB2 port, reset it */
+							*pscreg = (psc_pre & ~(rwc | 0x2u)) | 0x10u;  /* PR=1 */
+							__asm__ volatile("dsb sy" ::: "memory");
+							for (k = 0; k < 100; ++k) {  /* up to ~500 ms */
+								uint32_t now = *pscreg;
+								if ((now & 0x200000u) != 0u || (now & 0x2u) != 0u) {
+									break;  /* PRC set or PED set */
+								}
+								usleep(5000);
+							}
+							did_reset = 1;
+						}
+						psc_post = *pscreg;
+						port_speed = (psc_post >> 10) & 0xFu;
+						/* Clear PRC (RW1C) so it doesn't linger. */
+						*pscreg = (psc_post & ~(rwc | 0x2u)) | 0x200000u;
+						__asm__ volatile("dsb sy" ::: "memory");
+					}
+
+					{
+						/* MPS for EP0 by port speed (PSI default map:
+						 * 1=Full,2=Low,3=High,4=SS). LS=8, FS/HS=64, SS=512. */
+						uint32_t mps = (port_speed == 2u) ? 8u :
+							(port_speed == 4u) ? 512u : 64u;
+						void *devctx_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+							MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
+						void *inctx_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+							MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
+						void *ep0_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+							MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
+
+						if (devctx_page != MAP_FAILED && inctx_page != MAP_FAILED &&
+							ep0_page != MAP_FAILED && port_idx > 0) {
+							uintptr_t devctx_pa = (uintptr_t)va2pa(devctx_page);
+							uintptr_t inctx_pa = (uintptr_t)va2pa(inctx_page);
+							uintptr_t ep0_pa = (uintptr_t)va2pa(ep0_page);
+							volatile uint32_t *ic = (volatile uint32_t *)inctx_page;
+							volatile uint32_t *dcbaa = (volatile uint32_t *)dcbaa_page;
+							volatile uint32_t *dc = (volatile uint32_t *)devctx_page;
+							uint32_t want_ad = (uint32_t)((cmd_pa + 32u) & 0xFFFFFFFFu);
+							int ad_idx = -1, ad_cc = -1, kk3;
+							uint32_t slot_dw3;
+
+							memset(devctx_page, 0, _PAGE_SIZE);
+							memset(inctx_page, 0, _PAGE_SIZE);
+							memset(ep0_page, 0, _PAGE_SIZE);
+
+							/* Input Control Context: add Slot (A0) + EP0 (A1). */
+							ic[1] = 0x3u;
+							/* Slot Context (dwords 8..): ctx entries=1, speed,
+							 * root-hub port number; direct on root hub (no TT). */
+							ic[8] = (1u << 27) | ((port_speed & 0xFu) << 20);
+							ic[9] = ((uint32_t)port_idx & 0xFFu) << 16;
+							/* EP0 Context (dwords 16..): CErr=3, type=Control(4),
+							 * MPS; TR dequeue = EP0 ring | DCS=1; avg TRB len=8. */
+							ic[17] = (3u << 1) | (4u << 3) | (mps << 16);
+							ic[18] = (uint32_t)(ep0_pa & 0xFFFFFFF0u) | 1u;
+							ic[19] = (uint32_t)((uint64_t)ep0_pa >> 32);
+							ic[20] = 8u;
+
+							dcbaa[(uint32_t)es_slot * 2u] = (uint32_t)(devctx_pa & 0xFFFFFFFFu);
+							dcbaa[(uint32_t)es_slot * 2u + 1u] = (uint32_t)((uint64_t)devctx_pa >> 32);
+							__asm__ volatile("dsb sy" ::: "memory");
+
+							/* Address Device TRB at 3rd cmd-ring slot (offset 32). */
+							cmd[8] = (uint32_t)(inctx_pa & 0xFFFFFFFFu);
+							cmd[9] = (uint32_t)((uint64_t)inctx_pa >> 32);
+							cmd[10] = 0u;
+							cmd[11] = ((uint32_t)es_slot << 24) | (11u << 10) | 1u;
+							__asm__ volatile("dsb sy" ::: "memory");
+
+							if (dboff < USB_XHCI_MMIO_SIZE) {
+								*(volatile uint32_t *)(base + dboff) = 0u;
+								(void)*(volatile uint32_t *)(op + 0x04);
+								__asm__ volatile("dsb sy" ::: "memory");
+							}
+
+							for (k = 0; k < 100; ++k) {
+								for (kk3 = 0; kk3 < 256; ++kk3) {
+									if (((evt[kk3 * 4 + 3] >> 10) & 0x3Fu) == 33u &&
+										evt[kk3 * 4] == want_ad) {
+										ad_idx = kk3;
+										ad_cc = (int)((evt[kk3 * 4 + 2] >> 24) & 0xFFu);
+										break;
+									}
+								}
+								if (ad_idx >= 0) {
+									break;
+								}
+								usleep(5000);
+							}
+
+							slot_dw3 = dc[3];  /* controller-written: addr[7:0], state[31:27] */
+
+							r = snprintf(buf + off, cap - off,
+								"ENUM AddrDev: port=%d speed=%u mps=%u reset=%d psc=%08x->%08x  "
+								"%s cc=%d (1=success) devaddr=%u slotstate=%u (2=Addressed)\n",
+								port_idx, port_speed, mps, did_reset,
+								(unsigned)psc_pre, (unsigned)psc_post,
+								(ad_idx >= 0) ? "COMPLETED" : "no completion", ad_cc,
+								(unsigned)(slot_dw3 & 0xFFu),
+								(unsigned)((slot_dw3 >> 27) & 0x1Fu));
+							if (r > 0 && (size_t)r < cap - off) {
+								off += r;
+							}
+						}
+						else {
+							r = snprintf(buf + off, cap - off,
+								"ENUM AddrDev: setup failed (port_idx=%d alloc dev=%d in=%d ep0=%d)\n",
+								port_idx, devctx_page != MAP_FAILED,
+								inctx_page != MAP_FAILED, ep0_page != MAP_FAILED);
+							if (r > 0 && (size_t)r < cap - off) {
+								off += r;
+							}
+						}
+						if (devctx_page != MAP_FAILED) munmap(devctx_page, _PAGE_SIZE);
+						if (inctx_page != MAP_FAILED) munmap(inctx_page, _PAGE_SIZE);
+						if (ep0_page != MAP_FAILED) munmap(ep0_page, _PAGE_SIZE);
+					}
 				}
 			}
 		}

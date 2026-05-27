@@ -5100,6 +5100,7 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	uint8_t f2_ready = 0u;
 	int f2_ready_iters = -1;
 	uint8_t rstvec_rb[4] = {0};
+	uint32_t hmb_data = 0u;
 	unsigned card_intr = 0u;
 	int worst_rc_w = 0;
 	int i, pre_match, post_match, diff_count;
@@ -5458,6 +5459,28 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		rc_tail = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
 			/*reg_addr=*/0x7FF0u, /*block_count=*/1u, /*block_size=*/16u,
 			socram_tail);
+
+		/* DEFINITIVE fw-ready probe: read the SDIO-DEV core's
+		 * tohostmailboxdata (SDIOD_CORE_BASE + 0x4C). brcmfmac/WHD treat
+		 * HMB_DATA_FWREADY (0x0008) here as THE "firmware booted" signal —
+		 * more reliable than HT/F2/CARD_INTR. For the 43455 the SDIOD core
+		 * base is hypothesized at 0x18005000 (WHD maps the sibling 0x4373
+		 * there, and our EROM walk has an unidentified core at 0x18005000;
+		 * 0x18004000 is absent). Window=0x18000000 (L=0,M=0,H=0x18), so F1
+		 * offset 0x504C reaches 0x1800504C. A sensible/non-0xff value also
+		 * validates the base guess. */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
+		{
+			uint32_t m0[4] = {0}, m1[4] = {0}, m2[4] = {0}, m3[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x504Cu, 0u, m0);
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x504Du, 0u, m1);
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x504Eu, 0u, m2);
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x504Fu, 0u, m3);
+			hmb_data = (m0[0] & 0xffu) | ((m1[0] & 0xffu) << 8) |
+				((m2[0] & 0xffu) << 16) | ((m3[0] & 0xffu) << 24);
+		}
 	}
 
 	munmap(sdhci_page, _PAGE_SIZE);
@@ -5563,6 +5586,16 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	r = snprintf(buf + off, cap - off,
 		"F2 enable: IOR=0x%02x ready=%s @iter=%d (F2_RDY=bit2 0x04)\n",
 		f2_ready, ((f2_ready & 0x04u) != 0u) ? "YES" : "no", f2_ready_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"SDIOD tohostmailboxdata=0x%08x -> %s (HMB_DATA_FWREADY=0x0008; SDIOD base hyp 0x18005000)\n",
+		hmb_data,
+		((hmb_data & 0x0008u) != 0u) ? "FWREADY set -- FIRMWARE BOOTED!"
+			: ((hmb_data == 0xffffffffu || hmb_data == 0u) ? "0/0xff (no fw signal, or wrong SDIOD base)"
+				: "nonzero but no FWREADY bit"));
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}

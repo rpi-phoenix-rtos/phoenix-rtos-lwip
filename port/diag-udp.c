@@ -5099,6 +5099,7 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	uint8_t ht_clk_csr = 0u;
 	uint8_t f2_ready = 0u;
 	int f2_ready_iters = -1;
+	uint8_t rstvec_rb[4] = {0};
 	unsigned card_intr = 0u;
 	int worst_rc_w = 0;
 	int i, pre_match, post_match, diff_count;
@@ -5333,6 +5334,24 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2u, wifi_fw_43455[2], NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x3u, wifi_fw_43455[3], NULL);
 
+		/* Read addr 0 back to VERIFY the rstvec landed at TRUE backplane
+		 * address 0 (WHD does this exact assert in download_resource). If
+		 * it does not read back == fw[0..3], the addr-0 write is landing in
+		 * TCM/0x198000 (SBADDR window / address-mask bug) and the CR4
+		 * fetches a garbage reset vector — which fully explains "CR4
+		 * clocked+unhalted (IoCtrl=0x01) but firmware not executing". */
+		{
+			uint32_t v0[4] = {0}, v1[4] = {0}, v2[4] = {0}, v3[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x0u, 0u, v0);
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x1u, 0u, v1);
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x2u, 0u, v2);
+			(void)diag_sdioCmd52(sdhci, 0, 1, 0x3u, 0u, v3);
+			rstvec_rb[0] = (uint8_t)(v0[0] & 0xffu);
+			rstvec_rb[1] = (uint8_t)(v1[0] & 0xffu);
+			rstvec_rb[2] = (uint8_t)(v2[0] & 0xffu);
+			rstvec_rb[3] = (uint8_t)(v3[0] & 0xffu);
+		}
+
 		/* Re-window to ARM-CR4 wrapper window 0x18100000:
 		 *   F1 0x2408 = chip-internal 0x18102408 = BCMA_IOCTL
 		 *   F1 0x2800 = chip-internal 0x18102800 = BCMA_RESET_CTL */
@@ -5475,6 +5494,18 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		"ARMCR4 IoCtrl pre=0x%02x  post=0x%02x  (expect pre=0x21 CPUHALT+clk, post=0x01 clk-only)\n",
 		(unsigned)(rc_pre_resp[0] & 0xff),
 		(unsigned)(rc_post_resp[0] & 0xff));
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"rstvec@addr0 readback: %02x %02x %02x %02x  vs fw[0..3]: %02x %02x %02x %02x  -> %s\n",
+		rstvec_rb[0], rstvec_rb[1], rstvec_rb[2], rstvec_rb[3],
+		wifi_fw_43455[0], wifi_fw_43455[1], wifi_fw_43455[2], wifi_fw_43455[3],
+		(rstvec_rb[0] == wifi_fw_43455[0] && rstvec_rb[1] == wifi_fw_43455[1] &&
+			rstvec_rb[2] == wifi_fw_43455[2] && rstvec_rb[3] == wifi_fw_43455[3])
+			? "MATCH (vector placed at true backplane 0)"
+			: "MISMATCH (addr-0 write landed elsewhere -- CR4 fetches garbage!)");
 	if (r > 0 && (size_t)r < cap - off) {
 		off += r;
 	}

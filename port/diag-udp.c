@@ -1754,24 +1754,13 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 			 * should equal what we wrote — a sanity check that we're
 			 * looking at the right page. */
 			r = snprintf(buf + off, cap - off,
-				"  cmdring: CRCR before=0x%08x crr_now=0x%08x after=0x%08x (CRR=%u)  "
-				"USBSTS=0x%08x (EINT=%u)  IMAN=0x%08x (IP=%u)  DB_rb=0x%08x\n"
-				"  cmd_pa=0x%llx  cmd_post[0]=%08x [3]=%08x (wrote 00000000 / %08x)\n"
-				"  layout: HCSPARAMS1=0x%08x (slots=%u ports=%u)  HCCPARAMS1=0x%08x (AC64=%u CSZ=%u)\n"
-				"          DBOFF_raw=0x%08x RTSOFF_raw=0x%08x caplen=0x%02x\n"
-				"  scratchpad: n=%u arr_pa=0x%llx bufs_pa=0x%llx (DCBAA[0] set)\n",
-				crcr_before, crr_immediate, crcr_after, (unsigned)((crcr_after >> 3) & 1u),
-				usbsts_after, (unsigned)((usbsts_after >> 3) & 1u),
-				iman_after, (unsigned)(iman_after & 1u), db_rb,
-				(unsigned long long)cmd_pa, cmd_post0, cmd_post3,
-				(23u << 10) | 1u,
-				hcsparams1, (unsigned)(hcsparams1 & 0xFFu),
-				(unsigned)((hcsparams1 >> 24) & 0xFFu),
-				hccparams1, (unsigned)(hccparams1 & 1u),
-				(unsigned)((hccparams1 >> 2) & 1u),
-				dboff_raw, rtsoff_raw, caplength,
-				n_scratch, (unsigned long long)scratch_arr_pa,
-				(unsigned long long)scratch_bufs_pa);
+				"  cmdring: CRR=%u USBSTS=0x%08x slots=%u ports=%u CSZ=%u scratch n=%u\n",
+				(unsigned)((crcr_after >> 3) & 1u), usbsts_after,
+				(unsigned)(hcsparams1 & 0xFFu), (unsigned)((hcsparams1 >> 24) & 0xFFu),
+				(unsigned)((hccparams1 >> 2) & 1u), n_scratch);
+			(void)crcr_before; (void)crr_immediate; (void)iman_after; (void)db_rb;
+			(void)cmd_post0; (void)cmd_post3; (void)dboff_raw; (void)rtsoff_raw;
+			(void)scratch_arr_pa; (void)scratch_bufs_pa;
 			if (r > 0 && (size_t)r < cap - off) {
 				off += r;
 			}
@@ -2025,6 +2014,79 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 								(unsigned)((slot_dw3 >> 27) & 0x1Fu));
 							if (r > 0 && (size_t)r < cap - off) {
 								off += r;
+							}
+
+							/* ENUM STEP 3: control IN transfer (GET_DESCRIPTOR
+							 * device, 18 bytes) on EP0. Proves the cross-process
+							 * actor can do real DATA transfers (not just commands)
+							 * — the foundation of every device driver. Build the
+							 * Setup/Data/Status TD on the EP0 transfer ring, ring
+							 * DB[slot] target DCI 1, read the Transfer Event
+							 * (type 32) and the device descriptor bytes. */
+							if (ad_idx >= 0 && ad_cc == 1) {
+								void *data_page = mmap(NULL, _PAGE_SIZE, PROT_READ | PROT_WRITE,
+									MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNCACHED | MAP_CONTIGUOUS, -1, 0);
+								if (data_page != MAP_FAILED) {
+									uintptr_t data_pa = (uintptr_t)va2pa(data_page);
+									volatile uint32_t *ep0 = (volatile uint32_t *)ep0_page;
+									volatile uint8_t *desc = (volatile uint8_t *)data_page;
+									int td_idx = -1, td_cc = -1, kk4;
+									uint32_t td_resid = 0u;
+
+									memset(data_page, 0, _PAGE_SIZE);
+
+									/* Setup Stage TRB: GET_DESCRIPTOR(device,18), IDT,
+									 * TRT=IN(3). 8 setup bytes 80 06 00 01 00 00 12 00. */
+									ep0[0] = 0x01000680u;
+									ep0[1] = 0x00120000u;
+									ep0[2] = 8u;
+									ep0[3] = (2u << 10) | (3u << 16) | (1u << 6) | 1u;
+									/* Data Stage TRB: IN, 18 bytes -> data_pa. */
+									ep0[4] = (uint32_t)(data_pa & 0xFFFFFFFFu);
+									ep0[5] = (uint32_t)((uint64_t)data_pa >> 32);
+									ep0[6] = 18u;
+									ep0[7] = (3u << 10) | (1u << 16) | 1u;
+									/* Status Stage TRB: OUT, IOC. */
+									ep0[8] = 0u;
+									ep0[9] = 0u;
+									ep0[10] = 0u;
+									ep0[11] = (4u << 10) | (1u << 5) | 1u;
+									__asm__ volatile("dsb sy" ::: "memory");
+
+									/* Ring DB[slot] with target DCI 1 (EP0). */
+									if (dboff < USB_XHCI_MMIO_SIZE) {
+										*(volatile uint32_t *)(base + dboff + (uint32_t)es_slot * 4u) = 1u;
+										(void)*(volatile uint32_t *)(op + 0x04);
+										__asm__ volatile("dsb sy" ::: "memory");
+									}
+
+									for (k = 0; k < 100; ++k) {
+										for (kk4 = 0; kk4 < 256; ++kk4) {
+											if (((evt[kk4 * 4 + 3] >> 10) & 0x3Fu) == 32u) {
+												td_idx = kk4;
+												td_cc = (int)((evt[kk4 * 4 + 2] >> 24) & 0xFFu);
+												td_resid = evt[kk4 * 4 + 2] & 0xFFFFFFu;
+												break;
+											}
+										}
+										if (td_idx >= 0) {
+											break;
+										}
+										usleep(5000);
+									}
+
+									r = snprintf(buf + off, cap - off,
+										"ENUM GetDesc: %s cc=%d (1=success) resid=%u  len=%u type=%u class=%u VID=%04x PID=%04x bcdUSB=%04x\n",
+										(td_idx >= 0) ? "EVENT" : "no event", td_cc, td_resid,
+										desc[0], desc[1], desc[4],
+										(unsigned)(desc[8] | ((uint32_t)desc[9] << 8)),
+										(unsigned)(desc[10] | ((uint32_t)desc[11] << 8)),
+										(unsigned)(desc[2] | ((uint32_t)desc[3] << 8)));
+									if (r > 0 && (size_t)r < cap - off) {
+										off += r;
+									}
+									munmap(data_page, _PAGE_SIZE);
+								}
 							}
 						}
 						else {

@@ -5206,36 +5206,24 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 
 		rc_hs = diag_sdioGoHighSpeed(sdhci);
 
-		/* PMU resource-reload kick. On 43455 the HT/PLL resource is
-		 * not auto-requested on a clean boot, so HT_AVAIL_REQ latches
-		 * (CHIPCLKCSR=0x50) but HT_AVAIL (0x80) never grants. bwfm
-		 * writes PMUCONTROL RES_RELOAD before requesting HT.
-		 *   PMUCONTROL = ChipCommon base 0x18000000 + 0x600
-		 *   RES_RELOAD = field [14:13], value 0b10 (0x2 << 13 = 0x4000)
-		 * Window SBADDR to ChipCommon (L=0x00 M=0x00 H=0x18), then do a
-		 * proper RMW of the field in byte 1: clear bits [14:13] (byte-1
-		 * mask 0x60) and set bit 14 (byte-1 0x40). A bare OR (the previous
-		 * code) left bit 13 set if it was already set, encoding RES_RELOAD
-		 * as 0b11 instead of 0b10. */
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
-		{
-			uint32_t pmuc1[4] = {0};
-			(void)diag_sdioCmd52(sdhci, 0, 1, 0x0601u, 0u, pmuc1);  /* PMUCONTROL byte 1 */
-			(void)diag_sdioCmd52(sdhci, 1, 1, 0x0601u,
-				(uint8_t)(((pmuc1[0] & ~0x60u) | 0x40u) & 0xffu), NULL); /* RES_RELOAD field = 0b10 */
-		}
-		usleep(10000);
-
-		/* CHIPCLKCSR clock bring-up (F1 0x1000E), faithful to brcmfmac
-		 * brcmf_sdio_htclk(): request the clock and poll — do NOT set
-		 * FORCE_HW_CLKREQ_OFF (0x20). The previous code set 0x20 during
-		 * the ALP/FORCE_ALP steps then cleared it for the HT request; that
-		 * residue dropped CHIPCLKCSR to 0x00 (even ALP_AVAIL lost). Order:
-		 *   1. ALP_AVAIL_REQ (0x08); poll ALP_AVAIL (0x40)
-		 *   2. HT_AVAIL_REQ (0x10); poll HT_AVAIL (0x80)
-		 *   3. fallback FORCE_HT|HT_AVAIL_REQ (0x12); poll HT_AVAIL */
+		/* Backplane clock bring-up before CR4 release: ALP ONLY.
+		 * Per brcmfmac brcmf_sdio_load_firmware(), the host sets
+		 * alp_only=true for the whole firmware-download + CR4-release
+		 * window and brings the backplane up on ALP only
+		 * (SBSDIO_ALP_AVAIL_REQ 0x08; wait SBSDIO_ALP_AVAIL 0x40). It
+		 * does NOT request/await HT and does NO PMU resource-mask or
+		 * RES_RELOAD programming on the SDIO path — the firmware running
+		 * on the CR4 brings HT up itself once executing; the host only
+		 * force-enables HT (FORCE_HT) AFTER firmware is up, for F2 IRQ
+		 * propagation. Forcing HT here cannot work: the CR4 is a
+		 * high-speed core with no HT clock until firmware requests it, so
+		 * the old host-side HT_AVAIL_REQ/FORCE_HT + PMUCONTROL RES_RELOAD
+		 * just spun (CHIPCLKCSR stuck 0x50/0x00) — the identical signature
+		 * seen in OpenWrt #23069 / starfive #51, whose root cause is
+		 * "firmware not executing", not a missing PMU write. (Refs:
+		 * torvalds/linux brcmfmac sdio.c alp_only L4234 + htclk L784;
+		 * chip.c brcmf_chip_cr4_set_active L1339.) HT_AVAIL is polled
+		 * AFTER release below as the firmware-alive tell. */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x08u, NULL);
 		for (i = 0; i < 250; ++i) {
 			uint32_t cc[4] = {0};
@@ -5245,29 +5233,6 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 				break;
 			}
 			usleep(2000);
-		}
-
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x10u, NULL);
-		for (i = 0; i < 250; ++i) {
-			uint32_t cc[4] = {0};
-			(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Eu, 0u, cc);
-			ht_clk_csr = (uint8_t)(cc[0] & 0xffu);
-			if ((ht_clk_csr & 0x80u) != 0u) {
-				break;
-			}
-			usleep(2000);
-		}
-		if ((ht_clk_csr & 0x80u) == 0u) {
-			(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x12u, NULL);
-			for (i = 0; i < 250; ++i) {
-				uint32_t cc[4] = {0};
-				(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Eu, 0u, cc);
-				ht_clk_csr = (uint8_t)(cc[0] & 0xffu);
-				if ((ht_clk_csr & 0x80u) != 0u) {
-					break;
-				}
-				usleep(2000);
-			}
 		}
 
 		(void)diag_sdioCmd52(sdhci, 1, 0, 0x110u, 0x40u, NULL);

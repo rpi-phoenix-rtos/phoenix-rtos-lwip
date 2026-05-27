@@ -742,6 +742,22 @@ static uint32_t diag_mboxPower(uint32_t tag, uint32_t device_id, uint32_t state)
 }
 
 
+/* Cold-power-cycle the BCM43455 WiFi chip via its WL_REG_ON line (a Pi 4
+ * expander GPIO driven through the VideoCore mailbox): drop it, wait,
+ * re-assert, settle. Centralizes the 4-line toggle that was copy-pasted
+ * across every WiFi diag sub-command. NB: a 20x-longer power-down was
+ * tested and did NOT make the 43455 firmware execute (the fw-exec gate is
+ * not a reset-timing issue — see the bcm43455 memory note); 50/150 ms is
+ * the established, enumeration-tested baseline. */
+static void diag_wifiPowerCycle(void)
+{
+	(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
+	usleep(50 * 1000);
+	(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
+	usleep(150 * 1000);
+}
+
+
 static int diag_format_clocks(char *buf, size_t cap)
 {
 	int off = 0, r;
@@ -2152,10 +2168,7 @@ static int diag_format_sdio_enum(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -2656,10 +2669,7 @@ static int diag_format_sdio_f1(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -2925,10 +2935,7 @@ static int diag_format_sdio_cores(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -3224,10 +3231,7 @@ static int diag_format_sdio_erom(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -3496,10 +3500,7 @@ static int diag_format_sdio_arm(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -3698,10 +3699,7 @@ static int diag_format_sdio_socram(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -3871,10 +3869,7 @@ static int diag_format_sdio_block(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -4043,10 +4038,7 @@ static int diag_format_sdio_blockwrite(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -4237,10 +4229,7 @@ static int diag_format_sdio_fwloadtest(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -4450,10 +4439,7 @@ static int diag_format_sdio_fwwalk(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -4694,10 +4680,7 @@ static int diag_format_sdio_fwload(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -4928,10 +4911,7 @@ static int diag_format_sdio_hs(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -5155,10 +5135,7 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 		(void)diag_sdhciSetClockKHz(sdhci, 400u);
 		(void)diag_sdhciResetCmdDat(sdhci);
 
@@ -5697,10 +5674,7 @@ static int diag_format_sdio(char *buf, size_t cap)
 		for (i = 34; i <= 39; ++i) {
 			diag_gpioSetFsel(gpio, (unsigned)i, 7u);
 		}
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 0u);
-		usleep(50 * 1000);
-		(void)diag_mboxPower(VC_PROP_SET_GPIO_STATE, EXPGPIO_WL_ON, 1u);
-		usleep(150 * 1000);
+		diag_wifiPowerCycle();
 
 		pres_post_wlon = *(volatile uint32_t *)(sdhci + SDHCI_PRES_STATE);
 		intst_post_wlon = *(volatile uint32_t *)(sdhci + SDHCI_INT_STATUS);

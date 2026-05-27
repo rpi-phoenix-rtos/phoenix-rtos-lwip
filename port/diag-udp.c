@@ -5211,9 +5211,12 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		 * (CHIPCLKCSR=0x50) but HT_AVAIL (0x80) never grants. bwfm
 		 * writes PMUCONTROL RES_RELOAD before requesting HT.
 		 *   PMUCONTROL = ChipCommon base 0x18000000 + 0x600
-		 *   RES_RELOAD = 0x2 << RES_SHIFT(13) = 0x4000  (byte 1 bit 6)
-		 * Window SBADDR to ChipCommon (L=0x00 M=0x00 H=0x18), RMW the
-		 * 32-bit reg via byte access (the field is wholly in byte 1). */
+		 *   RES_RELOAD = field [14:13], value 0b10 (0x2 << 13 = 0x4000)
+		 * Window SBADDR to ChipCommon (L=0x00 M=0x00 H=0x18), then do a
+		 * proper RMW of the field in byte 1: clear bits [14:13] (byte-1
+		 * mask 0x60) and set bit 14 (byte-1 0x40). A bare OR (the previous
+		 * code) left bit 13 set if it was already set, encoding RES_RELOAD
+		 * as 0b11 instead of 0b10. */
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, 0x00u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, 0x00u, NULL);
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, 0x18u, NULL);
@@ -5221,17 +5224,19 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			uint32_t pmuc1[4] = {0};
 			(void)diag_sdioCmd52(sdhci, 0, 1, 0x0601u, 0u, pmuc1);  /* PMUCONTROL byte 1 */
 			(void)diag_sdioCmd52(sdhci, 1, 1, 0x0601u,
-				(uint8_t)((pmuc1[0] | 0x40u) & 0xffu), NULL);       /* set bit 6 = RES_RELOAD */
+				(uint8_t)(((pmuc1[0] & ~0x60u) | 0x40u) & 0xffu), NULL); /* RES_RELOAD field = 0b10 */
 		}
-		usleep(2000);
+		usleep(10000);
 
-		/* CHIPCLKCSR clock bring-up (F1 0x1000E), brcmfmac/bwfm order:
-		 *   1. ALP_AVAIL_REQ|FORCE_HW_CLKREQ_OFF (0x08|0x20=0x28); poll ALP_AVAIL(0x40)
-		 *   2. FORCE_ALP|FORCE_HW_CLKREQ_OFF (0x01|0x20=0x21); brief settle
-		 *   3. HT_AVAIL_REQ (0x10, FORCE_HW_CLKREQ_OFF cleared so HW can
-		 *      auto-request HT); poll HT_AVAIL(0x80). FORCE_HT(0x02)
-		 *      fallback. */
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x28u, NULL);
+		/* CHIPCLKCSR clock bring-up (F1 0x1000E), faithful to brcmfmac
+		 * brcmf_sdio_htclk(): request the clock and poll — do NOT set
+		 * FORCE_HW_CLKREQ_OFF (0x20). The previous code set 0x20 during
+		 * the ALP/FORCE_ALP steps then cleared it for the HT request; that
+		 * residue dropped CHIPCLKCSR to 0x00 (even ALP_AVAIL lost). Order:
+		 *   1. ALP_AVAIL_REQ (0x08); poll ALP_AVAIL (0x40)
+		 *   2. HT_AVAIL_REQ (0x10); poll HT_AVAIL (0x80)
+		 *   3. fallback FORCE_HT|HT_AVAIL_REQ (0x12); poll HT_AVAIL */
+		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x08u, NULL);
 		for (i = 0; i < 250; ++i) {
 			uint32_t cc[4] = {0};
 			(void)diag_sdioCmd52(sdhci, 0, 1, 0x1000Eu, 0u, cc);
@@ -5241,8 +5246,6 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			}
 			usleep(2000);
 		}
-		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x21u, NULL);
-		usleep(1000);
 
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Eu, 0x10u, NULL);
 		for (i = 0; i < 250; ++i) {

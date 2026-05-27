@@ -1838,6 +1838,58 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 					}
 				}
 			}
+
+			/* ENUM STEP 1: Enable Slot (TRB type 9) — the first REAL xHCI
+			 * command beyond No-Op. Goal: prove a separate process (this
+			 * lwip rig, which did NOT bring up the bridge) can drive real
+			 * commands cross-process, as the go/no-go for the cross-process
+			 * split. Write it at the 2nd cmd-ring TRB (byte offset 16,
+			 * cycle=1); the controller consumed the No-Op at TRB[0] so its
+			 * dequeue is now at TRB[1]. Its Command Completion Event (type
+			 * 33) carries the slot id in control[31:24] and completion code
+			 * in status[31:24]; parameter == cmd_pa+16 distinguishes it from
+			 * the No-Op completion (== cmd_pa+0). */
+			if (found_idx >= 0) {
+				uint32_t want_es = (uint32_t)((cmd_pa + 16u) & 0xFFFFFFFFu);
+				int es_idx = -1, es_slot = -1, es_cc = -1;
+				int kk2;
+
+				cmd[4] = 0u;
+				cmd[5] = 0u;
+				cmd[6] = 0u;
+				cmd[7] = (9u << 10) | 1u;  /* Enable Slot, cycle=1 */
+				__asm__ volatile("dsb sy" ::: "memory");
+
+				if (dboff < USB_XHCI_MMIO_SIZE) {
+					*(volatile uint32_t *)(base + dboff) = 0u;  /* DB[0] command ring */
+					(void)*(volatile uint32_t *)(op + 0x04);    /* posted-write flush */
+					__asm__ volatile("dsb sy" ::: "memory");
+				}
+
+				for (k = 0; k < 60; ++k) {
+					for (kk2 = 0; kk2 < 256; ++kk2) {
+						if (((evt[kk2 * 4 + 3] >> 10) & 0x3Fu) == 33u &&
+							evt[kk2 * 4] == want_es) {
+							es_idx = kk2;
+							es_cc = (int)((evt[kk2 * 4 + 2] >> 24) & 0xFFu);
+							es_slot = (int)((evt[kk2 * 4 + 3] >> 24) & 0xFFu);
+							break;
+						}
+					}
+					if (es_idx >= 0) {
+						break;
+					}
+					usleep(5000);
+				}
+
+				r = snprintf(buf + off, cap - off,
+					"ENUM EnableSlot: %s @idx %d cc=%d (1=success) slot=%d  (cross-process real command)\n",
+					(es_idx >= 0) ? "COMPLETED" : "no completion",
+					es_idx, es_cc, es_slot);
+				if (r > 0 && (size_t)r < cap - off) {
+					off += r;
+				}
+			}
 		}
 	}
 

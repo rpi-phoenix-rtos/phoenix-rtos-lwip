@@ -5097,6 +5097,8 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	uint8_t chipclk_samples[8] = {0};
 	uint8_t socram_tail[16] = {0};
 	uint8_t ht_clk_csr = 0u;
+	uint8_t f2_ready = 0u;
+	int f2_ready_iters = -1;
 	unsigned card_intr = 0u;
 	int worst_rc_w = 0;
 	int i, pre_match, post_match, diff_count;
@@ -5371,6 +5373,29 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		}
 		(void)diag_sdioCmd52(sdhci, 1, 1, 0x2408u, 0x01u, NULL);   /* IOCTL CLK (CPU runs) */
 
+		/* Post-release SDIO handshake (brcmfmac brcmf_sdio_bus_init):
+		 * once the CR4 is running, enable function 2 (the SDPCM data
+		 * channel) via CCCR IOEN bit 2 (0x04) and wait for F2-ready in
+		 * CCCR IOR bit 2 (0x04). The 43455 firmware brings up its HT/PLL
+		 * + data path as it comes ready; some firmware does not proceed
+		 * (nor raise HT) until the host enables F2. ~1 s poll budget. */
+		{
+			uint32_t ioen_resp[4] = {0};
+			(void)diag_sdioCmd52(sdhci, 0, 0, 0x02u, 0u, ioen_resp);
+			(void)diag_sdioCmd52(sdhci, 1, 0, 0x02u,
+				(uint8_t)((ioen_resp[0] | 0x04u) & 0xffu), NULL);  /* IOEN F2 */
+			for (i = 0; i < 500; ++i) {
+				uint32_t ior_resp[4] = {0};
+				(void)diag_sdioCmd52(sdhci, 0, 0, 0x03u, 0u, ior_resp);
+				f2_ready = (uint8_t)(ior_resp[0] & 0xffu);
+				if ((f2_ready & 0x04u) != 0u) {
+					f2_ready_iters = i;
+					break;
+				}
+				usleep(2000);
+			}
+		}
+
 		usleep(300 * 1000);  /* firmware init: NVRAM parse + chip-self-test */
 
 		/* Read IOCTL post (expect 0x01 = CLK only, CPU running). */
@@ -5502,6 +5527,13 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 				off += r;
 			}
 		}
+	}
+
+	r = snprintf(buf + off, cap - off,
+		"F2 enable: IOR=0x%02x ready=%s @iter=%d (F2_RDY=bit2 0x04)\n",
+		f2_ready, ((f2_ready & 0x04u) != 0u) ? "YES" : "no", f2_ready_iters);
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
 	}
 
 	r = snprintf(buf + off, cap - off,

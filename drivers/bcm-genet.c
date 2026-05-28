@@ -842,7 +842,17 @@ static void genet_dhcpStartCb(void *arg)
 	 * never reaches the wire. A static address keeps the netif usable
 	 * while the lwip-port internals are investigated separately.
 	 * 10.42.0.99 sits outside the host dnsmasq pool (.10..20) on the
-	 * netboot bridge so it won't collide with leased addresses. */
+	 * netboot bridge so it won't collide with leased addresses.
+	 *
+	 * 2026-05-28 investigation: dhcp_start() called from this
+	 * tcpip-callback context returns ERR_OK (lwip-port reaches link-
+	 * up + dhcp_start: 0 in the boot log), but verifying the full
+	 * DISCOVER → OFFER → REQUEST → ACK round-trip needs (a) a
+	 * longer post-link-up observation window than test-cycle-netboot
+	 * currently grants, AND (b) host-side dnsmasq logging keyed on
+	 * the Pi's MAC. Both prerequisites are open. Revisit with a
+	 * tcpdump-on-host + extended capture once the test infrastructure
+	 * supports those. */
 	IP4_ADDR(&ip, 10, 42, 0, 99);
 	IP4_ADDR(&mask, 255, 255, 255, 0);
 	IP4_ADDR(&gw, 10, 42, 0, 1);

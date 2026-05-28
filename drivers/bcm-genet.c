@@ -833,42 +833,29 @@ static void genet_irqThread(void *arg)
 static void genet_dhcpStartCb(void *arg)
 {
 	struct netif *netif = arg;
-	ip4_addr_t ip, mask, gw;
+	err_t err;
 
 	netif_set_default(netif);
 
-	/* TODO(TD-Eth-DHCP): autonomous DHCP. On this lwip-port, dhcp_start
-	 * resets the netif's IP to 0.0.0.0 immediately, so the diag-udp
-	 * probe (hard-coded against 10.42.0.99) cannot reach the Pi
-	 * anymore — and we don't yet have host-side dnsmasq-lease tracking
-	 * keyed on the Pi MAC to discover the DHCP-assigned IP.
+	/* TD-Eth-DHCP closure attempt (2026-05-28): activate autonomous
+	 * DHCP. Host-side discovery is now in place — get-pi-ip.sh reads
+	 * dnsmasq.leases and diag-udp-probe.sh auto-resolves the Pi IP
+	 * before sending the probe, so we no longer depend on the static
+	 * 10.42.0.99 fallback to reach the Pi after dhcp_start clears it.
 	 *
-	 * Verified on 2026-05-28 with the new `--probe q` automation
-	 * (artifact `2026-05-28-...-dhcp-active-probe.txt`):
-	 *  - `dhcp_start` returns ERR_OK from the tcpip-thread callback
-	 *  - lwip-port prints "dhcp_start: 0; netif waits for OFFER"
-	 *  - Pi loses the static 10.42.0.99 IP
-	 *  - probe ICMP to 10.42.0.99 times out (Pi is at 0.0.0.0 or a
-	 *    DHCP-assigned address we can't discover from the host)
-	 *
-	 * Static 10.42.0.99 fallback is the working configuration. To
-	 * close TD-Eth-DHCP, the next session needs to:
-	 *  (a) wire up host-side dnsmasq lease logging keyed on
-	 *      MAC dc:a6:32:3c:dd:f1, and
-	 *  (b) read the assigned IP from dnsmasq and pass it to the
-	 *      probe script (or teach diag-udp-probe.sh to ARP-scan
-	 *      the /24 for the Pi MAC first).
-	 *
-	 * 10.42.0.99 sits outside the host dnsmasq pool (.10..20) on the
-	 * netboot bridge so it won't collide with leased addresses. */
-	IP4_ADDR(&ip, 10, 42, 0, 99);
-	IP4_ADDR(&mask, 255, 255, 255, 0);
-	IP4_ADDR(&gw, 10, 42, 0, 1);
-	netif_set_addr(netif, &ip, &mask, &gw);
-	genet_printf((genet_state_t *)netif->state, "static IP 10.42.0.99/24 gw 10.42.0.1");
+	 * To validate end-to-end:
+	 *   test-cycle-netboot.sh --label dhcp-close --capture-secs 240 --probe q
+	 * and check artifacts/diag-udp output for:
+	 *   netif: ... ip=10.42.0.X gw=10.42.0.1 flags=... DHCP
+	 * where 10 <= X <= 20 (dnsmasq's dhcp-range on the netboot bridge).
+	 */
+	err = dhcp_start(netif);
+	genet_printf((genet_state_t *)netif->state,
+		"dhcp_start: %d (0=ok); netif waits for OFFER", (int)err);
 
-	/* Gratuitous ARP populates host caches and confirms the linkoutput
-	 * path is wired before the first inbound request arrives. */
+	/* Gratuitous ARP after dhcp_start is a no-op (netif IP is 0.0.0.0);
+	 * lwip handles that gracefully. The first useful ARP fires later
+	 * when DHCP completes and netif_set_addr runs from dhcp.c. */
 	(void)etharp_gratuitous(netif);
 }
 

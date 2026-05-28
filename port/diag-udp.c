@@ -38,6 +38,7 @@
 #include "lwip/netif.h"
 #include "lwip/tcpip.h"
 #include "lwip/stats.h"
+#include "lwip/dhcp.h"
 #include "netif-driver.h"
 #include "wifi-fw-43455.h"
 #include "wifi-nvram-43455.h"
@@ -6015,6 +6016,11 @@ static int diag_format_reply(char *buf, size_t cap)
 	NETIF_FOREACH(n) {
 		char drv_stats[256];
 		int drv_len = 0;
+		const ip4_addr_t *ip4 = netif_ip4_addr(n);
+		const ip4_addr_t *gw4 = netif_ip4_gw(n);
+		uint32_t ipw = ip4_addr_get_u32(ip4);
+		uint32_t gww = ip4_addr_get_u32(gw4);
+		unsigned flags = (unsigned)n->flags;
 
 		/* Only netifs created via create_netif() have the netif_alloc
 		 * wrapper that netif_driver() expects. The loopback netif
@@ -6029,15 +6035,35 @@ static int diag_format_reply(char *buf, size_t cap)
 			}
 		}
 
+		/* ip/gw bytes are little-endian inside ip4_addr_t::addr on a
+		 * little-endian host; format via ip4addr_ntoa via printf would
+		 * pull in extra deps — manual byte unpack is fine and obvious. */
+		/* DHCP state is in netif's client_data via dhcp_set_struct /
+		 * the LWIP_NETIF_CLIENT_DATA_INDEX_DHCP slot. Standard lwip
+		 * doesn't ship a one-liner predicate so peek directly. */
+		struct dhcp *dhcp = netif_dhcp_data(n);
+
+		r = snprintf(buf + off, cap - off,
+			"netif: %c%c%u ip=%u.%u.%u.%u gw=%u.%u.%u.%u flags=0x%x%s%s%s",
+			n->name[0], n->name[1], (unsigned)n->num,
+			(unsigned)(ipw & 0xff), (unsigned)((ipw >> 8) & 0xff),
+			(unsigned)((ipw >> 16) & 0xff), (unsigned)((ipw >> 24) & 0xff),
+			(unsigned)(gww & 0xff), (unsigned)((gww >> 8) & 0xff),
+			(unsigned)((gww >> 16) & 0xff), (unsigned)((gww >> 24) & 0xff),
+			flags,
+			(flags & NETIF_FLAG_UP) ? " UP" : "",
+			(flags & NETIF_FLAG_LINK_UP) ? " LINK" : "",
+			(dhcp != NULL) ? " DHCP" : "");
+		if (r < 0 || (size_t)r >= cap - off) {
+			break;
+		}
+		off += r;
+
 		if (drv_len > 0) {
-			r = snprintf(buf + off, cap - off,
-				"netif: %c%c%u %s\n",
-				n->name[0], n->name[1], (unsigned)n->num, drv_stats);
+			r = snprintf(buf + off, cap - off, " %s\n", drv_stats);
 		}
 		else {
-			r = snprintf(buf + off, cap - off,
-				"netif: %c%c%u (no per-driver stats)\n",
-				n->name[0], n->name[1], (unsigned)n->num);
+			r = snprintf(buf + off, cap - off, " (no per-driver stats)\n");
 		}
 		if (r < 0 || (size_t)r >= cap - off) {
 			break;

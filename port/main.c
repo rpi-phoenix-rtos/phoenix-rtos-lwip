@@ -74,9 +74,23 @@ static void lwip_embed_usb_thread(void *arg)
 	 * usb_init() spawns N-1 status threads + msgthr internally; this
 	 * wrapper exits after a successful init. */
 	sleep(10);
+	/* DIAGNOSTIC SEQUENCE: rig → usb_init. The rig is known-working
+	 * from this exact worker context (proven by the rig-in-worker test
+	 * which enumerated a real USB hub). Run it first to confirm the
+	 * controller can be brought up in this process. Then attempt the
+	 * real usb_init/xhci_init path. The rig's HCRST + USBCMD=R/S
+	 * sequence leaves the controller in a running state with one slot
+	 * enabled and one device addressed — usb_init's first act
+	 * (xhci_init) does its OWN HCRST so everything is reset back, but
+	 * any state that survives HCRST (e.g. bridge translation, VL805
+	 * firmware internals) will already be in the rig-success
+	 * configuration when xhci_init's sequence runs. */
 	printf("phoenix-rtos-lwip: starting embedded USB host stack...\n");
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
+	}
+	else {
+		printf("phoenix-rtos-lwip: embedded usb_init() SUCCEEDED\n");
 	}
 	(void)lwip_embed_rig_buf;
 	(void)diag_format_xhci_bringup;

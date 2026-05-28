@@ -74,18 +74,28 @@ static void lwip_embed_usb_thread(void *arg)
 	 * usb_init() spawns N-1 status threads + msgthr internally; this
 	 * wrapper exits after a successful init. */
 	sleep(10);
-	/* DIAGNOSTIC SEQUENCE: rig → usb_init. The rig is known-working
-	 * from this exact worker context (proven by the rig-in-worker test
-	 * which enumerated a real USB hub). Run it first to confirm the
-	 * controller can be brought up in this process. Then attempt the
-	 * real usb_init/xhci_init path. The rig's HCRST + USBCMD=R/S
-	 * sequence leaves the controller in a running state with one slot
-	 * enabled and one device addressed — usb_init's first act
-	 * (xhci_init) does its OWN HCRST so everything is reset back, but
-	 * any state that survives HCRST (e.g. bridge translation, VL805
-	 * firmware internals) will already be in the rig-success
-	 * configuration when xhci_init's sequence runs. */
-	printf("phoenix-rtos-lwip: starting embedded USB host stack...\n");
+	/* MULTI-TRIAL BENCH RESULTS (2026-05-28):
+	 *   PoC full bring-up:      0/8 trials succeed
+	 *   PoC DRIVE_ONLY:         0/4 trials succeed
+	 *   PoC MaxSlotsEn=1:       0/2 trials succeed
+	 *   PoC contig scratchpad:  0/4 trials succeed
+	 *   PoC no-bridge-mmap:     0/3 trials succeed
+	 *   'X' diag rig:           2/4 trials succeed (~50% flakiness)
+	 *
+	 * The PoC consistently fails to enumerate USB while the rig
+	 * succeeds about half the time on the same hardware/boot. The
+	 * single-variable code paths I can identify as different from the
+	 * rig (MaxSlotsEn, scratchpad layout, bridge re-init, leaked
+	 * bridge mmap) are not the culprit. The remaining difference is
+	 * higher up in the stack — possibly the cumulative effect of
+	 * usb_init's earlier allocations (mutex pool, driver registration,
+	 * hub_init) changing kernel/process state vs the rig's clean-slate
+	 * mmap calls. Investigation parked pending a fresh angle.
+	 *
+	 * Keep DRIVE_ONLY here as it eliminates a few variables without
+	 * regressing. */
+	setenv("USB_HCD_PCIE_DRIVE_ONLY", "1", 1);
+	printf("phoenix-rtos-lwip: starting embedded USB host stack (DRIVE_ONLY)...\n");
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
 	}

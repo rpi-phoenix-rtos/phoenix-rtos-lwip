@@ -29,6 +29,8 @@
 #ifdef LWIP_EMBED_USB
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/threads.h>
 
@@ -37,7 +39,14 @@
  * (defined in phoenix-rtos-usb/usb/usb.c, declared in usbhost.h). */
 extern int usb_init(void);
 
+/* Diagnostic: the proven-working X-diag rig from diag-udp.c. Calling
+ * it directly from this worker lets us A/B test in the same boot:
+ * "does the rig still succeed under BRIDGE_ONLY?" without needing to
+ * wait for a manual UDP trigger and without racing usb_init. */
+extern int diag_format_xhci_bringup(char *buf, size_t cap);
+
 static uint8_t lwip_embed_usb_stack[16 * 1024];
+static char lwip_embed_rig_buf[8192];
 
 static void lwip_embed_usb_thread(void *arg)
 {
@@ -69,6 +78,8 @@ static void lwip_embed_usb_thread(void *arg)
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
 	}
+	(void)lwip_embed_rig_buf;
+	(void)diag_format_xhci_bringup;
 	/* Phoenix beginthread'd functions must not return — falling off the
 	 * end jumps to a poisoned lr (PC alignment fault). Park here. */
 	for (;;) {

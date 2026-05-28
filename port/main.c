@@ -43,14 +43,18 @@ static void lwip_embed_usb_thread(void *arg)
 {
 	(void)arg;
 	/* Pi 4 PoC: this lwip-port process hosts the USB host stack. The
-	 * boot-time `usb` daemon has already done the one-shot BCM2711 PCIe
-	 * bridge bring-up and exited; the bridge HW state persists. Setting
-	 * USB_HCD_PCIE_DRIVE_ONLY makes bcm2711_pcie_initVL805 skip the
-	 * bridge bring-up so this drive-only process never PERSTs the bridge
-	 * (which empirically poisons that process's inbound DMA on BCM2711).
+	 * boot-time `usb;--bridge-only` daemon has already done the one-shot
+	 * BCM2711 PCIe bridge bring-up and exited cleanly (without touching
+	 * the controller — see BCM2711_USB_BRIDGE_ONLY in xhci_init). We
+	 * deliberately do NOT set USB_HCD_PCIE_DRIVE_ONLY here: we want this
+	 * process to re-run bcm2711_pcie_initVL805 in-process, matching the
+	 * known-good 'X' diag rig sequence where bridge bring-up + controller
+	 * drive happen in the SAME process. Empirically a controller-drive-
+	 * only process on BCM2711 has its inbound DMA writes silently lost,
+	 * so per-process bridge init is load-bearing for this PoC.
+	 *
 	 * usb_init() spawns N-1 status threads + msgthr internally; this
 	 * wrapper exits after a successful init. */
-	setenv("USB_HCD_PCIE_DRIVE_ONLY", "1", 1);
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
 	}

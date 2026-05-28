@@ -26,6 +26,43 @@
 #include "ipsec-api.h"
 
 
+#ifdef LWIP_EMBED_USB
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/threads.h>
+
+/* Embedded Phoenix-RTOS USB host stack — see port/Makefile and the
+ * shim files in port/usb-embed/. usb_init() is the stack entry point
+ * (defined in phoenix-rtos-usb/usb/usb.c, declared in usbhost.h). */
+extern int usb_init(void);
+
+static uint8_t lwip_embed_usb_stack[16 * 1024];
+
+static void lwip_embed_usb_thread(void *arg)
+{
+	(void)arg;
+	/* Pi 4 PoC: this lwip-port process hosts the USB host stack. The
+	 * boot-time `usb` daemon has already done the one-shot BCM2711 PCIe
+	 * bridge bring-up and exited; the bridge HW state persists. Setting
+	 * USB_HCD_PCIE_DRIVE_ONLY makes bcm2711_pcie_initVL805 skip the
+	 * bridge bring-up so this drive-only process never PERSTs the bridge
+	 * (which empirically poisons that process's inbound DMA on BCM2711).
+	 * usb_init() spawns N-1 status threads + msgthr internally; this
+	 * wrapper exits after a successful init. */
+	setenv("USB_HCD_PCIE_DRIVE_ONLY", "1", 1);
+	if (usb_init() != 0) {
+		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
+	}
+	/* Phoenix beginthread'd functions must not return — falling off the
+	 * end jumps to a poisoned lr (PC alignment fault). Park here. */
+	for (;;) {
+		usleep(60u * 1000u * 1000u);
+	}
+}
+#endif
+
+
 static void mainLoop(void)
 {
 	msg_t msg = { 0 };
@@ -158,6 +195,17 @@ int main(int argc, char **argv)
 		void init_diag_udp(void);
 		init_diag_udp();
 	}
+
+#ifdef LWIP_EMBED_USB
+	/* Pi 4 PoC: spawn the embedded USB host stack in this process. The
+	 * worker thread does the setenv + usb_init() call; see the
+	 * lwip_embed_usb_thread comment above for rationale. Failure to
+	 * spawn here is not fatal — networking still works. */
+	if (beginthread(lwip_embed_usb_thread, 4, lwip_embed_usb_stack,
+			sizeof(lwip_embed_usb_stack), NULL) != 0) {
+		printf("phoenix-rtos-lwip: failed to spawn embedded USB thread\n");
+	}
+#endif
 
 	mainLoop();
 

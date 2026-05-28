@@ -1416,7 +1416,7 @@ static int diag_format_dcbaa(char *buf, size_t cap)
  * lwip-port's setup. usb-hcd's failure is then narrowed to something
  * specific in its bring-up. If R/S=1 → HSE, we hit the same wall
  * from a different process — silicon side is the leading cause again. */
-int diag_format_xhci_bringup(char *buf, size_t cap)
+static int diag_format_xhci_bringup(char *buf, size_t cap)
 {
 	int off = 0, r;
 	void *mmio_page, *dcbaa_page, *evt_page, *erst_page, *cmd_page;

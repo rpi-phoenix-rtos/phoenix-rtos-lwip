@@ -53,8 +53,19 @@ static void lwip_embed_usb_thread(void *arg)
 	 * only process on BCM2711 has its inbound DMA writes silently lost,
 	 * so per-process bridge init is load-bearing for this PoC.
 	 *
+	 * GENET-warm-up delay (10 s): the 'X' diag rig works reliably when
+	 * triggered ~minutes after boot but fails when run immediately at
+	 * lwip startup; the leading hypothesis is that the SCB→DDR fabric
+	 * shared by GENET and the PCIe RC needs GENET to be actively
+	 * cycling before the VL805's inbound DMA writes reach DRAM. Give
+	 * lwip + DHCP + ARP a head start before we open the xHCI bring-up
+	 * race. Tune downward later once we confirm whether the delay
+	 * changes the outcome.
+	 *
 	 * usb_init() spawns N-1 status threads + msgthr internally; this
 	 * wrapper exits after a successful init. */
+	sleep(10);
+	printf("phoenix-rtos-lwip: starting embedded USB host stack...\n");
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
 	}

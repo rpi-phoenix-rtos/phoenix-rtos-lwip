@@ -30,4 +30,24 @@ endif
 LWIP_MAIN_THREAD_STACKSIZE ?= 4096
 LOCAL_LDFLAGS := -z stack-size=$(LWIP_MAIN_THREAD_STACKSIZE)
 
+# Pi 4 PoC (2026-05-28): host the Phoenix-RTOS USB host stack INSIDE this
+# lwip-port process. On BCM2711 the usb daemon's own xHCI inbound DMA
+# writes are silently lost (a per-process effect we couldn't root-cause)
+# while a separate process drives the same controller fine — proven by
+# the diag-udp 'X' rig in this binary. The user-chosen PoC is to run the
+# real usb stack (libusb + xhci HCD + hub/HID/usbkbd drivers) in this
+# process to confirm a working USB keyboard can be enumerated.
+#
+# The 6 thin shim files in port/usb-embed/ each #include the corresponding
+# source from phoenix-rtos-usb/usb/ — they give the embedded build its own
+# .o paths so Phoenix's source-path-keyed object cache doesn't reuse the
+# usb daemon's .o (which has main()). USB_NO_MAIN excludes main() from
+# the embedded usb.c; usb_init() is the entry point lwip-port will call.
+ifeq ($(PCI_EXPRESS_BCM2711_INDEXED_CFG),y)
+  USB_HOST_INCLUDE := $(LOCAL_PATH)../../phoenix-rtos-usb/usb
+  SRCS += $(addprefix $(LOCAL_PATH)usb-embed/,usb.c dev.c drv.c hcd.c hub.c mem.c)
+  LOCAL_CFLAGS += -DUSB_NO_MAIN -I$(USB_HOST_INCLUDE)
+  LIBS += libusbxhci libusbdrv-usbkbd libusb
+endif
+
 include $(binary.mk)

@@ -838,21 +838,29 @@ static void genet_dhcpStartCb(void *arg)
 	netif_set_default(netif);
 
 	/* TODO(TD-Eth-DHCP): autonomous DHCP. On this lwip-port, dhcp_start
-	 * resets the netif's IP to 0.0.0.0 immediately, so the DISCOVER
-	 * never reaches the wire. A static address keeps the netif usable
-	 * while the lwip-port internals are investigated separately.
-	 * 10.42.0.99 sits outside the host dnsmasq pool (.10..20) on the
-	 * netboot bridge so it won't collide with leased addresses.
+	 * resets the netif's IP to 0.0.0.0 immediately, so the diag-udp
+	 * probe (hard-coded against 10.42.0.99) cannot reach the Pi
+	 * anymore — and we don't yet have host-side dnsmasq-lease tracking
+	 * keyed on the Pi MAC to discover the DHCP-assigned IP.
 	 *
-	 * 2026-05-28 investigation: dhcp_start() called from this
-	 * tcpip-callback context returns ERR_OK (lwip-port reaches link-
-	 * up + dhcp_start: 0 in the boot log), but verifying the full
-	 * DISCOVER → OFFER → REQUEST → ACK round-trip needs (a) a
-	 * longer post-link-up observation window than test-cycle-netboot
-	 * currently grants, AND (b) host-side dnsmasq logging keyed on
-	 * the Pi's MAC. Both prerequisites are open. Revisit with a
-	 * tcpdump-on-host + extended capture once the test infrastructure
-	 * supports those. */
+	 * Verified on 2026-05-28 with the new `--probe q` automation
+	 * (artifact `2026-05-28-...-dhcp-active-probe.txt`):
+	 *  - `dhcp_start` returns ERR_OK from the tcpip-thread callback
+	 *  - lwip-port prints "dhcp_start: 0; netif waits for OFFER"
+	 *  - Pi loses the static 10.42.0.99 IP
+	 *  - probe ICMP to 10.42.0.99 times out (Pi is at 0.0.0.0 or a
+	 *    DHCP-assigned address we can't discover from the host)
+	 *
+	 * Static 10.42.0.99 fallback is the working configuration. To
+	 * close TD-Eth-DHCP, the next session needs to:
+	 *  (a) wire up host-side dnsmasq lease logging keyed on
+	 *      MAC dc:a6:32:3c:dd:f1, and
+	 *  (b) read the assigned IP from dnsmasq and pass it to the
+	 *      probe script (or teach diag-udp-probe.sh to ARP-scan
+	 *      the /24 for the Pi MAC first).
+	 *
+	 * 10.42.0.99 sits outside the host dnsmasq pool (.10..20) on the
+	 * netboot bridge so it won't collide with leased addresses. */
 	IP4_ADDR(&ip, 10, 42, 0, 99);
 	IP4_ADDR(&mask, 255, 255, 255, 0);
 	IP4_ADDR(&gw, 10, 42, 0, 1);

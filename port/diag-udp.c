@@ -326,6 +326,64 @@ static void diag_gpioSetPull(volatile uint8_t *base, unsigned pin, unsigned pull
 }
 
 
+/* BCM2711 PCIe root-complex host register window (0xfd500000). The RC
+ * latches the first failing CPU->PCIe (outbound) access in error-status
+ * registers at 0x6004..0x6020 (Linux pcie-brcmstb dumps these): a VALID
+ * bit, CFG-vs-MEM, read-vs-write, the offending address, and the cause.
+ * These latch regardless of whether the CPU SError is masked, so we can
+ * read them over UDP after the boot settles to classify the USB-bring-up
+ * external-abort SError (see docs/notes/2026-05-29-usb-reanalysis.md). */
+#define DIAG_PCIE_RC_BASE 0xfd500000ull
+#define DIAG_PCIE_RC_SIZE 0x10000u
+
+static int diag_format_pcie_err(char *buf, size_t cap)
+{
+	void *page;
+	int off = 0, r;
+	static const uint32_t errOffs[] = { 0x6004u, 0x6008u, 0x600cu, 0x6010u, 0x6014u, 0x6018u, 0x601cu, 0x6020u };
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 pcie-err\n");
+	if (r < 0 || (size_t)r >= cap - off) {
+		return -1;
+	}
+	off += r;
+
+	page = mmap(NULL, DIAG_PCIE_RC_SIZE, PROT_READ | PROT_WRITE,
+		MAP_DEVICE | MAP_UNCACHED | MAP_PHYSMEM | MAP_ANONYMOUS,
+		-1, DIAG_PCIE_RC_BASE);
+	if (page == MAP_FAILED) {
+		r = snprintf(buf + off, cap - off, "error: RC mmap failed\n.\n");
+		return off + (r > 0 ? r : 0);
+	}
+
+	{
+		volatile uint8_t *base = (volatile uint8_t *)page;
+		unsigned k;
+
+		r = snprintf(buf + off, cap - off, "MISC_CTRL=0x%08x MISC_STATUS=0x%08x\n",
+			*(volatile uint32_t *)(base + 0x4008u),
+			*(volatile uint32_t *)(base + 0x4068u));
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+
+		for (k = 0; k < (sizeof(errOffs) / sizeof(errOffs[0])); k++) {
+			r = snprintf(buf + off, cap - off, "[0x%04x]=0x%08x\n",
+				errOffs[k], *(volatile uint32_t *)(base + errOffs[k]));
+			if (r > 0 && (size_t)r < cap - off) {
+				off += r;
+			}
+		}
+	}
+
+	munmap(page, DIAG_PCIE_RC_SIZE);
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < cap - off) {
+		off += r;
+	}
+	return off;
+}
+
 static int diag_format_gpio(char *buf, size_t cap)
 {
 	void *page;
@@ -6184,6 +6242,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'G') {
 		len = diag_format_sdio_fwrelease(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'P') {
+		len = diag_format_pcie_err(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

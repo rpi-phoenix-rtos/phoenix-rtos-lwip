@@ -54,14 +54,15 @@ static void lwip_embed_usb_thread(void *arg)
 	 * only process on BCM2711 has its inbound DMA writes silently lost,
 	 * so per-process bridge init is load-bearing for this PoC.
 	 *
-	 * GENET-warm-up delay (10 s): the 'X' diag rig works reliably when
-	 * triggered ~minutes after boot but fails when run immediately at
-	 * lwip startup; the leading hypothesis is that the SCB→DDR fabric
-	 * shared by GENET and the PCIe RC needs GENET to be actively
-	 * cycling before the VL805's inbound DMA writes reach DRAM. Give
-	 * lwip + DHCP + ARP a head start before we open the xHCI bring-up
-	 * race. Tune downward later once we confirm whether the delay
-	 * changes the outcome.
+	 * GENET-warm-up delay (10 s): gives lwip + DHCP + ARP a head start
+	 * before the xHCI bring-up. NOTE (2026-05-29): the old rationale —
+	 * "the SCB→DDR fabric needs GENET actively cycling before the VL805's
+	 * inbound DMA writes reach DRAM" — was DISPROVEN. A sustained GENET TX
+	 * DMA flood (14877 broadcast sends, 0 failures, confirmed active via
+	 * debug()) running concurrently with the bring-up still produced
+	 * `first event @idx -1`. The rig's "works when triggered later"
+	 * correlation is most likely its own ~50% bridge flakiness, not
+	 * DMA-enablement. See docs/notes/2026-05-29-usb-reanalysis.md.
 	 *
 	 * usb_init() spawns N-1 status threads + msgthr internally; this
 	 * wrapper exits after a successful init. */

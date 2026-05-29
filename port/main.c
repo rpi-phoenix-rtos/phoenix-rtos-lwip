@@ -45,14 +45,18 @@ static void lwip_embed_usb_thread(void *arg)
 	(void)arg;
 	/* Pi 4 PoC: this lwip-port process hosts the USB host stack. The
 	 * boot-time `usb;--bridge-only` daemon has already done the one-shot
-	 * BCM2711 PCIe bridge bring-up and exited cleanly (without touching
-	 * the controller — see BCM2711_USB_BRIDGE_ONLY in xhci_init). We
-	 * deliberately do NOT set USB_HCD_PCIE_DRIVE_ONLY here: we want this
-	 * process to re-run bcm2711_pcie_initVL805 in-process, matching the
-	 * known-good 'X' diag rig sequence where bridge bring-up + controller
-	 * drive happen in the SAME process. Empirically a controller-drive-
-	 * only process on BCM2711 has its inbound DMA writes silently lost,
-	 * so per-process bridge init is load-bearing for this PoC.
+	 * BCM2711 PCIe bridge bring-up and parked (without touching the
+	 * controller — see BCM2711_USB_BRIDGE_ONLY in xhci_init). This thread
+	 * then sets USB_HCD_PCIE_DRIVE_ONLY (below) so it drives ONLY the
+	 * controller on the already-brought-up bridge, rather than re-running
+	 * the bridge bring-up itself. (An earlier approach had this process
+	 * re-run bcm2711_pcie_initVL805 in-process; DRIVE_ONLY was adopted to
+	 * eliminate that bridge re-init as a variable.)
+	 *
+	 * NOTE: neither arrangement enumerates USB — the controller runs but
+	 * its inbound DMA event-ring writes never land (`first event @idx -1`,
+	 * rc=-110). The root cause is unresolved and JTAG-gated; see
+	 * docs/notes/2026-05-29-usb-reanalysis.md.
 	 *
 	 * GENET-warm-up delay (10 s): gives lwip + DHCP + ARP a head start
 	 * before the xHCI bring-up. NOTE (2026-05-29): the old rationale —

@@ -205,6 +205,40 @@ static int diag_threads_cmp(const void *a, const void *b)
  * The cpuTime delta between two queries divided by wall-clock delta is
  * the per-thread fraction-of-a-core consumed; sum across CPU-bound
  * threads is the cross-CPU distribution metric for SMP Phase E. */
+/* 'm' — live memory snapshot of THIS (lwip-port) process and the system page
+ * allocator. Used to diagnose the hub_conf OOM: a tiny calloc fails because
+ * userspace mmap is eager-backed, so the discriminator is whether physical
+ * pages (page_free) are gross-exhausted vs. the per-process map free bytes
+ * (maps_free) being depleted/fragmented. page_* are global page-allocator
+ * counts; maps_* and entry_* are this process's. */
+static int diag_format_meminfo(char *buf, size_t cap)
+{
+	meminfo_t info;
+
+	memset(&info, 0, sizeof(info));
+	info.page.mapsz = -1;
+	info.entry.mapsz = -1;
+	info.entry.kmapsz = -1;
+	info.maps.mapsz = -1;
+
+	meminfo(&info);
+
+	return snprintf(buf, cap,
+		"PHX-DIAG/1 meminfo\n"
+		"page_alloc: %u\n"
+		"page_free: %u\n"
+		"page_boot: %u\n"
+		"page_sz: %u\n"
+		"proc_entries_used: %u\n"
+		"proc_entries_total: %u\n"
+		"maps_total: %zu\n"
+		"maps_free: %zu\n",
+		info.page.alloc, info.page.free, info.page.boot, info.page.sz,
+		info.entry.total - info.entry.free, info.entry.total,
+		info.maps.total, info.maps.free);
+}
+
+
 static int diag_format_threads(char *buf, size_t cap)
 {
 	enum { TOP_N = 12, MAX_THREADS = 128 };
@@ -6447,6 +6481,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'P') {
 		len = diag_format_pcie_err(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'm') {
+		len = diag_format_meminfo(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

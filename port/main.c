@@ -69,8 +69,12 @@ static void lwip_embed_usb_thread(void *arg)
 	 * DMA-enablement. See docs/notes/2026-05-29-usb-reanalysis.md.
 	 *
 	 * usb_init() spawns N-1 status threads + msgthr internally; this
-	 * wrapper exits after a successful init. */
-	sleep(10);
+	 * wrapper exits after a successful init.
+	 *
+	 * (2026-05-30) Trimmed 10 s -> 3 s: the GENET-warm-up rationale is
+	 * disproven and the long delay only pushed USB enumeration past the UART
+	 * capture window. Keep a short settle so lwip/DHCP are up first. */
+	sleep(3);
 	/* MULTI-TRIAL BENCH RESULTS (2026-05-28):
 	 *   PoC full bring-up:      0/8 trials succeed
 	 *   PoC DRIVE_ONLY:         0/4 trials succeed
@@ -101,8 +105,10 @@ static void lwip_embed_usb_thread(void *arg)
 	/* Observability: defer the rig-bringup usb_init another 18 s so it runs
 	 * in QUIET UART (after lwip/DHCP settle + the multi-core boot logging
 	 * stops), making the rig-path debug() markers readable instead of
-	 * interleaved garble. Temporary, for the Stage-1 experiment only. */
-	sleep(18);
+	 * interleaved garble. Temporary, for the Stage-1 experiment only.
+	 * (2026-05-30) Trimmed 18 s -> 2 s so enumeration lands inside the UART
+	 * capture window; the quiet-window need is gone now markers are sparse. */
+	sleep(2);
 	printf("phoenix-rtos-lwip: ===== RIG-BRINGUP usb_init starting (quiet window) =====\n");
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");

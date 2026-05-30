@@ -1649,8 +1649,14 @@ static int diag_xhci_bringupCore(char *buf, size_t cap, xhci_rig_handoff_t *hand
 			}
 		}
 
-		/* 2. CONFIG.MaxSlotsEn = 1. */
-		*(volatile uint32_t *)(op + USB_XHCI_OP_CONFIG_MAXSLOTS) = 1u;
+		/* 2. CONFIG.MaxSlotsEn. Enable several device slots, not just one:
+		 * the external hub takes slot 1, and any device BEHIND it (e.g. a
+		 * keyboard) needs its OWN slot. With MaxSlotsEn=1 a second EnableSlot
+		 * returns completion code 9 "No Slots Available". The DCBAA is a full
+		 * page (512 entries) so it already has room; unused entries stay 0
+		 * (slot disabled) until EnableSlot assigns them. 8 is ample for the
+		 * hub + a few downstream devices. */
+		*(volatile uint32_t *)(op + USB_XHCI_OP_CONFIG_MAXSLOTS) = 8u;
 
 		/* 3. DCBAAP. Bit 0..5 must be 0 (64-byte aligned). dmammap
 		 * returns page-aligned so this is satisfied. */

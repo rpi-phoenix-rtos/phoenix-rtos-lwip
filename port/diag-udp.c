@@ -42,6 +42,7 @@
 #include "netif-driver.h"
 #include "wifi-fw-43455.h"
 #include "wifi-nvram-43455.h"
+#include "usb-embed/xhci-rig-handoff.h"
 
 #include <sys/mman.h>
 
@@ -1475,7 +1476,7 @@ static int diag_format_dcbaa(char *buf, size_t cap)
  * lwip-port's setup. usb-hcd's failure is then narrowed to something
  * specific in its bring-up. If R/S=1 → HSE, we hit the same wall
  * from a different process — silicon side is the leading cause again. */
-static int diag_format_xhci_bringup(char *buf, size_t cap)
+static int diag_xhci_bringupCore(char *buf, size_t cap, xhci_rig_handoff_t *handoff)
 {
 	int off = 0, r;
 	void *mmio_page, *dcbaa_page, *evt_page, *erst_page, *cmd_page;
@@ -1789,6 +1790,62 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 				if (ty == 33u) {
 					found_idx = k;
 				}
+			}
+
+			/* Stage-1 rig handoff: the No-Op landed (found_idx >= 0) and
+			 * the controller is RUNNING (this whole block is gated on
+			 * post_usbsts having no HSE/HCH). Transfer ownership of the
+			 * live MMIO + DMA structures to the caller and return SUCCESS
+			 * immediately — skip the rig's own EnableSlot/AddrDev/GetDesc
+			 * enumeration AND the munmap teardown at the end of the
+			 * function (the framework HCD now owns this memory). On No-Op
+			 * failure with a handoff requested, free everything and return
+			 * a negative error. */
+			if (handoff != NULL) {
+				if (found_idx < 0) {
+					if (scratch_bufs_page != MAP_FAILED) {
+						munmap(scratch_bufs_page, (size_t)n_scratch * _PAGE_SIZE);
+					}
+					if (scratch_arr_page != MAP_FAILED) {
+						munmap(scratch_arr_page, _PAGE_SIZE);
+					}
+					munmap(cmd_page, _PAGE_SIZE);
+					munmap(erst_page, _PAGE_SIZE);
+					munmap(evt_page, _PAGE_SIZE);
+					munmap(dcbaa_page, _PAGE_SIZE);
+					munmap(mmio_page, USB_XHCI_MMIO_SIZE);
+					return -1;
+				}
+
+				handoff->mmioSize = USB_XHCI_MMIO_SIZE;
+				handoff->caplength = caplength;
+				handoff->rtsoff = rtsoff;
+				handoff->dboff = dboff;
+				handoff->nslots = hcsparams1 & 0xFFu;
+				handoff->nports = (hcsparams1 >> 24) & 0xFFu;
+				handoff->ac64 = ((hccparams1 & 0x1u) != 0u) ? 1u : 0u;
+
+				handoff->dcbaa = dcbaa_page;
+				handoff->dcbaaPhys = (uint64_t)dcbaa_pa;
+				handoff->cmdRing = cmd_page;
+				handoff->cmdRingPhys = (uint64_t)cmd_pa;
+				handoff->cmdRingCount = 256u;
+				handoff->cmdCycleState = 1u;
+				handoff->eventRing = evt_page;
+				handoff->eventRingPhys = (uint64_t)evt_pa;
+				handoff->eventRingTrbs = 256u;
+				handoff->eventCycleState = 1u;
+				handoff->erst = erst_page;
+				handoff->erstPhys = (uint64_t)erst_pa;
+				handoff->scratchpadArray = scratch_arr_page;
+				handoff->scratchpadArrayPhys = (uint64_t)scratch_arr_pa;
+				handoff->nscratchpad = n_scratch;
+
+				/* Publish mmio LAST: the exported wrapper treats a
+				 * non-NULL out->mmio as the success signal, so it must
+				 * only become visible once every other field is set. */
+				handoff->mmio = mmio_page;
+				return 0;
 			}
 
 			r = snprintf(buf + off, cap - off,
@@ -2183,6 +2240,35 @@ static int diag_format_xhci_bringup(char *buf, size_t cap)
 		off += r;
 	}
 	return off;
+}
+
+
+/* Thin wrapper preserving the original 'X' UDP diagnostic: run the full
+ * inline bring-up + enumeration and emit the human-readable report, with
+ * no handoff. */
+static int diag_format_xhci_bringup(char *buf, size_t cap)
+{
+	return diag_xhci_bringupCore(buf, cap, NULL);
+}
+
+
+/* Exported Stage-1 entry point (declared in xhci-rig-handoff.h): bring
+ * the VL805 xHCI controller to a verified-RUNNING state via the proven
+ * rig sequence and hand the live MMIO + DMA structures to the framework
+ * HCD. The core writes its human-readable byte-count into the scratch
+ * buffer for the 'X' path; on the handoff path success is signalled by
+ * out->mmio being set (the core publishes it LAST), so we gate on that
+ * rather than the return value. */
+int diag_xhci_rigBringupHandoff(xhci_rig_handoff_t *out)
+{
+	static char scratch[2048];
+
+	if (out == NULL) {
+		return -1;
+	}
+	memset(out, 0, sizeof(*out));
+
+	return (diag_xhci_bringupCore(scratch, sizeof(scratch), out) == 0 && out->mmio != NULL) ? 0 : -1;
 }
 
 

@@ -1697,7 +1697,59 @@ static int diag_xhci_bringupCore(char *buf, size_t cap, xhci_rig_handoff_t *hand
 			off += r;
 		}
 
-		/* FIX-14 decisive probe: only meaningful if the controller is
+		if (handoff != NULL) {
+				/* Stage-1 handoff (build-on-rig): hand the framework HCD a
+				 * PRISTINE, RUNNING controller. We deliberately do NOT run
+				 * the No-Op probe or any halt/re-run here — halting + a
+				 * second R/S wedges this VL805 (observed: the fresh-page
+				 * retry and the re-arm both hung the system at ~50 s). The
+				 * cmd + event rings are still zeroed (controller enqueue ==
+				 * framework dequeue == idx 0, cycle 1), so the framework's
+				 * EnableSlot is the first command and its completion lands
+				 * at event idx 0. The rig's ~50% bring-up flakiness means
+				 * some boots hand off a non-working controller — re-test
+				 * across boots. */
+				if ((post_usbsts & (USB_XHCI_USBSTS_HSE | USB_XHCI_USBSTS_HCH)) != 0u) {
+					if (scratch_bufs_page != MAP_FAILED) {
+						munmap(scratch_bufs_page, (size_t)n_scratch * _PAGE_SIZE);
+					}
+					if (scratch_arr_page != MAP_FAILED) {
+						munmap(scratch_arr_page, _PAGE_SIZE);
+					}
+					munmap(cmd_page, _PAGE_SIZE);
+					munmap(erst_page, _PAGE_SIZE);
+					munmap(evt_page, _PAGE_SIZE);
+					munmap(dcbaa_page, _PAGE_SIZE);
+					munmap(mmio_page, USB_XHCI_MMIO_SIZE);
+					return -1;
+				}
+				handoff->mmioSize = USB_XHCI_MMIO_SIZE;
+				handoff->caplength = caplength;
+				handoff->rtsoff = rtsoff;
+				handoff->dboff = *(volatile uint32_t *)(base + USB_XHCI_CAP_DBOFF) & ~0x3u;
+				handoff->nslots = hcsparams1 & 0xFFu;
+				handoff->nports = (hcsparams1 >> 24) & 0xFFu;
+				handoff->ac64 = ((hccparams1 & 0x1u) != 0u) ? 1u : 0u;
+				handoff->dcbaa = dcbaa_page;
+				handoff->dcbaaPhys = (uint64_t)dcbaa_pa;
+				handoff->cmdRing = cmd_page;
+				handoff->cmdRingPhys = (uint64_t)cmd_pa;
+				handoff->cmdRingCount = 256u;
+				handoff->cmdCycleState = 1u;
+				handoff->eventRing = evt_page;
+				handoff->eventRingPhys = (uint64_t)evt_pa;
+				handoff->eventRingTrbs = 256u;
+				handoff->eventCycleState = 1u;
+				handoff->erst = erst_page;
+				handoff->erstPhys = (uint64_t)erst_pa;
+				handoff->scratchpadArray = scratch_arr_page;
+				handoff->scratchpadArrayPhys = (uint64_t)scratch_arr_pa;
+				handoff->nscratchpad = n_scratch;
+				handoff->mmio = mmio_page; /* publish last == success signal */
+				return 0;
+			}
+
+			/* FIX-14 decisive probe: only meaningful if the controller is
 		 * RUNNING (not HSE/halted). Place a No-Op Command TRB (type 23)
 		 * in the command ring, ring doorbell 0, wait, then look for the
 		 * Command Completion Event (type 33) the controller should DMA
@@ -1817,7 +1869,71 @@ static int diag_xhci_bringupCore(char *buf, size_t cap, xhci_rig_handoff_t *hand
 					return -1;
 				}
 
-				handoff->mmioSize = USB_XHCI_MMIO_SIZE;
+/* CAVEAT-#1 FIX — re-arm clean rings before handoff. The
+					 * No-Op verification above advanced the controller's
+					 * event-ring producer past idx 0, but the framework HCD's
+					 * cmdExec dequeues from event idx 0 and won't advance past
+					 * a cycle mismatch -> it would never see its EnableSlot
+					 * completion (a guaranteed false negative). Halt, zero the
+					 * cmd + event rings, re-publish CRCR + re-commit ERST/ERDP
+					 * (writing ERSTBA resets the controller's event-ring
+					 * producer to the segment base, cycle 1), then re-run.
+					 * The framework then sees a pristine ring (controller
+					 * enqueue == framework dequeue == idx 0, cycle 1).
+					 * NB: this is a 2nd R/S; if the bring-up's ~50% bridge
+					 * flakiness re-rolls here the handoff fails and the boot
+					 * is re-tested. */
+					*(volatile uint32_t *)(op + 0x00) =
+						*(volatile uint32_t *)(op + 0x00) & ~USB_XHCI_USBCMD_RS;
+					for (i = 0; i < 1000000u; ++i) {
+						if ((*(volatile uint32_t *)(op + 0x04) & USB_XHCI_USBSTS_HCH) != 0u) {
+							break;
+						}
+					}
+					memset(cmd_page, 0, _PAGE_SIZE);
+					memset(evt_page, 0, _PAGE_SIZE);
+					__asm__ volatile("dsb sy" ::: "memory");
+					*(volatile uint32_t *)(op + 0x1C) = (uint32_t)((uint64_t)cmd_pa >> 32);
+					*(volatile uint32_t *)(op + 0x18) = (uint32_t)(cmd_pa & 0xFFFFFFC0u) | 1u;
+					*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERSTSZ) = 1u;
+					*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERDP_LO) = (uint32_t)(evt_pa & 0xFFFFFFF0u);
+					*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERDP_HI) = (uint32_t)((uint64_t)evt_pa >> 32);
+					*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERSTBA_LO) = (uint32_t)(erst_pa & 0xFFFFFFC0u);
+					*(volatile uint32_t *)(rt + USB_XHCI_RT_IR0_ERSTBA_HI) = (uint32_t)((uint64_t)erst_pa >> 32);
+					__asm__ volatile("dsb sy" ::: "memory");
+					usleep(10000);
+					*(volatile uint32_t *)(op + 0x00) =
+						USB_XHCI_USBCMD_RS | USB_XHCI_USBCMD_INTE | USB_XHCI_USBCMD_HSEE;
+					for (i = 0; i < 1000000u; ++i) {
+						uint32_t s = *(volatile uint32_t *)(op + 0x04);
+						if ((s & USB_XHCI_USBSTS_HSE) != 0u) {
+							break; /* re-run failed */
+						}
+						if ((s & USB_XHCI_USBSTS_HCH) == 0u) {
+							break; /* running */
+						}
+					}
+					{
+						uint32_t s = *(volatile uint32_t *)(op + 0x04);
+						if (((s & USB_XHCI_USBSTS_HSE) != 0u) || ((s & USB_XHCI_USBSTS_HCH) != 0u)) {
+							/* re-arm failed (HSE or still halted) — caller can't
+							 * use this handoff; free everything and fail. */
+							if (scratch_bufs_page != MAP_FAILED) {
+								munmap(scratch_bufs_page, (size_t)n_scratch * _PAGE_SIZE);
+							}
+							if (scratch_arr_page != MAP_FAILED) {
+								munmap(scratch_arr_page, _PAGE_SIZE);
+							}
+							munmap(cmd_page, _PAGE_SIZE);
+							munmap(erst_page, _PAGE_SIZE);
+							munmap(evt_page, _PAGE_SIZE);
+							munmap(dcbaa_page, _PAGE_SIZE);
+							munmap(mmio_page, USB_XHCI_MMIO_SIZE);
+							return -1;
+						}
+					}
+
+					handoff->mmioSize = USB_XHCI_MMIO_SIZE;
 				handoff->caplength = caplength;
 				handoff->rtsoff = rtsoff;
 				handoff->dboff = dboff;

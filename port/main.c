@@ -92,7 +92,18 @@ static void lwip_embed_usb_thread(void *arg)
 	 * Keep DRIVE_ONLY here as it eliminates a few variables without
 	 * regressing. */
 	setenv("USB_HCD_PCIE_DRIVE_ONLY", "1", 1);
-	printf("phoenix-rtos-lwip: starting embedded USB host stack (DRIVE_ONLY)...\n");
+	/* Stage 1 (build-on-rig): bring the controller up via the proven 'X'
+	 * rig sequence, then let the framework HCD drive EnableSlot/enumeration.
+	 * Decisive test of architecture (A). See docs/notes/2026-05-30-usb-rig-
+	 * bringup-build-plan.md + xhci-rig-handoff.h. Set in THIS (lwip) process
+	 * so the weak diag_xhci_rigBringupHandoff symbol resolves. */
+	setenv("XHCI_USE_RIG_BRINGUP", "1", 1);
+	/* Observability: defer the rig-bringup usb_init another 18 s so it runs
+	 * in QUIET UART (after lwip/DHCP settle + the multi-core boot logging
+	 * stops), making the rig-path debug() markers readable instead of
+	 * interleaved garble. Temporary, for the Stage-1 experiment only. */
+	sleep(18);
+	printf("phoenix-rtos-lwip: ===== RIG-BRINGUP usb_init starting (quiet window) =====\n");
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
 	}

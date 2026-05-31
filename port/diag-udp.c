@@ -6382,6 +6382,32 @@ static int diag_format_reply(char *buf, size_t cap)
 }
 
 
+/* TODO(#127): USB-keyboard input observability. usbkbd is linked into this lwip
+ * image (libusbdrv-usbkbd) and exports these counters; querying 'k' over the
+ * network localizes where a typed byte dies without depending on the slow UART
+ * or the fbcon. insertions>0 = keyboard enumerated; opens>0 = /dev/kbd0 opened
+ * so URBs are submitted (polling); reports>0 = HID reports actually arrived
+ * (input reaches the driver — any further loss is in the kbd->tty bridge or psh).
+ * Remove with the usbkbd diag counters once the input path is confirmed. */
+static int diag_format_kbd(char *buf, size_t cap)
+{
+	extern volatile unsigned usbkbd_diagInsertions;
+	extern volatile unsigned usbkbd_diagOpens;
+	extern volatile unsigned usbkbd_diagReports;
+	extern volatile uint8_t usbkbd_diagLastReport[8];
+
+	return snprintf(buf, cap,
+		"PHX-DIAG/1 kbd\n"
+		"kbd: insertions=%u opens=%u reports=%u\n"
+		"last=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+		usbkbd_diagInsertions, usbkbd_diagOpens, usbkbd_diagReports,
+		usbkbd_diagLastReport[0], usbkbd_diagLastReport[1],
+		usbkbd_diagLastReport[2], usbkbd_diagLastReport[3],
+		usbkbd_diagLastReport[4], usbkbd_diagLastReport[5],
+		usbkbd_diagLastReport[6], usbkbd_diagLastReport[7]);
+}
+
+
 static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	const ip_addr_t *addr, u16_t port)
 {
@@ -6490,6 +6516,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'm') {
 		len = diag_format_meminfo(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'k') {
+		len = diag_format_kbd(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

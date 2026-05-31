@@ -47,7 +47,7 @@ ifeq ($(PCI_EXPRESS_BCM2711_INDEXED_CFG),y)
   USB_HOST_INCLUDE := $(LOCAL_PATH)../../phoenix-rtos-usb/usb
   SRCS += $(addprefix $(LOCAL_PATH)usb-embed/,usb.c dev.c drv.c hcd.c hub.c mem.c)
   LOCAL_CFLAGS += -DUSB_NO_MAIN -DLWIP_EMBED_USB -I$(USB_HOST_INCLUDE)
-  LIBS += libusbxhci libusbdrv-usbkbd libusb
+  LIBS += libusbxhci libusbdrv-usbkbd libusbdrv-usbmouse libusb
 endif
 
 include $(binary.mk)

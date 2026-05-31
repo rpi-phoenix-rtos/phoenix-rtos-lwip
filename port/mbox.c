@@ -16,6 +16,7 @@
 #include <sys/threads.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -49,6 +50,12 @@ err_t sys_mbox_new(sys_mbox_t *mbox, int size)
 
 	mbox->sz = size;
 	mbox->head = mbox->tail = 0;
+
+	/* TODO(#121): log mbox + ring at allocation so a later wild-load fault in
+	 * mbox_tryfetch is decisive: if the in-tryfetch guard fires, head was
+	 * corrupted (ring intact); if it faults anyway, compare the exception far
+	 * against these ring values to confirm ring itself was overwritten. */
+	printf("mbox NEW: mbox=%p ring=%p sz=%d\n", (void *)mbox, (void *)mbox->ring, size);
 
 	return ERR_OK;
 }
@@ -122,6 +129,18 @@ static int mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 
 	if (mbox_is_full(mbox))
 		condSignal(mbox->pop_cond);
+
+	/* TODO(#121): the mbox struct has been seen corrupted during USB enumeration
+	 * (a libc-heap overflow, likely USB-side, clobbers ring/head -> a wild
+	 * ring[head] load faulted in mbox_tryfetch). Validate before dereferencing:
+	 * log the corrupt state (clue to the writer) and recover (report empty)
+	 * instead of crashing the lwip process. This is a survive-not-crash guard,
+	 * not the root-cause fix. */
+	if ((mbox->ring == NULL) || (mbox->sz == 0) || (mbox->head >= mbox->sz)) {
+		printf("mbox CORRUPT in tryfetch: mbox=%p ring=%p head=%zu tail=%zu sz=%zu\n",
+			(void *)mbox, (void *)mbox->ring, mbox->head, mbox->tail, mbox->sz);
+		return 0;
+	}
 
 	*msg = mbox->ring[mbox->head];
 	mbox->head = WRAP(mbox, head);

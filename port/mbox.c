@@ -15,6 +15,7 @@
 
 #include <sys/threads.h>
 #include <sys/time.h>
+#include <sys/mman.h> /* va2pa — TODO(#129) corruption-PA diagnostic */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,15 @@ err_t sys_mbox_new(sys_mbox_t *mbox, int size)
 	 * mbox_tryfetch is decisive: if the in-tryfetch guard fires, head was
 	 * corrupted (ring intact); if it faults anyway, compare the exception far
 	 * against these ring values to confirm ring itself was overwritten. */
-	printf("mbox NEW: mbox=%p ring=%p sz=%d\n", (void *)mbox, (void *)mbox->ring, size);
+	/* TODO(#129): also print PHYSICAL addresses. mboxes are created early (clean
+	 * UART, before the USB enumeration flood) and live in pinned heap, so this is
+	 * the reliable way to learn the victim's PA. Compare against the USB DMA pool
+	 * PAs (xhci DMAMAP, ~0x32xxxxx): if a mbox/ring PA falls in that range, the
+	 * uncached USB pool physically ALIASES lwIP's cached heap (the #26 pmap bug)
+	 * and the controller's DMA corrupts it — independent of the corruption firing. */
+	printf("mbox NEW: mbox=%p (pa=0x%llx) ring=%p (pa=0x%llx) sz=%d\n",
+		(void *)mbox, (unsigned long long)va2pa((void *)mbox),
+		(void *)mbox->ring, (unsigned long long)va2pa((void *)mbox->ring), size);
 
 	return ERR_OK;
 }
@@ -137,8 +146,23 @@ static int mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 	 * instead of crashing the lwip process. This is a survive-not-crash guard,
 	 * not the root-cause fix. */
 	if ((mbox->ring == NULL) || (mbox->sz == 0) || (mbox->head >= mbox->sz)) {
-		printf("mbox CORRUPT in tryfetch: mbox=%p ring=%p head=%zu tail=%zu sz=%zu\n",
-			(void *)mbox, (void *)mbox->ring, mbox->head, mbox->tail, mbox->sz);
+		/* TODO(#129): rate-limit — once corrupted, every poll re-detects and the
+		 * flood back-pressures the UART (and wedges the host). Print the first few
+		 * with the struct's PHYSICAL address: the #121/#129 hunt needs to know
+		 * whether va2pa(mbox) lands inside a programmed USB DMA region (DMA overrun)
+		 * or nowhere near one (CPU write). va2pa is cheap and the struct is one
+		 * cache line, so its PA localises the victim for the overlap test. */
+		static unsigned corruptCount = 0u;
+		if (corruptCount == 0u) {
+			/* ONE short line only — the flood is what garbles the UART, and this
+			 * single datum (the victim's PA vs the USB DMA pool at 0x32f1000+) is
+			 * the DMA-overrun-vs-CPU-write discriminator (#129). */
+			printf("MBOXPA pa=0x%llx ringpa=0x%llx h=%zu sz=%zu\n",
+				(unsigned long long)va2pa((void *)mbox),
+				(unsigned long long)va2pa((void *)mbox->ring),
+				mbox->head, mbox->sz);
+		}
+		corruptCount++;
 		return 0;
 	}
 

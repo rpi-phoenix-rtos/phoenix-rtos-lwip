@@ -43,11 +43,18 @@ LOCAL_LDFLAGS := -z stack-size=$(LWIP_MAIN_THREAD_STACKSIZE)
 # .o paths so Phoenix's source-path-keyed object cache doesn't reuse the
 # usb daemon's .o (which has main()). USB_NO_MAIN excludes main() from
 # the embedded usb.c; usb_init() is the entry point lwip-port will call.
-ifeq ($(PCI_EXPRESS_BCM2711_INDEXED_CFG),y)
-  USB_HOST_INCLUDE := $(LOCAL_PATH)../../phoenix-rtos-usb/usb
-  SRCS += $(addprefix $(LOCAL_PATH)usb-embed/,usb.c dev.c drv.c hcd.c hub.c mem.c)
-  LOCAL_CFLAGS += -DUSB_NO_MAIN -DLWIP_EMBED_USB -I$(USB_HOST_INCLUDE)
-  LIBS += libusbxhci libusbdrv-usbkbd libusbdrv-usbmouse libusb
-endif
+# TODO(#129) Step 3 (USER-CHOSEN 2026-06-01): USB moved OUT of lwip into a
+# standalone `usb` daemon (+ usbkbd/usbmouse driver processes) — see
+# user.plo.yaml. The embedded-USB block below is DISABLED: lwip no longer links
+# the USB stack, so the embed thread in main.c (#ifdef LWIP_EMBED_USB) and the
+# USB diag formatters in diag-udp.c (#if LWIP_EMBED_USB) compile out. This
+# isolates the USB DMA pool + driver heaps from lwip's, so a USB-side bug can no
+# longer corrupt the lwIP mbox (the #121 UAF) and kill the network.
+#ifeq ($(PCI_EXPRESS_BCM2711_INDEXED_CFG),y)
+#  USB_HOST_INCLUDE := $(LOCAL_PATH)../../phoenix-rtos-usb/usb
+#  SRCS += $(addprefix $(LOCAL_PATH)usb-embed/,usb.c dev.c drv.c hcd.c hub.c mem.c)
+#  LOCAL_CFLAGS += -DUSB_NO_MAIN -DLWIP_EMBED_USB -I$(USB_HOST_INCLUDE)
+#  LIBS += libusbxhci libusbdrv-usbkbd libusbdrv-usbmouse libusb
+#endif
 
 include $(binary.mk)

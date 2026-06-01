@@ -95,21 +95,20 @@ static void lwip_embed_usb_thread(void *arg)
 	 *
 	 * Keep DRIVE_ONLY here as it eliminates a few variables without
 	 * regressing. */
-	setenv("USB_HCD_PCIE_DRIVE_ONLY", "1", 1);
-	/* Stage 1 (build-on-rig): bring the controller up via the proven 'X'
-	 * rig sequence, then let the framework HCD drive EnableSlot/enumeration.
-	 * Decisive test of architecture (A). See docs/notes/2026-05-30-usb-rig-
-	 * bringup-build-plan.md + xhci-rig-handoff.h. Set in THIS (lwip) process
-	 * so the weak diag_xhci_rigBringupHandoff symbol resolves. */
-	setenv("XHCI_USE_RIG_BRINGUP", "1", 1);
-	/* Observability: defer the rig-bringup usb_init another 18 s so it runs
-	 * in QUIET UART (after lwip/DHCP settle + the multi-core boot logging
-	 * stops), making the rig-path debug() markers readable instead of
-	 * interleaved garble. Temporary, for the Stage-1 experiment only.
-	 * (2026-05-30) Trimmed 18 s -> 2 s so enumeration lands inside the UART
-	 * capture window; the quiet-window need is gone now markers are sparse. */
+	/* TODO(#129) Step 1 — MERGED-CONFIG TEST: both DRIVE_ONLY and the rig
+	 * handoff are DISABLED so the framework runs its OWN in-process bring-up
+	 * (bridge + HCRST + alloc + program + R/S + first No-Op). The point: FIX-19
+	 * (xhci_enterRunState's RC_BAR2 re-settle, the candidate fix for "controller
+	 * runs but posts zero events") only arms on the non-DRIVE_ONLY branch
+	 * (bcm2711-pcie lastCtx) and so has NEVER run in the PoC; plus the post-Stage
+	 * event/command-ring engine landed after the "wall" verdict. Decisive
+	 * question: does the framework's first event finally land (@idx >= 0)?
+	 * Requires the `usb --bridge-only` boot daemon removed so THIS process owns
+	 * the bridge. Restore the two setenvs below to fall back to the working rig. */
+	/* setenv("USB_HCD_PCIE_DRIVE_ONLY", "1", 1); */
+	/* setenv("XHCI_USE_RIG_BRINGUP", "1", 1); */
 	sleep(2);
-	printf("phoenix-rtos-lwip: ===== RIG-BRINGUP usb_init starting (quiet window) =====\n");
+	printf("phoenix-rtos-lwip: ===== MERGED-CONFIG usb_init starting (#129 Step 1: no rig, no DRIVE_ONLY, FIX-19 live) =====\n");
 	if (usb_init() != 0) {
 		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
 	}

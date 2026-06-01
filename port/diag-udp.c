@@ -6408,6 +6408,46 @@ static int diag_format_kbd(char *buf, size_t cap)
 }
 
 
+/* TODO(#129) 'U' — framework xHCI bring-up outcome, read over the network so it
+ * survives the back-pressured UART (where the bring-up debug() output drains
+ * slowly and char-interleaved). Externs the non-static diag globals set by the
+ * embedded usb/xhci/xhci.c. Decisive read for the #129 merged-config test:
+ *   eventsSeen > 0   ⇒ inbound DMA writes land — the @idx -1 "wall" is gone.
+ *   fix19Rc == 0     ⇒ FIX-19 (RC_BAR2 re-settle) armed (premise holds);
+ *                      -16 (-ENODEV) ⇒ inert (lastCtx NULL) ⇒ test meaningless.
+ *   bringupRc == 0   ⇒ xhci_init succeeded (controller usable).
+ * The sentinel 0x7fffffff prints as "unset" (helper not reached this boot). */
+static int diag_format_usbhcd(char *buf, size_t cap)
+{
+	extern volatile unsigned xhci_diagEventsSeen;
+	extern volatile int xhci_diagFix19Rc;
+	extern volatile uint32_t xhci_diagUsbsts;
+	extern volatile int xhci_diagBringupRc;
+	char f19[16];
+	char brc[16];
+
+	if (xhci_diagFix19Rc == 0x7fffffff) {
+		snprintf(f19, sizeof(f19), "unset");
+	}
+	else {
+		snprintf(f19, sizeof(f19), "%d", xhci_diagFix19Rc);
+	}
+	if (xhci_diagBringupRc == 0x7fffffff) {
+		snprintf(brc, sizeof(brc), "unset");
+	}
+	else {
+		snprintf(brc, sizeof(brc), "%d", xhci_diagBringupRc);
+	}
+
+	return snprintf(buf, cap,
+		"PHX-DIAG/1 usbhcd\n"
+		"usbhcd: eventsSeen=%u fix19Rc=%s usbsts=0x%08x bringupRc=%s\n"
+		"  (eventsSeen>0 => DMA-wall gone; fix19Rc=0 => FIX-19 armed; "
+		"bringupRc=0 => init ok)\n",
+		xhci_diagEventsSeen, f19, xhci_diagUsbsts, brc);
+}
+
+
 static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	const ip_addr_t *addr, u16_t port)
 {
@@ -6519,6 +6559,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'k') {
 		len = diag_format_kbd(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'U') {
+		len = diag_format_usbhcd(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

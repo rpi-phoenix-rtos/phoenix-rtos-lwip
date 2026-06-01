@@ -16,6 +16,8 @@
 #include <sys/threads.h>
 #include <sys/time.h>
 #include <sys/mman.h> /* va2pa — TODO(#129) corruption-PA diagnostic */
+#include <sys/debug.h> /* debug() — TODO(#129) atomic single-syscall line (printf garbles/drops) */
+#include <stdio.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,16 +64,30 @@ err_t sys_mbox_new(sys_mbox_t *mbox, int size)
 	 * PAs (xhci DMAMAP, ~0x32xxxxx): if a mbox/ring PA falls in that range, the
 	 * uncached USB pool physically ALIASES lwIP's cached heap (the #26 pmap bug)
 	 * and the controller's DMA corrupts it — independent of the corruption firing. */
-	printf("mbox NEW: mbox=%p (pa=0x%llx) ring=%p (pa=0x%llx) sz=%d\n",
-		(void *)mbox, (unsigned long long)va2pa((void *)mbox),
-		(void *)mbox->ring, (unsigned long long)va2pa((void *)mbox->ring), size);
+	{
+		char d[128];
+		snprintf(d, sizeof(d), "mbox NEW: mbox=%p (pa=0x%llx) ring=%p (pa=0x%llx) sz=%d\n",
+			(void *)mbox, (unsigned long long)va2pa((void *)mbox),
+			(void *)mbox->ring, (unsigned long long)va2pa((void *)mbox->ring), size);
+		debug(d);
+	}
 
 	return ERR_OK;
 }
 
 
+/* TODO(#129) free-vs-steal forensic: record recently-freed mbox structs in a
+ * small ring (no per-free debug() flood). When the corruption detector fires it
+ * checks whether the victim is in here: present ⇒ the mbox was torn down and its
+ * memp slot reused = use-after-free in the poll path (fix = lifetime/invalidate);
+ * absent ⇒ a LIVE mbox's memory was stolen = heap/allocator corruption. */
+void *mbox_diagFreed[32];
+volatile unsigned mbox_diagFreedIdx;
+
 void sys_mbox_free(sys_mbox_t *mbox)
 {
+	mbox_diagFreed[mbox_diagFreedIdx & 31u] = (void *)mbox;
+	mbox_diagFreedIdx++;
 	free(mbox->ring);
 	resourceDestroy(mbox->pop_cond);
 	resourceDestroy(mbox->push_cond);
@@ -154,13 +170,42 @@ static int mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 		 * cache line, so its PA localises the victim for the overlap test. */
 		static unsigned corruptCount = 0u;
 		if (corruptCount == 0u) {
-			/* ONE short line only — the flood is what garbles the UART, and this
-			 * single datum (the victim's PA vs the USB DMA pool at 0x32f1000+) is
-			 * the DMA-overrun-vs-CPU-write discriminator (#129). */
-			printf("MBOXPA pa=0x%llx ringpa=0x%llx h=%zu sz=%zu\n",
+			/* ONE atomic debug() line — the victim's PA vs the USB DMA pool
+			 * (USBPOOL log) is the DMA-overrun-vs-CPU-write discriminator (#129). */
+			char d[128];
+			unsigned i;
+			volatile uint64_t *w = (volatile uint64_t *)((char *)mbox - 32);
+			snprintf(d, sizeof(d), "MBOXPA pa=0x%llx ringpa=0x%llx h=%zu sz=%zu\n",
 				(unsigned long long)va2pa((void *)mbox),
 				(unsigned long long)va2pa((void *)mbox->ring),
 				mbox->head, mbox->sz);
+			debug(d);
+			/* free-vs-steal verdict: was this victim recently torn down? */
+			{
+				unsigned k;
+				int wasFreed = 0;
+				for (k = 0u; k < 32u; k++) {
+					if (mbox_diagFreed[k] == (void *)mbox) {
+						wasFreed = 1;
+						break;
+					}
+				}
+				snprintf(d, sizeof(d), "MBOXFREED=%d (1=UAF-in-poll, 0=live-stolen) frees=%u\n",
+					wasFreed, (unsigned)mbox_diagFreedIdx);
+				debug(d);
+			}
+			/* TODO(#129) dump raw memory around the victim struct so the OVERWRITING
+			 * data's signature identifies the writer (a recognizable struct/TRB/HID
+			 * report, or an adjacent allocation that overflowed). Atomic debug() per
+			 * line; window = mbox-32 .. mbox+96 (16 u64). The sys_mbox_t field order
+			 * is {lock,push_cond,pop_cond, ring, sz, head, tail,...} so the post-mbox
+			 * words show the clobbered ring/sz/head/tail; the pre-mbox words show any
+			 * overflow source. */
+			for (i = 0u; i < 16u; i++) {
+				snprintf(d, sizeof(d), "MBOXDUMP %+d: 0x%016llx\n",
+					(int)(i * 8u) - 32, (unsigned long long)w[i]);
+				debug(d);
+			}
 		}
 		corruptCount++;
 		return 0;

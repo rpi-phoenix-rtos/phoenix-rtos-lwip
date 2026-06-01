@@ -26,6 +26,9 @@
 #include "ipsec-api.h"
 
 
+/* TODO(#129) Step 3: USB moved to a standalone daemon (port/Makefile no longer
+ * defines LWIP_EMBED_USB), so this whole embedded-USB block compiles out and
+ * lwip links without the USB libs. Retained for the rig-fallback build option. */
 #ifdef LWIP_EMBED_USB
 #include <stdlib.h>
 #include <stdint.h>

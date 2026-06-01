@@ -6389,6 +6389,10 @@ static int diag_format_reply(char *buf, size_t cap)
  * so URBs are submitted (polling); reports>0 = HID reports actually arrived
  * (input reaches the driver — any further loss is in the kbd->tty bridge or psh).
  * Remove with the usbkbd diag counters once the input path is confirmed. */
+#if defined(LWIP_EMBED_USB)
+/* TODO(#129) These USB diag formatters extern symbols from the embedded USB libs
+ * (libusbdrv-usbkbd / libusbxhci). In the standalone-daemon build USB is a
+ * separate process, so the symbols don't exist here — guard the whole block. */
 static int diag_format_kbd(char *buf, size_t cap)
 {
 	extern volatile unsigned usbkbd_diagInsertions;
@@ -6446,6 +6450,7 @@ static int diag_format_usbhcd(char *buf, size_t cap)
 		"bringupRc=0 => init ok)\n",
 		xhci_diagEventsSeen, f19, xhci_diagUsbsts, brc);
 }
+#endif /* LWIP_EMBED_USB */
 
 
 static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
@@ -6557,12 +6562,14 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	else if (query == 'm') {
 		len = diag_format_meminfo(body, DIAG_REPLY_MAX);
 	}
+#if defined(LWIP_EMBED_USB)
 	else if (query == 'k') {
 		len = diag_format_kbd(body, DIAG_REPLY_MAX);
 	}
 	else if (query == 'U') {
 		len = diag_format_usbhcd(body, DIAG_REPLY_MAX);
 	}
+#endif
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);
 	}

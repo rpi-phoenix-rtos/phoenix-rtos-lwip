@@ -9,3 +9,6 @@ port/wifi-fw-43455.c
 port/wifi-fw-43455.h
 port/wifi-nvram-43455.c
 port/wifi-nvram-43455.h
+
+# Pi 4 coordination-repo capture/build output
+artifacts/

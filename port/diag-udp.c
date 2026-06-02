@@ -53,6 +53,7 @@
 #include <sys/threads.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <time.h>
 
 
@@ -370,6 +371,43 @@ static void diag_gpioSetPull(volatile uint8_t *base, unsigned pin, unsigned pull
  * external-abort SError (see docs/notes/2026-05-29-usb-reanalysis.md). */
 #define DIAG_PCIE_RC_BASE 0xfd500000ull
 #define DIAG_PCIE_RC_SIZE 0x10000u
+
+/* TODO(#129) USB-enum observability after Step-3 moved USB to a standalone
+ * process: the lwip diag responder can no longer read embedded HCD state, and
+ * netboot UART captures race the (late, variable-timing) USB enumeration. But
+ * the driver-created device nodes are global and resolvable cross-process
+ * (#123), so a post-settle UDP 'D' probe statting them is a capture-timing-
+ * independent "did USB enumerate the keyboard?" check. present=1 ⇒ usbkbd
+ * enumerated the LS keyboard behind the VL805/VIA-hub chain end to end. */
+static int diag_format_devnodes(char *buf, size_t cap)
+{
+	static const char *const nodes[] = { "/dev/kbd0", "/dev/mouse0", "/dev/usb" };
+	int off = 0, r;
+	unsigned i;
+
+	r = snprintf(buf + off, cap - off, "PHX-DIAG/1 devnodes\n");
+	if (r < 0 || (size_t)r >= (size_t)(cap - off)) {
+		return -1;
+	}
+	off += r;
+
+	for (i = 0u; i < sizeof(nodes) / sizeof(nodes[0]); ++i) {
+		struct stat st;
+		int present = (stat(nodes[i], &st) == 0) ? 1 : 0;
+		r = snprintf(buf + off, cap - off, "%s present=%d errno=%d\n",
+			nodes[i], present, present ? 0 : errno);
+		if (r < 0 || (size_t)r >= (size_t)(cap - off)) {
+			break;
+		}
+		off += r;
+	}
+	r = snprintf(buf + off, cap - off, ".\n");
+	if (r > 0 && (size_t)r < (size_t)(cap - off)) {
+		off += r;
+	}
+	return off;
+}
+
 
 static int diag_format_pcie_err(char *buf, size_t cap)
 {
@@ -6561,6 +6599,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'm') {
 		len = diag_format_meminfo(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'D') {
+		len = diag_format_devnodes(body, DIAG_REPLY_MAX);
 	}
 #if defined(LWIP_EMBED_USB)
 	else if (query == 'k') {

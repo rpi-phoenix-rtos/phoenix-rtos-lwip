@@ -26,107 +26,6 @@
 #include "ipsec-api.h"
 
 
-/* TODO(#129) Step 3: USB moved to a standalone daemon (port/Makefile no longer
- * defines LWIP_EMBED_USB), so this whole embedded-USB block compiles out and
- * lwip links without the USB libs. Retained for the rig-fallback build option. */
-#ifdef LWIP_EMBED_USB
-#include <stdlib.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <sys/threads.h>
-
-/* Embedded Phoenix-RTOS USB host stack — see port/Makefile and the
- * shim files in port/usb-embed/. usb_init() is the stack entry point
- * (defined in phoenix-rtos-usb/usb/usb.c, declared in usbhost.h). */
-extern int usb_init(void);
-
-static uint8_t lwip_embed_usb_stack[16 * 1024];
-
-static void lwip_embed_usb_thread(void *arg)
-{
-	(void)arg;
-	/* Pi 4 PoC: this lwip-port process hosts the USB host stack. The
-	 * boot-time `usb;--bridge-only` daemon has already done the one-shot
-	 * BCM2711 PCIe bridge bring-up and parked (without touching the
-	 * controller — see BCM2711_USB_BRIDGE_ONLY in xhci_init). This thread
-	 * then sets USB_HCD_PCIE_DRIVE_ONLY (below) so it drives ONLY the
-	 * controller on the already-brought-up bridge, rather than re-running
-	 * the bridge bring-up itself. (An earlier approach had this process
-	 * re-run bcm2711_pcie_initVL805 in-process; DRIVE_ONLY was adopted to
-	 * eliminate that bridge re-init as a variable.)
-	 *
-	 * NOTE: neither arrangement enumerates USB — the controller runs but
-	 * its inbound DMA event-ring writes never land (`first event @idx -1`,
-	 * rc=-110). The root cause is unresolved and JTAG-gated; see
-	 * docs/notes/2026-05-29-usb-reanalysis.md.
-	 *
-	 * GENET-warm-up delay (10 s): gives lwip + DHCP + ARP a head start
-	 * before the xHCI bring-up. NOTE (2026-05-29): the old rationale —
-	 * "the SCB→DDR fabric needs GENET actively cycling before the VL805's
-	 * inbound DMA writes reach DRAM" — was DISPROVEN. A sustained GENET TX
-	 * DMA flood (14877 broadcast sends, 0 failures, confirmed active via
-	 * debug()) running concurrently with the bring-up still produced
-	 * `first event @idx -1`. The rig's "works when triggered later"
-	 * correlation is most likely its own ~50% bridge flakiness, not
-	 * DMA-enablement. See docs/notes/2026-05-29-usb-reanalysis.md.
-	 *
-	 * usb_init() spawns N-1 status threads + msgthr internally; this
-	 * wrapper exits after a successful init.
-	 *
-	 * (2026-05-30) Trimmed 10 s -> 3 s: the GENET-warm-up rationale is
-	 * disproven and the long delay only pushed USB enumeration past the UART
-	 * capture window. Keep a short settle so lwip/DHCP are up first. */
-	sleep(3);
-	/* MULTI-TRIAL BENCH RESULTS (2026-05-28):
-	 *   PoC full bring-up:      0/8 trials succeed
-	 *   PoC DRIVE_ONLY:         0/4 trials succeed
-	 *   PoC MaxSlotsEn=1:       0/2 trials succeed
-	 *   PoC contig scratchpad:  0/4 trials succeed
-	 *   PoC no-bridge-mmap:     0/3 trials succeed
-	 *   'X' diag rig:           2/4 trials succeed (~50% flakiness)
-	 *
-	 * The PoC consistently fails to enumerate USB while the rig
-	 * succeeds about half the time on the same hardware/boot. The
-	 * single-variable code paths I can identify as different from the
-	 * rig (MaxSlotsEn, scratchpad layout, bridge re-init, leaked
-	 * bridge mmap) are not the culprit. The remaining difference is
-	 * higher up in the stack — possibly the cumulative effect of
-	 * usb_init's earlier allocations (mutex pool, driver registration,
-	 * hub_init) changing kernel/process state vs the rig's clean-slate
-	 * mmap calls. Investigation parked pending a fresh angle.
-	 *
-	 * Keep DRIVE_ONLY here as it eliminates a few variables without
-	 * regressing. */
-	/* TODO(#129) Step 1 — MERGED-CONFIG TEST: both DRIVE_ONLY and the rig
-	 * handoff are DISABLED so the framework runs its OWN in-process bring-up
-	 * (bridge + HCRST + alloc + program + R/S + first No-Op). The point: FIX-19
-	 * (xhci_enterRunState's RC_BAR2 re-settle, the candidate fix for "controller
-	 * runs but posts zero events") only arms on the non-DRIVE_ONLY branch
-	 * (bcm2711-pcie lastCtx) and so has NEVER run in the PoC; plus the post-Stage
-	 * event/command-ring engine landed after the "wall" verdict. Decisive
-	 * question: does the framework's first event finally land (@idx >= 0)?
-	 * Requires the `usb --bridge-only` boot daemon removed so THIS process owns
-	 * the bridge. Restore the two setenvs below to fall back to the working rig. */
-	/* setenv("USB_HCD_PCIE_DRIVE_ONLY", "1", 1); */
-	/* setenv("XHCI_USE_RIG_BRINGUP", "1", 1); */
-	sleep(2);
-	printf("phoenix-rtos-lwip: ===== MERGED-CONFIG usb_init starting (#129 Step 1: no rig, no DRIVE_ONLY, FIX-19 live) =====\n");
-	if (usb_init() != 0) {
-		printf("phoenix-rtos-lwip: embedded usb_init() failed\n");
-	}
-	else {
-		printf("phoenix-rtos-lwip: embedded usb_init() SUCCEEDED\n");
-	}
-	/* Phoenix beginthread'd functions must not return — falling off the
-	 * end jumps to a poisoned lr (PC alignment fault). Park here. */
-	for (;;) {
-		usleep(60u * 1000u * 1000u);
-	}
-}
-#endif
-
-
 static void mainLoop(void)
 {
 	msg_t msg = { 0 };
@@ -259,17 +158,6 @@ int main(int argc, char **argv)
 		void init_diag_udp(void);
 		init_diag_udp();
 	}
-
-#ifdef LWIP_EMBED_USB
-	/* Pi 4 PoC: spawn the embedded USB host stack in this process. The
-	 * worker thread does the setenv + usb_init() call; see the
-	 * lwip_embed_usb_thread comment above for rationale. Failure to
-	 * spawn here is not fatal — networking still works. */
-	if (beginthread(lwip_embed_usb_thread, 4, lwip_embed_usb_stack,
-			sizeof(lwip_embed_usb_stack), NULL) != 0) {
-		printf("phoenix-rtos-lwip: failed to spawn embedded USB thread\n");
-	}
-#endif
 
 	mainLoop();
 

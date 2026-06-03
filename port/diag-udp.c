@@ -6420,77 +6420,6 @@ static int diag_format_reply(char *buf, size_t cap)
 }
 
 
-/* TODO(#127): USB-keyboard input observability. usbkbd is linked into this lwip
- * image (libusbdrv-usbkbd) and exports these counters; querying 'k' over the
- * network localizes where a typed byte dies without depending on the slow UART
- * or the fbcon. insertions>0 = keyboard enumerated; opens>0 = /dev/kbd0 opened
- * so URBs are submitted (polling); reports>0 = HID reports actually arrived
- * (input reaches the driver — any further loss is in the kbd->tty bridge or psh).
- * Remove with the usbkbd diag counters once the input path is confirmed. */
-#if defined(LWIP_EMBED_USB)
-/* TODO(#129) These USB diag formatters extern symbols from the embedded USB libs
- * (libusbdrv-usbkbd / libusbxhci). In the standalone-daemon build USB is a
- * separate process, so the symbols don't exist here — guard the whole block. */
-static int diag_format_kbd(char *buf, size_t cap)
-{
-	extern volatile unsigned usbkbd_diagInsertions;
-	extern volatile unsigned usbkbd_diagOpens;
-	extern volatile unsigned usbkbd_diagReports;
-	extern volatile uint8_t usbkbd_diagLastReport[8];
-
-	return snprintf(buf, cap,
-		"PHX-DIAG/1 kbd\n"
-		"kbd: insertions=%u opens=%u reports=%u\n"
-		"last=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-		usbkbd_diagInsertions, usbkbd_diagOpens, usbkbd_diagReports,
-		usbkbd_diagLastReport[0], usbkbd_diagLastReport[1],
-		usbkbd_diagLastReport[2], usbkbd_diagLastReport[3],
-		usbkbd_diagLastReport[4], usbkbd_diagLastReport[5],
-		usbkbd_diagLastReport[6], usbkbd_diagLastReport[7]);
-}
-
-
-/* TODO(#129) 'U' — framework xHCI bring-up outcome, read over the network so it
- * survives the back-pressured UART (where the bring-up debug() output drains
- * slowly and char-interleaved). Externs the non-static diag globals set by the
- * embedded usb/xhci/xhci.c. Decisive read for the #129 merged-config test:
- *   eventsSeen > 0   ⇒ inbound DMA writes land — the @idx -1 "wall" is gone.
- *   fix19Rc == 0     ⇒ FIX-19 (RC_BAR2 re-settle) armed (premise holds);
- *                      -16 (-ENODEV) ⇒ inert (lastCtx NULL) ⇒ test meaningless.
- *   bringupRc == 0   ⇒ xhci_init succeeded (controller usable).
- * The sentinel 0x7fffffff prints as "unset" (helper not reached this boot). */
-static int diag_format_usbhcd(char *buf, size_t cap)
-{
-	extern volatile unsigned xhci_diagEventsSeen;
-	extern volatile int xhci_diagFix19Rc;
-	extern volatile uint32_t xhci_diagUsbsts;
-	extern volatile int xhci_diagBringupRc;
-	char f19[16];
-	char brc[16];
-
-	if (xhci_diagFix19Rc == 0x7fffffff) {
-		snprintf(f19, sizeof(f19), "unset");
-	}
-	else {
-		snprintf(f19, sizeof(f19), "%d", xhci_diagFix19Rc);
-	}
-	if (xhci_diagBringupRc == 0x7fffffff) {
-		snprintf(brc, sizeof(brc), "unset");
-	}
-	else {
-		snprintf(brc, sizeof(brc), "%d", xhci_diagBringupRc);
-	}
-
-	return snprintf(buf, cap,
-		"PHX-DIAG/1 usbhcd\n"
-		"usbhcd: eventsSeen=%u fix19Rc=%s usbsts=0x%08x bringupRc=%s\n"
-		"  (eventsSeen>0 => DMA-wall gone; fix19Rc=0 => FIX-19 armed; "
-		"bringupRc=0 => init ok)\n",
-		xhci_diagEventsSeen, f19, xhci_diagUsbsts, brc);
-}
-#endif /* LWIP_EMBED_USB */
-
-
 static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	const ip_addr_t *addr, u16_t port)
 {
@@ -6603,14 +6532,6 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	else if (query == 'D') {
 		len = diag_format_devnodes(body, DIAG_REPLY_MAX);
 	}
-#if defined(LWIP_EMBED_USB)
-	else if (query == 'k') {
-		len = diag_format_kbd(body, DIAG_REPLY_MAX);
-	}
-	else if (query == 'U') {
-		len = diag_format_usbhcd(body, DIAG_REPLY_MAX);
-	}
-#endif
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);
 	}

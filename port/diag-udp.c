@@ -4388,6 +4388,10 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 	int rc_tail = -100;
 	uint8_t chipclk_samples[8] = {0};
 	uint8_t socram_tail[16] = {0};
+	uint8_t scan_buf[64];
+	int scan_rc[6] = {0};
+	int scan_diff[6] = {0};
+	int scan_changed_pts = -1;
 	uint8_t ht_clk_csr = 0u;
 	uint8_t f2_ready = 0u;
 	int f2_ready_iters = -1;
@@ -4717,6 +4721,51 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 		rc_r_post = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
 			/*reg_addr=*/0u, /*block_count=*/1u, /*block_size=*/64u, post_buf);
 
+		/* fw-execution disambiguation (#91): SOCRAM[0..63] is entry/vector
+		 * code a running fw need not modify, so it is a weak "alive" tell.
+		 * Scan several points spread across the loaded image and compare
+		 * the post-release on-chip bytes to the source blob. ANY changed
+		 * point => the CR4 IS executing (writing its data/BSS) and the
+		 * problem is observability/early-stall; zero change everywhere =>
+		 * fw genuinely not running (chase rstvec/activate). Reads use
+		 * 64-byte blocks (F1 block size is 64; non-64 reads return -EIO). */
+		{
+			static const uint32_t scan_off[6] = {
+				0x02000u, 0x10000u, 0x30000u, 0x60000u, 0x90000u, 0x9C000u
+			};
+			unsigned s;
+			int k;
+			scan_changed_pts = 0;
+			for (s = 0u; s < 6u; ++s) {
+				uint32_t a = 0x198000u + scan_off[s];
+				uint8_t lo = (uint8_t)(((a >> 15) & 1u) ? 0x80u : 0x00u);
+				uint8_t mid = (uint8_t)((a >> 16) & 0xffu);
+				uint8_t hi = (uint8_t)((a >> 24) & 0xffu);
+				uint32_t f1 = a & 0x7FFFu;
+				int d = 0;
+				(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Au, lo, NULL);
+				(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Bu, mid, NULL);
+				(void)diag_sdioCmd52(sdhci, 1, 1, 0x1000Cu, hi, NULL);
+				scan_rc[s] = diag_sdioCmd53Read(sdhci, 1, /*incr=*/1,
+					/*reg_addr=*/f1, /*block_count=*/1u, /*block_size=*/64u,
+					scan_buf);
+				if (scan_rc[s] == 0) {
+					for (k = 0; k < 64; ++k) {
+						if (scan_buf[k] != wifi_fw_43455[scan_off[s] + (uint32_t)k]) {
+							++d;
+						}
+					}
+					scan_diff[s] = d;
+					if (d > 0) {
+						++scan_changed_pts;
+					}
+				}
+				else {
+					scan_diff[s] = -1;
+				}
+			}
+		}
+
 		/* Firmware-running probes:
 		 *
 		 * 1. CHIPCLKCSR (F1 reg 0x1000E): HT_AVAIL (bit 7, 0x80) goes
@@ -4869,6 +4918,25 @@ static int diag_format_sdio_fwrelease(char *buf, size_t cap)
 			if (r > 0 && (size_t)r < cap - off) {
 				off += r;
 			}
+		}
+	}
+
+	if (scan_changed_pts >= 0) {
+		r = snprintf(buf + off, cap - off,
+			"image-scan post vs fw (changed bytes/64 @ +off): "
+			"+0x02000=%d +0x10000=%d +0x30000=%d +0x60000=%d +0x90000=%d +0x9C000=%d\n",
+			scan_diff[0], scan_diff[1], scan_diff[2], scan_diff[3], scan_diff[4], scan_diff[5]);
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
+		}
+		r = snprintf(buf + off, cap - off,
+			"  -> %d/6 points changed => %s\n",
+			scan_changed_pts,
+			(scan_changed_pts > 0)
+				? "CR4 IS EXECUTING (writing memory) -- gate is observability/early-stall"
+				: "no memory writes anywhere -- fw genuinely not running (chase rstvec/activate)");
+		if (r > 0 && (size_t)r < cap - off) {
+			off += r;
 		}
 	}
 

@@ -44,6 +44,10 @@
 #include "wifi-nvram-43455.h"
 
 #include <sys/mman.h>
+#include <sys/platform.h>
+/* platformctl_t + pctl_graphmode (the VideoCore graphmode query struct); same
+ * header pl011-tty's fbcon uses. <sys/platform.h> only declares platformctl(). */
+#include <phoenix/arch/aarch64/generic/generic.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -5113,6 +5117,88 @@ static int diag_format_sdio(char *buf, size_t cap)
 }
 
 
+/* Framebuffer probe ('V') -- groundwork for a future /dev/fb0 driver.
+ *
+ * Queries the VideoCore graphmode that plo/firmware configured (the same
+ * platformctl(pctl_get, pctl_graphmode) call pl011-tty's fbcon uses; it is a
+ * general syscall, not tty-specific), mmaps the framebuffer from THIS arbitrary
+ * userspace process, and NON-DESTRUCTIVELY verifies the read/write path: save a
+ * few words at the bottom-right corner, write a known pattern, read it back,
+ * compare, then restore the originals. Proves the userspace mmap + uncached
+ * read/write coherence a /dev/fb0 driver would rely on, without taking over the
+ * display or racing the fbcon console writer. The display-ownership and the
+ * (Phoenix has no fbdev ABI) device-interface decisions are deferred to an
+ * attended session -- see docs/notes/2026-06-05-fb0-attended-decisions.md. */
+static int diag_format_fb(char *buf, size_t cap)
+{
+	platformctl_t pctl = { .action = pctl_get, .type = pctl_graphmode };
+	volatile uint32_t *fb;
+	void *fb_page;
+	size_t fbsz, visible, testoff;
+	uint32_t saved[16];
+	uint32_t pattern[16];
+	int rw_ok = 1;
+	int i;
+	int off = 0;
+
+	if (platformctl(&pctl) != 0) {
+		return snprintf(buf, cap, "PHX-DIAG/1 fb\nplatformctl(graphmode) failed\n.\n");
+	}
+
+	off += snprintf(buf + off, cap - off,
+		"PHX-DIAG/1 fb\nfb: pa=0x%lx w=%u h=%u bpp=%u pitch=%u\n",
+		(unsigned long)pctl.task.graphmode.framebuffer,
+		(unsigned)pctl.task.graphmode.width,
+		(unsigned)pctl.task.graphmode.height,
+		(unsigned)pctl.task.graphmode.bpp,
+		(unsigned)pctl.task.graphmode.pitch);
+
+	if ((pctl.task.graphmode.framebuffer == 0u) || (pctl.task.graphmode.pitch == 0u)) {
+		off += snprintf(buf + off, cap - off, "no framebuffer configured\n.\n");
+		return off;
+	}
+
+	visible = (size_t)pctl.task.graphmode.pitch * (size_t)pctl.task.graphmode.height;
+	fbsz = (visible + _PAGE_SIZE - 1u) & ~(size_t)(_PAGE_SIZE - 1u);
+
+	fb_page = mmap(NULL, fbsz, PROT_READ | PROT_WRITE,
+		MAP_SHARED | MAP_UNCACHED | MAP_ANONYMOUS | MAP_PHYSMEM, -1,
+		(off_t)pctl.task.graphmode.framebuffer);
+	if (fb_page == MAP_FAILED) {
+		off += snprintf(buf + off, cap - off, "mmap failed\n.\n");
+		return off;
+	}
+	fb = (volatile uint32_t *)fb_page;
+
+	/* Last 16 pixels (bottom-right): least likely to race the scrolling
+	 * console, and restored within microseconds so the display is untouched. */
+	testoff = (visible / sizeof(uint32_t)) - 16u;
+	for (i = 0; i < 16; i++) {
+		saved[i] = fb[testoff + i];
+	}
+	for (i = 0; i < 16; i++) {
+		pattern[i] = 0xdeadbeefu ^ (uint32_t)((unsigned)i * 0x01010101u);
+		fb[testoff + i] = pattern[i];
+	}
+	for (i = 0; i < 16; i++) {
+		if (fb[testoff + i] != pattern[i]) {
+			rw_ok = 0;
+		}
+	}
+	for (i = 0; i < 16; i++) {
+		fb[testoff + i] = saved[i]; /* restore -- non-destructive */
+	}
+
+	off += snprintf(buf + off, cap - off,
+		"fb mmap rw %s (testoff_word=%u saved[0]=0x%08x wrote=0x%08x)\n.\n",
+		(rw_ok != 0) ? "verified" : "FAILED",
+		(unsigned)testoff, saved[0], pattern[0]);
+
+	munmap(fb_page, fbsz);
+	return off;
+}
+
+
 static int diag_format_reply(char *buf, size_t cap)
 {
 	struct netif *n;
@@ -5294,6 +5380,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'D') {
 		len = diag_format_devnodes(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'V') {
+		len = diag_format_fb(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

@@ -5261,6 +5261,43 @@ static int diag_format_devread(char *buf, size_t cap)
 }
 
 
+/* SD-card read probe ('k', #120 bring-up): read the start of /dev/mmcblk0p2
+ * through the bcm2711-emmc block device and report whether the ext2 superblock
+ * (magic 0xEF53 at byte 1080: superblock@1024 + s_magic@56) reads back. A live
+ * end-to-end validation of the SD read path at the partition offset across
+ * reboots without reflashing -- works only because the daemon now keeps
+ * /dev/mmcblk0* served after a failed root mount. Remove with the #120 diag. */
+static int diag_format_sdread(char *buf, size_t cap)
+{
+	static unsigned char sb[2048];
+	int off = 0;
+	int fd;
+	ssize_t n;
+	unsigned magic;
+
+	off += snprintf(buf + off, cap - off, "PHX-DIAG/1 sdread\n");
+
+	fd = open("/dev/mmcblk0p2", O_RDONLY);
+	if (fd < 0) {
+		off += snprintf(buf + off, cap - off, "/dev/mmcblk0p2: open errno=%d\n.\n", errno);
+		return off;
+	}
+	n = read(fd, sb, sizeof(sb));
+	close(fd);
+	if (n < 0) {
+		off += snprintf(buf + off, cap - off, "/dev/mmcblk0p2: read errno=%d\n.\n", errno);
+		return off;
+	}
+
+	magic = (n >= 1082) ? ((unsigned)sb[1080] | ((unsigned)sb[1081] << 8)) : 0u;
+	off += snprintf(buf + off, cap - off,
+		"/dev/mmcblk0p2: read %d bytes; ext2_magic=0x%04x (%s); sb1024[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x\n.\n",
+		(int)n, magic, (magic == 0xef53u) ? "EXT2-OK" : "BAD",
+		sb[1024], sb[1025], sb[1026], sb[1027], sb[1028], sb[1029], sb[1030], sb[1031]);
+	return off;
+}
+
+
 static int diag_format_reply(char *buf, size_t cap)
 {
 	struct netif *n;
@@ -5448,6 +5485,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'R') {
 		len = diag_format_devread(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'k') {
+		len = diag_format_sdread(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

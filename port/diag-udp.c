@@ -58,6 +58,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 
 #define DIAG_UDP_PORT 9999u
@@ -5199,6 +5201,66 @@ static int diag_format_fb(char *buf, size_t cap)
 }
 
 
+/* Device-read smoke test ('R'): open + read the pseudo-files registered by the
+ * rpi4-thermal and rpi4-hwrng drivers from THIS (separate) process. Validates
+ * their mtRead msg-loops end-to-end cross-process -- the part the per-driver
+ * init self-log does not exercise -- and would catch a devfs-resolution failure
+ * (cf. the old /dev/kbd0 #123 issue) where a device registers but other
+ * processes can't open it. */
+static int diag_format_devread(char *buf, size_t cap)
+{
+	static const char *const textDevs[] = { "/dev/thermal", "/dev/throttled" };
+	int off = 0;
+	unsigned i;
+	int fd;
+	ssize_t n;
+	char tmp[64];
+
+	off += snprintf(buf + off, cap - off, "PHX-DIAG/1 devread\n");
+
+	for (i = 0; i < (sizeof(textDevs) / sizeof(textDevs[0])); i++) {
+		fd = open(textDevs[i], O_RDONLY);
+		if (fd < 0) {
+			off += snprintf(buf + off, cap - off, "%s: open errno=%d\n", textDevs[i], errno);
+			continue;
+		}
+		n = read(fd, tmp, sizeof(tmp) - 1u);
+		close(fd);
+		if (n < 0) {
+			off += snprintf(buf + off, cap - off, "%s: read errno=%d\n", textDevs[i], errno);
+		}
+		else {
+			tmp[n] = '\0';
+			if ((n > 0) && (tmp[n - 1] == '\n')) {
+				tmp[n - 1] = '\0';
+			}
+			off += snprintf(buf + off, cap - off, "%s: \"%s\" (%d bytes)\n", textDevs[i], tmp, (int)n);
+		}
+	}
+
+	fd = open("/dev/hwrng", O_RDONLY);
+	if (fd < 0) {
+		off += snprintf(buf + off, cap - off, "/dev/hwrng: open errno=%d\n", errno);
+	}
+	else {
+		unsigned char rb[8] = { 0 };
+		n = read(fd, rb, sizeof(rb));
+		close(fd);
+		if (n < 0) {
+			off += snprintf(buf + off, cap - off, "/dev/hwrng: read errno=%d\n", errno);
+		}
+		else {
+			off += snprintf(buf + off, cap - off,
+				"/dev/hwrng: %d bytes %02x%02x%02x%02x%02x%02x%02x%02x\n",
+				(int)n, rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7]);
+		}
+	}
+
+	off += snprintf(buf + off, cap - off, ".\n");
+	return off;
+}
+
+
 static int diag_format_reply(char *buf, size_t cap)
 {
 	struct netif *n;
@@ -5383,6 +5445,9 @@ static void diag_udp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 	}
 	else if (query == 'V') {
 		len = diag_format_fb(body, DIAG_REPLY_MAX);
+	}
+	else if (query == 'R') {
+		len = diag_format_devread(body, DIAG_REPLY_MAX);
 	}
 	else {
 		len = diag_format_reply(body, DIAG_REPLY_MAX);

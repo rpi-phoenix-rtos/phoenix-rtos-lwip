@@ -5,7 +5,7 @@
  *
  * Copyright 2026 Phoenix Systems
  *
- * SPDX-License-Identifier: BSD-3-Clause
+ * %LICENSE%
  *
  * Tier 5 scope:
  *   - MMIO map, GENET v5 silicon ID validation, UMAC reset
@@ -27,8 +27,6 @@
  *     (GET_BOARD_MAC). The previous locally-administered fallback is
  *     used only if the mailbox call fails; we set UMAC_CMD.PROMISC
  *     only on that fallback path.
- *   - Static IP 10.42.0.99/24 is assigned on first link-up to bypass
- *     a DHCP-start interaction with this lwip-port (TODO(TD-Eth-DHCP)).
  *
  * References (BEHAVIORAL only — fresh-code per CLAUDE.md
  * upstreamability guidance):
@@ -837,18 +835,8 @@ static void genet_dhcpStartCb(void *arg)
 
 	netif_set_default(netif);
 
-	/* TD-Eth-DHCP closure attempt (2026-05-28): activate autonomous
-	 * DHCP. Host-side discovery is now in place — get-pi-ip.sh reads
-	 * dnsmasq.leases and diag-udp-probe.sh auto-resolves the Pi IP
-	 * before sending the probe, so we no longer depend on the static
-	 * 10.42.0.99 fallback to reach the Pi after dhcp_start clears it.
-	 *
-	 * To validate end-to-end:
-	 *   test-cycle-netboot.sh --label dhcp-close --capture-secs 240 --probe q
-	 * and check artifacts/diag-udp output for:
-	 *   netif: ... ip=10.42.0.X gw=10.42.0.1 flags=... DHCP
-	 * where 10 <= X <= 20 (dnsmasq's dhcp-range on the netboot bridge).
-	 */
+	/* Kick DHCP via tcpip_callback so it runs in the tcpip-thread context
+	 * required by LWIP_TCPIP_CORE_LOCKING. */
 	err = dhcp_start(netif);
 	genet_printf((genet_state_t *)netif->state,
 		"dhcp_start: %d (0=ok); netif waits for OFFER", (int)err);

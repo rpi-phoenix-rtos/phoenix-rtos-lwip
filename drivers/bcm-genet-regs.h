@@ -5,7 +5,7 @@
  *
  * Copyright 2026 Phoenix Systems
  *
- * SPDX-License-Identifier: BSD-3-Clause
+ * %LICENSE%
  *
  * Block layout in the 64 KiB GENET MMIO window:
  *   0x0000  SYS         system / revision / flush

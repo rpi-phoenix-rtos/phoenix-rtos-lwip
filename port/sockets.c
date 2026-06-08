@@ -1243,7 +1243,20 @@ __constructor__(1000) void init_lwip_sockets(void)
 	if ((err = portCreate(&oid.port)) < 0)
 		errout(err, "portCreate(socketsrv)");
 
-	if ((err = create_dev(&oid, PATH_SOCKSRV))) {
+	err = create_dev(&oid, PATH_SOCKSRV);
+	/* DIAG(#153-T3 Gap B): from lwip's OWN process, immediately after
+	 * registering netsocket, log the create_dev rc and whether the node is
+	 * self-resolvable pre-"/" by both the literal path and the devfs-relative
+	 * path. Compare these against nfs-fs's cross-process probes to root-cause
+	 * why netsocket is unreachable before "/" exists. Revertable. */
+	{
+		oid_t lit = { 0 }, dev = { 0 };
+		int litRc = lookup("/dev/netsocket", NULL, &lit);
+		int devRc = lookup("devfs/netsocket", NULL, &dev);
+		printf("lwip: netsocket create_dev rc=%d port=%u selflit=%d selfdevfs=%d dport=%u\n",
+			err, oid.port, litRc, devRc, (devRc == 0) ? dev.port : 0u);
+	}
+	if (err) {
 		errout(err, "create_dev(%s)", PATH_SOCKSRV);
 	}
 

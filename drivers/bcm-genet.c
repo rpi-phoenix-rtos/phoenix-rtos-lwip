@@ -99,7 +99,8 @@ typedef struct {
 	int last_speed;
 	int last_duplex;
 	int dhcp_started;
-	uint32_t link_poll_stack[1024] __attribute__((aligned(16)));
+	/* 8 KB — shallow MDIO poll loop; doubled from 4 KB for uniformity (#152). */
+	uint32_t link_poll_stack[2048] __attribute__((aligned(16)));
 
 	/* TX: single DMA buffer, ring of 256 BDs in MMIO. */
 	void *tx_buf;
@@ -127,7 +128,10 @@ typedef struct {
 	handle_t irq_cond;
 	handle_t irq_handle;
 	uint32_t irq_events;
-	uint32_t irq_stack[2048] __attribute__((aligned(16)));
+	/* 16 KB (#152): the IRQ thread drains the RX ring into pbuf/netif input;
+	 * bumped from 8 KB for margin -- 8 KB is the exact size that overflowed the
+	 * SD pool thread in #120, and this stack (like all here) has no guard page. */
+	uint32_t irq_stack[4096] __attribute__((aligned(16)));
 } genet_state_t;
 
 

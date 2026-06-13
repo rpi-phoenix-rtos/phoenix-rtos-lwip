@@ -287,9 +287,18 @@ static void ephy_setLinkState(const eth_phy_state_t *phy)
 		case ephy_ksz9031mnx:
 		case ephy_dp83867is:
 		case ephy_rtl8201fi:
-		case ephy_bcm54213pe:
 			ephy_printf(phy, "link is %s %uMbps/%s (ctl %04x, status %04x, adv %04x, lpa %04x)",
 					(linkup != 0) ? "UP  " : "DOWN", speed, (full_duplex != 0) ? "Full" : "Half", bctl, bstat, adv, lpa);
+			break;
+		case ephy_bcm54213pe:
+			/* gbcr (reg 9) = our 1000Base-T advertisement (bit9=1000-FD, bit8=1000-HD);
+			 * gbsr (reg 10) = 1000Base-T status (bit11=LP 1000-FD, bit10=LP 1000-HD,
+			 * bit13=local rcvr OK, bit12=remote rcvr OK). Tells us whether we advertise
+			 * gigabit and whether the link partner/cable can do it. */
+			pc1 = ephy_regRead(phy, EPHY_COMMON_09_GBCR);
+			pc2 = ephy_regRead(phy, EPHY_COMMON_0A_GBSR);
+			ephy_printf(phy, "link is %s %uMbps/%s (ctl %04x, status %04x, adv %04x, lpa %04x, gbcr %04x, gbsr %04x)",
+					(linkup != 0) ? "UP  " : "DOWN", speed, (full_duplex != 0) ? "Full" : "Half", bctl, bstat, adv, lpa, pc1, pc2);
 			break;
 		case ephy_88e1111:
 			physr = ephy_regRead(phy, EPHY_88E1111_11_PHYSR);

@@ -66,14 +66,21 @@
 #define MDIO_TIMEOUT_US   20000u    /* xHCI MDIO max per Linux bcmmii */
 
 /*
- * RX ring depth. 16 BDs is enough for Tier 3 (one packet, polled) and
- * keeps the init's 16-call dmammap loop well under Phoenix's allocator
- * cliff — bumping to GENET_TOTAL_DESC (256) made the 256 successive
- * MAP_CONTIGUOUS allocations stall lwip startup so it never produced
- * its first print. The ring's BUF_SIZE and END_ADDR are programmed
- * for this count, so the HW only sees the slots we actually filled.
+ * RX ring depth. The HW default-queue ring is GENET_TOTAL_DESC (256) BDs and
+ * the BUF_SIZE/END_ADDR are programmed for that full count. We MUST back every
+ * BD with its own unique buffer: an earlier build allocated only 16 unique
+ * buffers and aliased BDs 16..255 cyclically back onto them, but that defeats
+ * the ring's flow control — once the HW producer gets >16 BDs ahead of the
+ * (caches-off, slow) drain thread it overwrites a not-yet-drained aliased
+ * buffer, corrupting frames. On the wire that shows up as packet loss +
+ * reordering, which collapses the server's TCP cwnd to 1 (confirmed via host
+ * `ss -ti`: bytes_retrans ~2.5%, cwnd:1) and caps NFS throughput far below the
+ * link. 16 was originally chosen only because 256 *separate* dmammap()
+ * MAP_CONTIGUOUS calls stalled the allocator at startup; we now allocate the
+ * whole pool in ONE contiguous dmammap and carve it, so all 256 BDs get unique
+ * buffers without tripping that cliff.
  */
-#define GENET_RX_SLOTS    16u
+#define GENET_RX_SLOTS    GENET_TOTAL_DESC
 
 
 static err_t genet_linkOutput(struct netif *netif, struct pbuf *p);
@@ -113,7 +120,10 @@ typedef struct {
 
 	/* RX: per-slot buffers + IRQ-driven service thread. The BD's address
 	 * is programmed once at init — HW writes received frames into the
-	 * same physical buffer each time the BD comes back around. */
+	 * same physical buffer each time the BD comes back around. The buffers
+	 * are one contiguous pool (rx_pool) carved into GENET_TOTAL_DESC slices. */
+	void *rx_pool;            /* single contiguous dmammap for all RX buffers */
+	addr_t rx_pool_phys;
 	void *rx_bufs[GENET_RX_SLOTS];
 	addr_t rx_bufs_phys[GENET_RX_SLOTS];
 	uint32_t rx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
@@ -611,32 +621,26 @@ static int genet_initRxRing(genet_state_t *state)
 	 * each time the BD cycles past. We just read the status word per
 	 * arrival to learn the per-frame length and flags.
 	 *
-	 * We populate the first GENET_RX_SLOTS BDs with unique dmammap'd
-	 * buffers, then alias the remaining BDs [GENET_RX_SLOTS .. GENET_TOTAL_DESC-1]
-	 * cyclically back to the same buffers. The previous attempt had
-	 * END_ADDR set for only 16 BDs, which seems to have made BCM2711
-	 * GENET treat BD[0] as also the LAST BD in the ring (WRAP set on
-	 * the first received frame). Programming all 256 BD slots with
-	 * (aliased) valid addresses + writing the full default-queue
-	 * END_ADDR = 767 keeps HW from setting WRAP early. */
-	for (i = 0; i < GENET_RX_SLOTS; ++i) {
-		state->rx_bufs[i] = dmammap(GENET_MAX_FRAME);
-		if (state->rx_bufs[i] == NULL) {
-			genet_printf(state, "dmammap RX slot %u failed", i);
-			return -ENOMEM;
-		}
-		state->rx_bufs_phys[i] = va2pa(state->rx_bufs[i]);
+	 * One unique buffer per BD: allocate the whole 256-buffer pool in a
+	 * SINGLE contiguous dmammap (avoids the per-slot-allocation cliff that
+	 * once forced 16 aliased buffers) and carve it. Each BD points at its own
+	 * GENET_MAX_FRAME-sized slice, so the HW ring's flow control is honoured
+	 * (HW stops when it catches the consumer) and no in-flight frame is ever
+	 * overwritten. */
+	state->rx_pool = dmammap(GENET_TOTAL_DESC * GENET_MAX_FRAME);
+	if (state->rx_pool == NULL) {
+		genet_printf(state, "dmammap RX pool (%u KB) failed",
+			(GENET_TOTAL_DESC * GENET_MAX_FRAME) / 1024u);
+		return -ENOMEM;
+	}
+	state->rx_pool_phys = va2pa(state->rx_pool);
+	for (i = 0; i < GENET_TOTAL_DESC; ++i) {
+		state->rx_bufs[i] = (uint8_t *)state->rx_pool + (size_t)i * GENET_MAX_FRAME;
+		state->rx_bufs_phys[i] = state->rx_pool_phys + (addr_t)i * GENET_MAX_FRAME;
 
 		bd_off = GENET_RX_DESCS_OFF + i * GENET_DMA_DESC_SIZE;
 		genet_write(state, bd_off + 4, (uint32_t)(state->rx_bufs_phys[i] & 0xFFFFFFFFu));
 		genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->rx_bufs_phys[i] >> 32));
-		genet_write(state, bd_off + 0, 0);
-	}
-	for (i = GENET_RX_SLOTS; i < GENET_TOTAL_DESC; ++i) {
-		addr_t pa = state->rx_bufs_phys[i % GENET_RX_SLOTS];
-		bd_off = GENET_RX_DESCS_OFF + i * GENET_DMA_DESC_SIZE;
-		genet_write(state, bd_off + 4, (uint32_t)(pa & 0xFFFFFFFFu));
-		genet_write(state, bd_off + 8, (uint32_t)((uint64_t)pa >> 32));
 		genet_write(state, bd_off + 0, 0);
 	}
 
@@ -1201,7 +1205,7 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	if (err < 0) {
 		return err;
 	}
-	genet_printf(state, "RX ring 16 ready (%u slots, BD 0..%u)",
+	genet_printf(state, "RX ring ready (%u unique buffers, BD 0..%u)",
 		GENET_RX_SLOTS, GENET_RX_SLOTS - 1u);
 
 	/* IRQ plumbing: mask everything in INTRL2_0/1 before registering

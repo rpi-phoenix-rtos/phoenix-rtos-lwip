@@ -84,9 +84,25 @@
 
 
 static err_t genet_linkOutput(struct netif *netif, struct pbuf *p);
+static void genet_rxbufFree(struct pbuf *p);
 
 
+/*
+ * Zero-copy RX: the drain hands the DMA buffer straight to lwip wrapped in a
+ * custom pbuf (no per-frame memcpy/malloc) and refills the BD from a free list.
+ * lwip owns the buffer until tcpip_input's thread frees the pbuf, which calls
+ * genet_rxbufFree() to return it to the free list. So we need MORE buffers than
+ * the 256 BDs: 256 armed + a slack pool for frames in flight up the stack
+ * (sized from TCPIP_MBOX_SIZE + recv mailboxes). When the free list runs dry the
+ * drain falls back to the original copy path, so a shortfall degrades to slow,
+ * never to a wedged ring or buffer reuse. */
+#define GENET_RX_POOL_SLOTS  (GENET_TOTAL_DESC + 256u)   /* 256 BDs + in-flight slack */
 
+typedef struct genet_rxbuf {
+	struct pbuf_custom pc;   /* MUST be first: custom_free gets &pc == &pc.pbuf */
+	void *state;             /* genet_state_t * (void* to dodge the fwd-decl) */
+	uint16_t idx;            /* this buffer's index in the pool */
+} genet_rxbuf_t;
 
 typedef struct {
 	addr_t dev_phys_addr;
@@ -122,10 +138,17 @@ typedef struct {
 	 * is programmed once at init — HW writes received frames into the
 	 * same physical buffer each time the BD comes back around. The buffers
 	 * are one contiguous pool (rx_pool) carved into GENET_TOTAL_DESC slices. */
-	void *rx_pool;            /* single contiguous dmammap for all RX buffers */
+	void *rx_pool;            /* single contiguous dmammap for ALL pool buffers */
 	addr_t rx_pool_phys;
-	void *rx_bufs[GENET_RX_SLOTS];
-	addr_t rx_bufs_phys[GENET_RX_SLOTS];
+	void *rx_bufs[GENET_RX_POOL_SLOTS];      /* VA of each pool buffer */
+	addr_t rx_bufs_phys[GENET_RX_POOL_SLOTS];/* PA of each pool buffer */
+	uint16_t rx_bd_buf[GENET_TOTAL_DESC];    /* which pool buffer each BD is armed with */
+	genet_rxbuf_t rx_pc[GENET_RX_POOL_SLOTS];/* custom-pbuf wrapper per pool buffer */
+	uint16_t rx_free[GENET_RX_POOL_SLOTS];   /* free-list (stack of pool-buffer indices) */
+	int rx_free_top;                         /* # entries on the free list */
+	handle_t rx_free_lock;                   /* drain pops, custom-free pushes (cross-thread) */
+	unsigned long rx_zerocopy;               /* frames handed up zero-copy */
+	unsigned long rx_copyfallback;           /* frames that fell back to the copy path */
 	uint32_t rx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
 	uint32_t rx_c_index;     /* SW's view, mirrors RDMA_RING_CONS_INDEX */
 	unsigned long rx_pkts_seen;
@@ -621,27 +644,40 @@ static int genet_initRxRing(genet_state_t *state)
 	 * each time the BD cycles past. We just read the status word per
 	 * arrival to learn the per-frame length and flags.
 	 *
-	 * One unique buffer per BD: allocate the whole 256-buffer pool in a
-	 * SINGLE contiguous dmammap (avoids the per-slot-allocation cliff that
-	 * once forced 16 aliased buffers) and carve it. Each BD points at its own
-	 * GENET_MAX_FRAME-sized slice, so the HW ring's flow control is honoured
-	 * (HW stops when it catches the consumer) and no in-flight frame is ever
-	 * overwritten. */
-	state->rx_pool = dmammap(GENET_TOTAL_DESC * GENET_MAX_FRAME);
+	 * Allocate the whole GENET_RX_POOL_SLOTS-buffer pool in a SINGLE contiguous
+	 * dmammap (avoids the per-slot-allocation cliff that once forced 16 aliased
+	 * buffers) and carve it. The first GENET_TOTAL_DESC buffers arm the 256 BDs
+	 * one-to-one; the remainder seed the zero-copy free list. No BD ever shares
+	 * a buffer, so the HW ring's flow control is honoured and no in-flight frame
+	 * is overwritten. */
+	state->rx_pool = dmammap(GENET_RX_POOL_SLOTS * GENET_MAX_FRAME);
 	if (state->rx_pool == NULL) {
 		genet_printf(state, "dmammap RX pool (%u KB) failed",
-			(GENET_TOTAL_DESC * GENET_MAX_FRAME) / 1024u);
+			(GENET_RX_POOL_SLOTS * GENET_MAX_FRAME) / 1024u);
 		return -ENOMEM;
 	}
 	state->rx_pool_phys = va2pa(state->rx_pool);
-	for (i = 0; i < GENET_TOTAL_DESC; ++i) {
+	for (i = 0; i < GENET_RX_POOL_SLOTS; ++i) {
 		state->rx_bufs[i] = (uint8_t *)state->rx_pool + (size_t)i * GENET_MAX_FRAME;
 		state->rx_bufs_phys[i] = state->rx_pool_phys + (addr_t)i * GENET_MAX_FRAME;
-
+		state->rx_pc[i].state = state;
+		state->rx_pc[i].idx = (uint16_t)i;
+		state->rx_pc[i].pc.custom_free_function = genet_rxbufFree;
+	}
+	/* Arm the 256 BDs with buffers 0..255; the rest seed the free list. */
+	for (i = 0; i < GENET_TOTAL_DESC; ++i) {
+		state->rx_bd_buf[i] = (uint16_t)i;
 		bd_off = GENET_RX_DESCS_OFF + i * GENET_DMA_DESC_SIZE;
 		genet_write(state, bd_off + 4, (uint32_t)(state->rx_bufs_phys[i] & 0xFFFFFFFFu));
 		genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->rx_bufs_phys[i] >> 32));
 		genet_write(state, bd_off + 0, 0);
+	}
+	state->rx_free_top = 0;
+	for (i = GENET_TOTAL_DESC; i < GENET_RX_POOL_SLOTS; ++i)
+		state->rx_free[state->rx_free_top++] = (uint16_t)i;
+	if (mutexCreate(&state->rx_free_lock) != 0) {
+		genet_printf(state, "rx_free_lock create failed");
+		return -ENOMEM;
 	}
 
 	/* Same burst size convention as TDMA. */
@@ -714,6 +750,33 @@ static int genet_initRxRing(genet_state_t *state)
 }
 
 
+/* custom-pbuf free callback: runs on the tcpip thread when lwip drops the last
+ * ref. Returns the buffer to the free list (cross-thread vs the drain -> lock). */
+static void genet_rxbufFree(struct pbuf *p)
+{
+	genet_rxbuf_t *rb = (genet_rxbuf_t *)p;   /* pc is first member: &pc.pbuf == p */
+	genet_state_t *state = (genet_state_t *)rb->state;
+
+	mutexLock(state->rx_free_lock);
+	if (state->rx_free_top < (int)GENET_RX_POOL_SLOTS)
+		state->rx_free[state->rx_free_top++] = rb->idx;
+	mutexUnlock(state->rx_free_lock);
+}
+
+
+/* Pop a spare buffer index for refilling a BD, or -1 if the free list is dry. */
+static int genet_rxbufPop(genet_state_t *state)
+{
+	int idx = -1;
+
+	mutexLock(state->rx_free_lock);
+	if (state->rx_free_top > 0)
+		idx = state->rx_free[--state->rx_free_top];
+	mutexUnlock(state->rx_free_lock);
+	return idx;
+}
+
+
 static void genet_drainRxRing(genet_state_t *state)
 {
 	uint32_t ring_off = GENET_RX_RINGS_OFF + GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
@@ -739,27 +802,75 @@ static void genet_drainRxRing(genet_state_t *state)
 			(BD_STATUS_SOP | BD_STATUS_EOP) &&
 			(status & GENET_RX_STATUS_ERROR_MASK) == 0u) {
 			uint16_t pay_len = frame_len_total - GENET_RX_STATUS_PREFIX;
-			uint8_t *buf = state->rx_bufs[state->rx_index % GENET_RX_SLOTS];
+			uint16_t bufidx = state->rx_bd_buf[state->rx_index];
+			uint8_t *buf = state->rx_bufs[bufidx];
 			uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
+			int nb = genet_rxbufPop(state);   /* spare buffer to re-arm this BD */
 
-			struct pbuf *p = pbuf_alloc(PBUF_RAW,
-				(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_RAM);
-			if (p != NULL) {
-				((uint8_t *)p->payload)[0] = 0;
-				((uint8_t *)p->payload)[1] = 0;
-				if (pbuf_take_at(p, frame, pay_len, ETH_PAD_SIZE) == ERR_OK) {
-					if (state->netif->input(p, state->netif) != ERR_OK) {
+			if (nb >= 0) {
+				/* ZERO-COPY: wrap this DMA buffer in its custom pbuf and hand it
+				 * up; re-arm the BD with the spare 'nb' so HW keeps receiving. The
+				 * 2-byte ETH pad lives in the status prefix ahead of the frame. */
+				genet_rxbuf_t *rb = &state->rx_pc[bufidx];
+				uint8_t *payload_mem = frame - ETH_PAD_SIZE;
+				uint16_t avail = (uint16_t)(GENET_MAX_FRAME -
+					(GENET_RX_STATUS_PREFIX - ETH_PAD_SIZE));
+				struct pbuf *p = pbuf_alloced_custom(PBUF_RAW,
+					(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_REF,
+					&rb->pc, payload_mem, avail);
+				if (p != NULL) {
+					((uint8_t *)p->payload)[0] = 0;
+					((uint8_t *)p->payload)[1] = 0;
+					/* Re-arm BD with the spare BEFORE input(): the BD is SW-owned
+					 * until we publish CONS_INDEX after the loop, so HW won't touch
+					 * it meanwhile; 'buf' now belongs to lwip until rxbufFree(). */
+					state->rx_bd_buf[state->rx_index] = (uint16_t)nb;
+					genet_write(state, bd_off + 4,
+						(uint32_t)(state->rx_bufs_phys[nb] & 0xFFFFFFFFu));
+					genet_write(state, bd_off + 8,
+						(uint32_t)((uint64_t)state->rx_bufs_phys[nb] >> 32));
+					genet_write(state, bd_off + 0, 0);
+					if (state->netif->input(p, state->netif) == ERR_OK) {
+						state->rx_zerocopy++;
+					}
+					else {
+						pbuf_free(p);   /* returns 'bufidx' via rxbufFree */
+						state->rx_pkts_dropped++;
+					}
+					nb = -2;        /* handled (success or dropped) */
+				}
+				else {
+					/* custom alloc failed: give the spare back, copy instead. */
+					mutexLock(state->rx_free_lock);
+					if (state->rx_free_top < (int)GENET_RX_POOL_SLOTS)
+						state->rx_free[state->rx_free_top++] = (uint16_t)nb;
+					mutexUnlock(state->rx_free_lock);
+					nb = -1;
+				}
+			}
+
+			if (nb == -1) {
+				/* COPY FALLBACK (free list dry): copy out, BD keeps its buffer. */
+				struct pbuf *p = pbuf_alloc(PBUF_RAW,
+					(uint16_t)(pay_len + ETH_PAD_SIZE), PBUF_RAM);
+				if (p != NULL) {
+					((uint8_t *)p->payload)[0] = 0;
+					((uint8_t *)p->payload)[1] = 0;
+					if (pbuf_take_at(p, frame, pay_len, ETH_PAD_SIZE) == ERR_OK) {
+						if (state->netif->input(p, state->netif) != ERR_OK) {
+							pbuf_free(p);
+							state->rx_pkts_dropped++;
+						}
+					}
+					else {
 						pbuf_free(p);
 						state->rx_pkts_dropped++;
 					}
 				}
 				else {
-					pbuf_free(p);
 					state->rx_pkts_dropped++;
 				}
-			}
-			else {
-				state->rx_pkts_dropped++;
+				state->rx_copyfallback++;
 			}
 		}
 		else {
@@ -908,6 +1019,7 @@ static void genet_linkPollThread(void *arg)
 {
 	genet_state_t *state = arg;
 	int speed, full_duplex;
+	unsigned tick = 0;
 
 	for (;;) {
 		usleep(1000 * 1000);  /* 1s — matches Linux mii_link_poll cadence */
@@ -915,6 +1027,15 @@ static void genet_linkPollThread(void *arg)
 		full_duplex = 0;
 		speed = ephy_linkSpeed(&state->phy, &full_duplex);
 		genet_setLinkState(state->netif, (speed > 0) ? 1 : 0);
+
+		/* RXSTATS: zero-copy vs copy-fallback ratio + free-list depth (one line/min).
+		 * copyfb>0 or free near 0 means the in-flight pool is too small; dropped>0
+		 * means the drain is falling behind. Healthy = all-zerocopy, copyfb/dropped 0. */
+		if ((++tick % 60u) == 0u) {
+			genet_printf(state, "RXSTATS seen=%lu zerocopy=%lu copyfb=%lu dropped=%lu free=%d",
+				state->rx_pkts_seen, state->rx_zerocopy, state->rx_copyfallback,
+				state->rx_pkts_dropped, state->rx_free_top);
+		}
 	}
 }
 

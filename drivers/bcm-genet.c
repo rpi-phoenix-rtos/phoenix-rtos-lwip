@@ -71,7 +71,7 @@
  * BD with its own unique buffer: an earlier build allocated only 16 unique
  * buffers and aliased BDs 16..255 cyclically back onto them, but that defeats
  * the ring's flow control — once the HW producer gets >16 BDs ahead of the
- * (caches-off, slow) drain thread it overwrites a not-yet-drained aliased
+ * drain thread it overwrites a not-yet-drained aliased
  * buffer, corrupting frames. On the wire that shows up as packet loss +
  * reordering, which collapses the server's TCP cwnd to 1 (confirmed via host
  * `ss -ti`: bytes_retrans ~2.5%, cwnd:1) and caps NFS throughput far below the

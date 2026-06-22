@@ -86,4 +86,10 @@
 #define LWIP_DHCP_AUTOIP_COOP 1
 #define LWIP_DHCP_AUTOIP_COOP_TRIES 3
 #define LWIP_SO_RCVTIMEO 1
+/* FIONREAD support for UDP sockets (Linux semantics: returns the next datagram's size, 0 if
+ * none, buffering it into lastdata so the following recvfrom still receives it). Without this
+ * lwip_ioctl(FIONREAD) returns ENOSYS -> Quake's UDP server start (UDP_CheckNewConnections) hit
+ * "ioctlsocket (FIONREAD) failed (ENOSYS)" and hung at "Loading". Lighter than LWIP_SO_RCVBUF
+ * (no per-netconn byte accounting); covers the datagram use case multiplayer needs. */
+#define LWIP_FIONREAD_LINUXMODE 1
 #define ifreq lwip_ifreq

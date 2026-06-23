@@ -1015,6 +1015,14 @@ static void genet_setLinkState(void *arg, int state_up)
 
 /* --- Link-state poll thread ------------------------------------- */
 
+/* Per-minute RX-stats console line. Gated OFF by default so it doesn't spam the
+ * shared console and interrupt interactive psh (user-reported #31). Debug builds
+ * re-enable it with -DGENET_RXSTATS_LOG=1. (The stats counters are always kept;
+ * only the console print is gated.) */
+#ifndef GENET_RXSTATS_LOG
+#define GENET_RXSTATS_LOG 0
+#endif
+
 static void genet_linkPollThread(void *arg)
 {
 	genet_state_t *state = arg;
@@ -1030,12 +1038,17 @@ static void genet_linkPollThread(void *arg)
 
 		/* RXSTATS: zero-copy vs copy-fallback ratio + free-list depth (one line/min).
 		 * copyfb>0 or free near 0 means the in-flight pool is too small; dropped>0
-		 * means the drain is falling behind. Healthy = all-zerocopy, copyfb/dropped 0. */
+		 * means the drain is falling behind. Healthy = all-zerocopy, copyfb/dropped 0.
+		 * Gated (GENET_RXSTATS_LOG) so user-mode builds keep the console quiet (#31). */
+#if GENET_RXSTATS_LOG
 		if ((++tick % 60u) == 0u) {
 			genet_printf(state, "RXSTATS seen=%lu zerocopy=%lu copyfb=%lu dropped=%lu free=%d",
 				state->rx_pkts_seen, state->rx_zerocopy, state->rx_copyfallback,
 				state->rx_pkts_dropped, state->rx_free_top);
 		}
+#else
+		(void)tick;
+#endif
 	}
 }
 

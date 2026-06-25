@@ -65,6 +65,32 @@
 #define GENET_MMIO_SIZE   0x10000u  /* 64 KiB */
 #define MDIO_TIMEOUT_US   20000u    /* xHCI MDIO max per Linux bcmmii */
 
+
+/*
+ * Policy B — cacheable (streaming-DMA) RX path. DEFAULT-OFF.
+ *
+ * The proven RX path (this flag = 0) DMAs into an UNCACHED dmammap pool: zero
+ * cache maintenance, but the whole TCP/IP recv chain then touches every payload
+ * byte uncached, which is slow. When this flag is 1 the RX pool is allocated
+ * WRITE-BACK CACHEABLE (dmammap_cached) and the driver does Linux-style
+ * per-frame streaming-DMA cache maintenance:
+ *   - dma_sync_for_device: invalidate a slot's cache lines BEFORE arming its BD
+ *     (so no dirty line can write back over a frame the device is about to DMA),
+ *   - dma_sync_for_cpu: invalidate a slot's cache lines BEFORE the CPU reads a
+ *     received frame.
+ * Per-line ops use `dc ivac` (EL0-legal: SCTLR_EL1.UCI is set in the kernel
+ * _init.S). Each pool slot is GENET_MAX_FRAME (2048) bytes — a cache-line
+ * multiple — so an invalidate of a whole slot never touches a neighbour's lines
+ * (the classic streaming-DMA buffer-clobber bug is avoided by construction).
+ *
+ * NEEDS-CAREFUL-HW-REVIEW: a cache-coherency mistake here corrupts RX silently.
+ * Keep this OFF for normal boots; enable only for the integrity bench
+ * (-DGENET_RX_CACHEABLE=1) where genet-rxcache-bench verifies byte-correctness.
+ */
+#ifndef GENET_RX_CACHEABLE
+#define GENET_RX_CACHEABLE 0
+#endif
+
 /*
  * RX ring depth. The HW default-queue ring is GENET_TOTAL_DESC (256) BDs and
  * the BUF_SIZE/END_ADDR are programmed for that full count. We MUST back every
@@ -184,6 +210,38 @@ static inline void genet_write(genet_state_t *state, uint32_t off, uint32_t val)
 {
 	*(volatile uint32_t *)((volatile uint8_t *)state->mmio + off) = val;
 }
+
+
+#if GENET_RX_CACHEABLE
+/*
+ * Invalidate the D-cache lines covering [va, va+len) by VA (`dc ivac`), discarding
+ * any cached/dirty copy so the next CPU read fetches what the device DMA'd, and so
+ * no stale dirty line can write back over an in-flight DMA. Mirrors the kernel's
+ * hal_cpuInvalDataCache (hal/aarch64/cache.c): read the D-cache line size from
+ * CTR_EL0.DminLine, loop per line, dsb-bracketed. EL0-legal via SCTLR_EL1.UCI.
+ *
+ * Callers always pass a whole GENET_MAX_FRAME slot, whose base is GENET_MAX_FRAME
+ * (a cache-line multiple) past a page-aligned pool — so start and end are already
+ * line-aligned and the op never reaches a neighbouring buffer. The explicit
+ * round-down/round-up below keeps that safe even if a partial range is ever passed. */
+static inline void genet_dcacheInvalRx(void *va, size_t len)
+{
+	uint64_t ctr;
+	uintptr_t line, start, end;
+
+	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	line = (uintptr_t)4 << ((ctr >> 16) & 0xfu);  /* CTR_EL0.DminLine: log2(words) */
+
+	start = (uintptr_t)va & ~(line - 1u);
+	end = ((uintptr_t)va + len + line - 1u) & ~(line - 1u);
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (; start < end; start += line) {
+		__asm__ volatile("dc ivac, %0" : : "r"(start) : "memory");
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+#endif /* GENET_RX_CACHEABLE */
 
 
 /* --- Reset / MAC / UMAC ----------------------------------------- */
@@ -589,7 +647,12 @@ static int genet_initRxRing(genet_state_t *state)
 	 * one-to-one; the remainder seed the zero-copy free list. No BD ever shares
 	 * a buffer, so the HW ring's flow control is honoured and no in-flight frame
 	 * is overwritten. */
+#if GENET_RX_CACHEABLE
+	/* Policy B: write-back cacheable pool + per-frame cache maintenance (below). */
+	state->rx_pool = dmammap_cached(GENET_RX_POOL_SLOTS * GENET_MAX_FRAME);
+#else
 	state->rx_pool = dmammap(GENET_RX_POOL_SLOTS * GENET_MAX_FRAME);
+#endif
 	if (state->rx_pool == NULL) {
 		genet_printf(state, "dmammap RX pool (%u KB) failed",
 			(GENET_RX_POOL_SLOTS * GENET_MAX_FRAME) / 1024u);
@@ -606,6 +669,12 @@ static int genet_initRxRing(genet_state_t *state)
 	/* Arm the 256 BDs with buffers 0..255; the rest seed the free list. */
 	for (i = 0; i < GENET_TOTAL_DESC; ++i) {
 		state->rx_bd_buf[i] = (uint16_t)i;
+#if GENET_RX_CACHEABLE
+		/* dma_sync_for_device: drop any dirty line (the pool is freshly
+		 * mapped cacheable and may carry the kernel's zeroing) so it can't
+		 * write back over the device's first DMA into this slot. */
+		genet_dcacheInvalRx(state->rx_bufs[i], GENET_MAX_FRAME);
+#endif
 		bd_off = GENET_RX_DESCS_OFF + i * GENET_DMA_DESC_SIZE;
 		genet_write(state, bd_off + 4, (uint32_t)(state->rx_bufs_phys[i] & 0xFFFFFFFFu));
 		genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->rx_bufs_phys[i] >> 32));
@@ -744,7 +813,15 @@ static void genet_drainRxRing(genet_state_t *state)
 			uint16_t bufidx = state->rx_bd_buf[state->rx_index];
 			uint8_t *buf = state->rx_bufs[bufidx];
 			uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
-			int nb = genet_rxbufPop(state);   /* spare buffer to re-arm this BD */
+			int nb;
+
+#if GENET_RX_CACHEABLE
+			/* dma_sync_for_cpu: invalidate this slot's lines before ANY read
+			 * of its contents (zero-copy hand-up OR copy fallback below), so
+			 * the CPU sees what the device DMA'd, not a stale cached copy. */
+			genet_dcacheInvalRx(buf, GENET_MAX_FRAME);
+#endif
+			nb = genet_rxbufPop(state);   /* spare buffer to re-arm this BD */
 
 			if (nb >= 0) {
 				/* ZERO-COPY: wrap this DMA buffer in its custom pbuf and hand it
@@ -764,6 +841,12 @@ static void genet_drainRxRing(genet_state_t *state)
 					 * until we publish CONS_INDEX after the loop, so HW won't touch
 					 * it meanwhile; 'buf' now belongs to lwip until rxbufFree(). */
 					state->rx_bd_buf[state->rx_index] = (uint16_t)nb;
+#if GENET_RX_CACHEABLE
+					/* dma_sync_for_device: the spare may carry dirty lines from
+					 * its previous life up the stack — drop them so they can't
+					 * write back over the device's next DMA into this slot. */
+					genet_dcacheInvalRx(state->rx_bufs[nb], GENET_MAX_FRAME);
+#endif
 					genet_write(state, bd_off + 4,
 						(uint32_t)(state->rx_bufs_phys[nb] & 0xFFFFFFFFu));
 					genet_write(state, bd_off + 8,

@@ -18,12 +18,21 @@
 #include <posix/utils.h>
 #include <syslog.h>
 
+#include "lwip/netif.h"
+
 #include "netif-driver.h"
 #include "route.h"
 #include "filter.h"
 #include "devs.h"
 #include "wifi-api.h"
 #include "ipsec-api.h"
+
+#ifndef GENET_RX_CACHEABLE
+#define GENET_RX_CACHEABLE 0
+#endif
+#if GENET_RX_CACHEABLE
+void genet_rxcacheBench(struct netif *netif);
+#endif
 
 
 static void mainLoop(void)
@@ -148,6 +157,12 @@ int main(int argc, char **argv)
 	if (ipsecdev_attach(LWIP_IPSEC_DEV) < 0) {
 		printf("phoenix-rtos-lwip: can't attach IPSEC device \"%s\": %s\n", LWIP_IPSEC_DEV, strerror(errno));
 	}
+#endif
+
+#if GENET_RX_CACHEABLE
+	/* Policy B integrity + throughput bench. Resolves the gateway itself once
+	 * DHCP completes; netif_default is the genet interface here. */
+	genet_rxcacheBench(netif_default);
 #endif
 
 	mainLoop();

@@ -31,6 +31,15 @@ include g3/Makefile
 endif
 
 CFLAGS += -Wundef -Iinclude -Ilib-lwip/src/include -I"$(LWIPOPTS_DIR)"
+
+# Policy B (task #11): opt-in cacheable/streaming-DMA GENET RX path + integrity
+# bench. DEFAULT-OFF — the stock build keeps the proven uncached RX path. Enable
+# for the bench with `make GENET_RX_CACHEABLE=1 ...`; the -D reaches both the
+# driver lib (drivers/bcm-genet.c) and the port lib (port/genet-rxcache-bench.c,
+# port/main.c). See drivers/bcm-genet.c for the NEEDS-CAREFUL-HW-REVIEW notes.
+ifeq ($(GENET_RX_CACHEABLE),1)
+CFLAGS += -DGENET_RX_CACHEABLE=1
+endif
 ifeq ($(LWIP_G3_BUILD), yes)
 CFLAGS += -I$(PREFIX_BUILD)/phrtos3-include -I$(PREFIX_PROJECT)/G3-PLC/ps_g3_phy/api/include
 endif

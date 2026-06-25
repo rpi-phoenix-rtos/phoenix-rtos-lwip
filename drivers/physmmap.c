@@ -30,6 +30,24 @@ void *dmammap(size_t sz)
 }
 
 
+void *dmammap_cached(size_t sz)
+{
+	void *p;
+
+	sz = (sz + _PAGE_SIZE - 1) & ~(_PAGE_SIZE - 1);
+
+	if (!sz)
+		return NULL;
+
+	/* Same as dmammap() but WITHOUT MAP_UNCACHED: the contiguous physical region
+	 * keeps the default write-back-cacheable page attribute (MAIR_IDX_CACHED in the
+	 * aarch64 pmap). MAP_CONTIGUOUS still pins it physically so va2pa() is stable for
+	 * device DMA. The caller owns all cache maintenance. */
+	p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_CONTIGUOUS, -1, 0);
+	return p != MAP_FAILED ? p : NULL;
+}
+
+
 volatile void *physmmap(addr_t addr, size_t sz)
 {
 	volatile void *va;

@@ -105,7 +105,7 @@ static void genet_rxcacheBenchThread(void *arg)
 	}
 	if (netif == NULL || ip4_addr_isany_val(*netif_ip4_gw(netif))) {
 		printf("GENET-RXCACHE: ENABLED throughput=0.00 MB/s integrity=FAIL (no gateway)\n");
-		return;
+		endthread();
 	}
 	gw = ip4_addr_get_u32(netif_ip4_gw(netif));
 
@@ -117,7 +117,7 @@ static void genet_rxcacheBenchThread(void *arg)
 	fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
 		printf("GENET-RXCACHE: ENABLED throughput=0.00 MB/s integrity=FAIL (socket)\n");
-		return;
+		endthread();
 	}
 
 	if (lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
@@ -127,7 +127,7 @@ static void genet_rxcacheBenchThread(void *arg)
 			(unsigned)((gw >> 16) & 0xFF), (unsigned)((gw >> 24) & 0xFF),
 			GENET_RXCACHE_BENCH_PORT);
 		lwip_close(fd);
-		return;
+		endthread();
 	}
 
 	gettime(&t0, NULL);
@@ -167,6 +167,14 @@ static void genet_rxcacheBenchThread(void *arg)
 			(mism == 0 && total >= GENET_RXCACHE_BENCH_BYTES) ? "PASS" : "FAIL",
 			(unsigned long long)total, (unsigned long long)mism);
 	}
+
+	/* A Phoenix thread must exit via endthread(), never by returning: beginthreadex
+	 * installs no return trampoline, so the entry function's closing `ret` would pop
+	 * the stack's 0x1e poison fill and fault (PC-alignment Exception #34, pc=far=
+	 * 0x1e1e1e1e1e1e1e1e) — which crashed the lwip process right after this bench
+	 * printed PASS. (All the other threads in this driver loop forever, so they
+	 * never hit this; this one-shot bench is the only one that finishes.) */
+	endthread();
 }
 
 

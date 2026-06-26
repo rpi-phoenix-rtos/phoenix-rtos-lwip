@@ -672,6 +672,17 @@ static int genet_initRxRing(genet_state_t *state)
 		return -ENOMEM;
 	}
 	state->rx_pool_phys = va2pa(state->rx_pool);
+#if GENET_RX_CACHEABLE
+	/* Print the cacheable pool's PA + span so it can be checked against the GPU
+	 * scanout high-mem region (e.g. the Pi 4 plo framebuffer triple-buffers around
+	 * 0x3d3b2000..0x3eb84000). A cacheable RX pool that overlaps scanout would let
+	 * RX DMA + cache maintenance clobber the framebuffer. */
+	genet_printf(state, "RXCACHE pool PA=0x%08x..0x%08x (%u KB, cacheable); TX pool PA=0x%08x",
+		(unsigned)state->rx_pool_phys,
+		(unsigned)(state->rx_pool_phys + GENET_RX_POOL_SLOTS * GENET_MAX_FRAME),
+		(GENET_RX_POOL_SLOTS * GENET_MAX_FRAME) / 1024u,
+		(unsigned)state->tx_buf_phys);
+#endif
 	for (i = 0; i < GENET_RX_POOL_SLOTS; ++i) {
 		state->rx_bufs[i] = (uint8_t *)state->rx_pool + (size_t)i * GENET_MAX_FRAME;
 		state->rx_bufs_phys[i] = state->rx_pool_phys + (addr_t)i * GENET_MAX_FRAME;

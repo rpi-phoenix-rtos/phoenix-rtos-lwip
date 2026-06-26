@@ -74,13 +74,16 @@
  * byte uncached, which is slow. When this flag is 1 the RX pool is allocated
  * WRITE-BACK CACHEABLE (dmammap_cached) and the driver does Linux-style
  * per-frame streaming-DMA cache maintenance:
- *   - dma_sync_for_device: invalidate a slot's cache lines BEFORE arming its BD
- *     (so no dirty line can write back over a frame the device is about to DMA),
- *   - dma_sync_for_cpu: invalidate a slot's cache lines BEFORE the CPU reads a
- *     received frame.
- * Per-line ops use `dc ivac` (EL0-legal: SCTLR_EL1.UCI is set in the kernel
- * _init.S). Each pool slot is GENET_MAX_FRAME (2048) bytes — a cache-line
- * multiple — so an invalidate of a whole slot never touches a neighbour's lines
+ *   - dma_sync_for_device: clean+invalidate a slot's cache lines BEFORE arming
+ *     its BD (so no dirty line can write back over a frame the device is about
+ *     to DMA),
+ *   - dma_sync_for_cpu: clean+invalidate a slot's cache lines BEFORE the CPU
+ *     reads a received frame.
+ * Per-line ops use `dc civac` — the only EL0-legal invalidate-bearing op (the
+ * UCI set is CVAU/CVAC/CVAP/CIVAC + IC IVAU; pure `dc ivac` is EL1-only and TRAPS
+ * at EL0, which is why an earlier `dc ivac` version killed RX entirely — see
+ * genet_dcacheCleanInvalRx). Each pool slot is GENET_MAX_FRAME (2048) bytes — a
+ * cache-line multiple — so a whole-slot op never touches a neighbour's lines
  * (the classic streaming-DMA buffer-clobber bug is avoided by construction).
  *
  * NEEDS-CAREFUL-HW-REVIEW: a cache-coherency mistake here corrupts RX silently.
@@ -214,17 +217,27 @@ static inline void genet_write(genet_state_t *state, uint32_t off, uint32_t val)
 
 #if GENET_RX_CACHEABLE
 /*
- * Invalidate the D-cache lines covering [va, va+len) by VA (`dc ivac`), discarding
- * any cached/dirty copy so the next CPU read fetches what the device DMA'd, and so
- * no stale dirty line can write back over an in-flight DMA. Mirrors the kernel's
- * hal_cpuInvalDataCache (hal/aarch64/cache.c): read the D-cache line size from
- * CTR_EL0.DminLine, loop per line, dsb-bracketed. EL0-legal via SCTLR_EL1.UCI.
+ * Clean+invalidate the D-cache lines covering [va, va+len) by VA (`dc civac`):
+ * write back any dirty copy then drop the line, so (RX-complete -> read) the CPU
+ * fetches what the device DMA'd from RAM, and (before arming a BD) no dirty line
+ * can later evict over the device's DMA.
+ *
+ * IMPORTANT — must be `dc civac`, NOT `dc ivac`: this driver runs at EL0, and only
+ * SCTLR_EL1.UCI's set is EL0-legal — DC CVAU/CVAC/CVAP/CIVAC + IC IVAU. The pure
+ * invalidate `DC IVAC` is EL1-only; issuing it at EL0 TRAPS, which silently killed
+ * the whole RX path (no frames drained -> no DHCP lease) the first time this landed.
+ * (The kernel hal_cpuInvalDataCache uses `dc ivac` because it runs at EL1; the
+ * _init.S:589 comment that lists "ivac" as UCI-enabled is wrong.) `civac` is
+ * functionally correct at both our sync points: before a read no frame line is
+ * CPU-dirty yet (the 2 ETH-pad bytes are written afterwards), so the clean is a
+ * no-op and the invalidate does the work; before arming, the clean flushes the
+ * spare's stale lines to RAM and the incoming frame simply DMAs over them.
  *
  * Callers always pass a whole GENET_MAX_FRAME slot, whose base is GENET_MAX_FRAME
  * (a cache-line multiple) past a page-aligned pool — so start and end are already
  * line-aligned and the op never reaches a neighbouring buffer. The explicit
  * round-down/round-up below keeps that safe even if a partial range is ever passed. */
-static inline void genet_dcacheInvalRx(void *va, size_t len)
+static inline void genet_dcacheCleanInvalRx(void *va, size_t len)
 {
 	uint64_t ctr;
 	uintptr_t line, start, end;
@@ -237,7 +250,7 @@ static inline void genet_dcacheInvalRx(void *va, size_t len)
 
 	__asm__ volatile("dsb sy" ::: "memory");
 	for (; start < end; start += line) {
-		__asm__ volatile("dc ivac, %0" : : "r"(start) : "memory");
+		__asm__ volatile("dc civac, %0" : : "r"(start) : "memory");
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
 }
@@ -670,10 +683,10 @@ static int genet_initRxRing(genet_state_t *state)
 	for (i = 0; i < GENET_TOTAL_DESC; ++i) {
 		state->rx_bd_buf[i] = (uint16_t)i;
 #if GENET_RX_CACHEABLE
-		/* dma_sync_for_device: drop any dirty line (the pool is freshly
-		 * mapped cacheable and may carry the kernel's zeroing) so it can't
-		 * write back over the device's first DMA into this slot. */
-		genet_dcacheInvalRx(state->rx_bufs[i], GENET_MAX_FRAME);
+		/* dma_sync_for_device: clean+invalidate so no dirty line (the pool is
+		 * freshly mapped cacheable and may carry the kernel's zeroing) can write
+		 * back over the device's first DMA into this slot. */
+		genet_dcacheCleanInvalRx(state->rx_bufs[i], GENET_MAX_FRAME);
 #endif
 		bd_off = GENET_RX_DESCS_OFF + i * GENET_DMA_DESC_SIZE;
 		genet_write(state, bd_off + 4, (uint32_t)(state->rx_bufs_phys[i] & 0xFFFFFFFFu));
@@ -816,10 +829,10 @@ static void genet_drainRxRing(genet_state_t *state)
 			int nb;
 
 #if GENET_RX_CACHEABLE
-			/* dma_sync_for_cpu: invalidate this slot's lines before ANY read
-			 * of its contents (zero-copy hand-up OR copy fallback below), so
-			 * the CPU sees what the device DMA'd, not a stale cached copy. */
-			genet_dcacheInvalRx(buf, GENET_MAX_FRAME);
+			/* dma_sync_for_cpu: clean+invalidate this slot's lines before ANY
+			 * read of its contents (zero-copy hand-up OR copy fallback below),
+			 * so the CPU sees what the device DMA'd, not a stale cached copy. */
+			genet_dcacheCleanInvalRx(buf, GENET_MAX_FRAME);
 #endif
 			nb = genet_rxbufPop(state);   /* spare buffer to re-arm this BD */
 
@@ -843,9 +856,9 @@ static void genet_drainRxRing(genet_state_t *state)
 					state->rx_bd_buf[state->rx_index] = (uint16_t)nb;
 #if GENET_RX_CACHEABLE
 					/* dma_sync_for_device: the spare may carry dirty lines from
-					 * its previous life up the stack — drop them so they can't
-					 * write back over the device's next DMA into this slot. */
-					genet_dcacheInvalRx(state->rx_bufs[nb], GENET_MAX_FRAME);
+					 * its previous life up the stack — clean+invalidate so they
+					 * can't write back over the device's next DMA into this slot. */
+					genet_dcacheCleanInvalRx(state->rx_bufs[nb], GENET_MAX_FRAME);
 #endif
 					genet_write(state, bd_off + 4,
 						(uint32_t)(state->rx_bufs_phys[nb] & 0xFFFFFFFFu));

@@ -133,36 +133,11 @@ static int mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 	 * instead of crashing the lwip process. This is a survive-not-crash guard,
 	 * not the root-cause fix. */
 	if ((mbox->ring == NULL) || (mbox->sz == 0) || (mbox->head >= mbox->sz)) {
-		/* TODO(#129): rate-limit — once corrupted, every poll re-detects and the
-		 * flood back-pressures the UART (and wedges the host). Print the first few
-		 * with the struct's PHYSICAL address: the #121/#129 hunt needs to know
-		 * whether va2pa(mbox) lands inside a programmed USB DMA region (DMA overrun)
-		 * or nowhere near one (CPU write). va2pa is cheap and the struct is one
-		 * cache line, so its PA localises the victim for the overlap test. */
+		/* Rate-limited: once corrupted, every poll re-detects it and the flood
+		 * would back-pressure the UART. Warn once, then recover as empty. */
 		static unsigned corruptCount = 0u;
 		if (corruptCount == 0u) {
-			/* ONE atomic debug() line — the victim's PA vs the USB DMA pool
-			 * (USBPOOL log) is the DMA-overrun-vs-CPU-write discriminator (#129). */
-			char d[128];
-			unsigned i;
-			volatile uint64_t *w = (volatile uint64_t *)((char *)mbox - 32);
-			snprintf(d, sizeof(d), "MBOXPA pa=0x%llx ringpa=0x%llx h=%zu sz=%zu\n",
-				(unsigned long long)va2pa((void *)mbox),
-				(unsigned long long)va2pa((void *)mbox->ring),
-				mbox->head, mbox->sz);
-			debug(d);
-			/* TODO(#129) dump raw memory around the victim struct so the OVERWRITING
-			 * data's signature identifies the writer (a recognizable struct/TRB/HID
-			 * report, or an adjacent allocation that overflowed). Atomic debug() per
-			 * line; window = mbox-32 .. mbox+96 (16 u64). The sys_mbox_t field order
-			 * is {lock,push_cond,pop_cond, ring, sz, head, tail,...} so the post-mbox
-			 * words show the clobbered ring/sz/head/tail; the pre-mbox words show any
-			 * overflow source. */
-			for (i = 0u; i < 16u; i++) {
-				snprintf(d, sizeof(d), "MBOXDUMP %+d: 0x%016llx\n",
-					(int)(i * 8u) - 32, (unsigned long long)w[i]);
-				debug(d);
-			}
+			debug("mbox: ring corrupted (ring/sz/head invalid); recovering as empty\n");
 		}
 		corruptCount++;
 		return 0;

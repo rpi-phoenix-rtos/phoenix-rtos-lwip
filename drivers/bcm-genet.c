@@ -285,8 +285,8 @@ static void genet_readMac(genet_state_t *state)
 	uint32_t hi = genet_read(state, UMAC_MAC0);
 	uint32_t lo = genet_read(state, UMAC_MAC1);
 
-	/* UMAC_MAC0 holds bytes [5..2], UMAC_MAC1 holds bytes [1..0] in the
-	 * low half-word — matches the Linux bcmgenet layout. */
+	/* UMAC_MAC0 holds MAC bytes [0..3] (MSB-first), UMAC_MAC1 holds bytes [4..5]
+	 * in its low half-word — matches the Linux bcmgenet layout. */
 	state->mac[0] = (hi >> 24) & 0xFFu;
 	state->mac[1] = (hi >> 16) & 0xFFu;
 	state->mac[2] = (hi >> 8) & 0xFFu;

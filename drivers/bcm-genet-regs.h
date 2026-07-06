@@ -169,13 +169,9 @@
 #define MDIO_CMD_WR          (1u << 26)
 #define MDIO_CMD_RD          (1u << 27)
 #define MDIO_FAIL            (1u << 28)
-#define MDIO_READ_FAILED     (1u << 29)
-#define MDIO_START_BUSY      (1u << 29)   /* alias on GENETv5: bit 29 is
-                                            "start/busy"; controller clears
-                                            when MDIO transaction completes.
-                                            (Some references use bit 30 — to
-                                            be confirmed against hardware in
-                                            Tier 1.) */
+#define MDIO_START_BUSY      (1u << 29)   /* GENETv5: bit 29 is "start/busy";
+                                            the controller clears it when the
+                                            MDIO transaction completes. */
 
 
 /* --- INTRL2_0 / INTRL2_1 (0x0200 / 0x0240 + ...) --------------- */

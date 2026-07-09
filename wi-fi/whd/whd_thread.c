@@ -304,7 +304,7 @@ void whd_thread_quit(whd_driver_t whd_driver)
 
     /* signal main thread and wake it */
     thread_info->thread_quit_flag = WHD_TRUE;
-    result = cy_rtos_set_semaphore(&thread_info->transceive_semaphore, WHD_FALSE);
+    result = cy_rtos_set_semaphore(&thread_info->transceive_semaphore, WHD_TRUE);
     if (result != WHD_SUCCESS)
     {
         WPRINT_WHD_ERROR( ("Error setting semaphore in %s at %d \n", __func__, __LINE__) );
@@ -427,7 +427,6 @@ static void whd_thread_func(cy_thread_arg_t thread_input)
             WPRINT_WHD_ERROR( ("%s: Error bus_fail over %d times\n", __FUNCTION__, WHD_MAX_BUS_FAIL) );
             error_type = WLC_ERR_BUS;
             whd_set_error_handler_locally(whd_driver, &error_type, NULL, NULL, NULL);
-            break;
         }
 
         /* Sleep till WLAN do something */

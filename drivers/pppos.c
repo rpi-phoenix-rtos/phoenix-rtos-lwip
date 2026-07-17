@@ -9,6 +9,12 @@
  * %LICENSE%
  */
 
+#include "lwip/opt.h"
+
+#if PPP_SUPPORT == 0 || PPPOS_SUPPORT == 0
+#warning pppos driver requires both PPP_SUPPORT and PPPOS_SUPPORT. Disabling pppos driver.
+#else
+
 #include "netif-driver.h"
 
 #include <netif/ppp/pppapi.h>
@@ -27,6 +33,33 @@
 #include <termios.h>
 
 #include <pppos_modem.h>
+
+
+#if PPPOS_MODEM_USE_AUTH == 1 && PPP_AUTH_SUPPORT == 0
+#error Modem configured for authentication, but no method is enabled!
+#endif
+
+
+#ifndef PPPOS_USE_CONFIG_FILE
+#define PPPOS_USE_CONFIG_FILE 0
+#endif
+
+/* if 1 - use blocking read with VMIN=0, VTIME=1 */
+#ifndef PPPOS_USE_BLOCKING_READ
+#define PPPOS_USE_BLOCKING_READ 1
+#endif
+
+#if PPPOS_USE_BLOCKING_READ == 0
+#define PPPOS_READ_DATA_TIMEOUT_STEP_MS 5 /* sleep if no data */
+#define PPPOS_READ_DATA_RETRY_MS        1 /* sleep if data was just read */
+#endif
+
+#define PPPOS_READ_AT_TIMEOUT_STEP_MS 5
+
+#define PPPOS_TRYOPEN_SERIALDEV_SEC 3
+#define PPPOS_CONNECT_RETRY_SEC     5
+#define PPPOS_CONNECT_CMD_RETRY_MS  500
+
 
 enum {
 	CONN_STATE_DISCONNECTING,
@@ -97,21 +130,6 @@ static void pppos_printf(const char *format, ...)
 
 #endif
 
-/* if 1 - use blocking read with VMIN=0, VTIME=1 */
-#ifndef PPPOS_USE_BLOCKING_READ
-#define PPPOS_USE_BLOCKING_READ 1
-#endif
-
-#define PPPOS_READ_AT_TIMEOUT_STEP_MS 5
-#if PPPOS_USE_BLOCKING_READ == 0
-#define PPPOS_READ_DATA_TIMEOUT_STEP_MS 5 /* sleep if no data */
-#define PPPOS_READ_DATA_RETRY_MS        1 /* sleep if data was just read */
-#endif
-
-
-#define PPPOS_TRYOPEN_SERIALDEV_SEC 3
-#define PPPOS_CONNECT_RETRY_SEC     5
-#define PPPOS_CONNECT_CMD_RETRY_MS  500
 
 /****** serial handling ******/
 
@@ -342,7 +360,7 @@ static int at_send_cmd(int fd, const char* cmd, int timeout_ms)
 
 // NOTE: this only disconnects the AT modem from the data connection
 // Currently only used in initialisation
-#if PPPOS_DISCONNECT_ON_INIT
+#if PPPOS_MODEM_DISCONNECT_ON_INIT
 static int at_disconnect(int fd)
 {
 	int res;
@@ -353,7 +371,7 @@ static int at_disconnect(int fd)
 			serial_write(fd, (u8_t *)"+++", 3);
 			usleep(1000 * 1000);
 		}
-		res = at_send_cmd(fd, AT_DISCONNECT_CMD, 3000);
+		res = at_send_cmd(fd, PPPOS_MODEM_AT_DISCONNECT_CMD, 3000);
 	} while (res != AT_RESULT_OK && --retries);
 
 	return res;
@@ -566,7 +584,7 @@ static void pppos_mainLoop(void* _state)
 		}
 
 		serial_set_non_blocking(state->fd);
-#if PPPOS_DISCONNECT_ON_INIT
+#if PPPOS_MODEM_DISCONNECT_ON_INIT
 		if (at_disconnect(state->fd) != AT_RESULT_OK)
 			goto fail;
 #endif
@@ -581,9 +599,9 @@ static void pppos_mainLoop(void* _state)
 		if (!at_is_responding(state->fd, 1000)) {
 			goto fail;
 		}
-		const char** at_cmd = at_init_cmds;
+		const char **at_cmd = ppposModem_atInitCmds;
 		while (*at_cmd) {
-			if ((res = at_send_cmd(state->fd, *at_cmd, AT_INIT_CMDS_TIMEOUT_MS)) != AT_RESULT_OK) {
+			if ((res = at_send_cmd(state->fd, *at_cmd, PPPOS_MODEM_AT_INIT_CMDS_TIMEOUT_MS)) != AT_RESULT_OK) {
 				log_warn("failed to initialize modem (cmd=%s), res=%d, retrying", *at_cmd, res);
 				goto fail;
 			}
@@ -606,11 +624,11 @@ static void pppos_mainLoop(void* _state)
 		}
 #endif
 
-		/* Some modems hanging on AT_CONNECT_CMD, some returning error when not ready yet.
+		/* Some modems hanging on PPPOS_MODEM_AT_CONNECT_CMD, some returning error when not ready yet.
 		 * Retrying until receive AT_RESULT_CONNECT or standard timeout is reached (res < 0)
 		 */
-		retries = AT_CONNECT_CMD_TIMEOUT_MS / PPPOS_CONNECT_CMD_RETRY_MS;
-		while ((res = at_send_cmd(state->fd, AT_CONNECT_CMD, AT_CONNECT_CMD_TIMEOUT_MS)) != AT_RESULT_CONNECT) {
+		retries = PPPOS_MODEM_AT_CONNECT_CMD_TIMEOUT_MS / PPPOS_CONNECT_CMD_RETRY_MS;
+		while ((res = at_send_cmd(state->fd, PPPOS_MODEM_AT_CONNECT_CMD, PPPOS_MODEM_AT_CONNECT_CMD_TIMEOUT_MS)) != AT_RESULT_CONNECT) {
 			if (retries-- <= 0 || res < 0) {
 				log_warn("failed to dial PPP, res=%d, retrying", res);
 				goto fail;
@@ -661,8 +679,18 @@ fail:
 static int pppos_netifUp(pppos_priv_t *state)
 {
 #if PPPOS_USE_CONFIG_FILE
+	/*
+	 * FIXME: This code require verification before production use. Spotted issues:
+	 * - early success return, without setting want_connected flag and signaling cond
+	 * - waiting for state->apn[0] in mainloop which may be never set here
+	 */
+	if (state->config_path == NULL) {
+		return 1;
+	}
+
 	char lcfg[256] = { 0 };
 	int line = 0;
+
 	FILE *fcfg = fopen(state->config_path, "r");
 	char *cfgval;
 	char *eq;
@@ -756,27 +784,59 @@ static void pppos_statusCallback(struct netif *netif)
 }
 
 
-static char *cfg_get_next_arg(char *arg)
-{
-	if (arg == NULL || *arg == '\0')
-		return NULL;
+struct iter {
+	char *next;
+};
 
-	for (; *arg; arg++) {
-		if (*arg == ':') {
-			*arg++ = '\0';
-			break;
-		}
+
+static char *iterateArgs(struct iter *iter)
+{
+	if (iter->next == NULL) {
+		return NULL;
 	}
 
-	return arg;
+	char *const cur = iter->next;
+	char *curEnd = strchr(cur, ':');
+	if (curEnd != NULL) {
+		*curEnd = '\0';
+		iter->next = curEnd + 1;
+	}
+	else {
+		iter->next = NULL;
+	}
+
+	return cur;
 }
 
 
+static void initIter(struct iter *iter, char *arg)
+{
+	iter->next = arg;
+}
+
+/*
+ * Arguments:
+ * <control_device>[:<option>...]
+ *
+ * <control_device> Path to the primary control device (starts with AT, switches into PPP) (required)
+ * <option>         Zero or more optional option separated by colons (':')
+ *
+ * Supported options:
+ * st=<status_device> Status device, for retrieving media information (additional AT interface)
+ * cfg=<config_file>  Path to config file, when PPPOS_USE_CONFIG_FILE enabled
+ * up                 Bring the interface up on start
+ * nodefault          Disable default route
+ * nodns              Disable DNS
+ *
+ * Examples:
+ * /dev/usbacm0
+ * /dev/usbacm0:up:st=/dev/usbacm2
+ * /dev/usbacm0:up:nodefault:nodns:st=/dev/usbacm2
+ */
 static int pppos_netifInit(struct netif *netif, char *cfg)
 {
-	pppos_priv_t* state;
+	pppos_priv_t *state;
 	int retries, flags = 0;
-	char *next;
 
 	// NOTE: netif->state cannot be used to keep our private state as it is used by LWiP PPP implementation, pass it as *ctx to callbacks
 	state = netif->state;
@@ -784,48 +844,55 @@ static int pppos_netifInit(struct netif *netif, char *cfg)
 
 	memset(state, 0, sizeof(pppos_priv_t));
 	state->netif = netif;
-	state->serialdev_fn = cfg;
-	state->serialat_fn = "/dev/ttyacm1";
 	state->fd = -1;
 
-#if PPPOS_USE_CONFIG_FILE
-	state->config_path = cfg;
-#endif
+	struct iter iter;
+	initIter(&iter, cfg);
+	state->serialdev_fn = iterateArgs(&iter);
 
-	for (; (next = cfg_get_next_arg(cfg)); cfg = next) {
-		if (!strncmp(cfg, "/dev/", 5)) {
-			state->serialat_fn = cfg;
-			log_info("config device: %s", cfg);
-			continue;
+	if (state->serialdev_fn == NULL) {
+		return ERR_ARG;
+	}
+
+	for (char *arg = iterateArgs(&iter); arg != NULL; arg = iterateArgs(&iter)) {
+		if (strncmp(arg, "st=", 3) == 0) {
+			state->serialat_fn = arg + 3;
 		}
-
-		if (strcmp(cfg, "up") == 0) {
+#if PPPOS_USE_CONFIG_FILE
+		else if (strncmp(arg, "cfg=", 4) == 0) {
+			state->config_path = arg + 4;
+		}
+#endif
+		else if (strcmp(arg, "up") == 0) {
 			flags |= CFG_FLAG_DEFAULT_UP;
 			log_info("config up: yes");
-			continue;
 		}
-
-		if (strcmp(cfg, "nodefault") == 0) {
+		else if (strcmp(arg, "nodefault") == 0) {
 			flags |= CFG_FLAG_NO_DEFAULT_ROUTE;
 			log_info("config no default route: yes");
-			continue;
 		}
-
-		if (strcmp(cfg, "nodns") == 0) {
+		else if (strcmp(arg, "nodns") == 0) {
 			flags |= CFG_FLAG_NO_DNS;
 			log_info("config no DNS: yes");
-			continue;
+		}
+		else {
+			log_error("Not recognized argument: %s", arg);
+			return ERR_ARG;
 		}
 	}
+
+#if PPPOS_USE_CONFIG_FILE
+	if (state->config_path == NULL) {
+		log_error("Config file not provided while PPPOS_USE_CONFIG_FILE enabled");
+		return ERR_ARG;
+	}
+#endif
 
 	mutexCreate(&state->lock);
 	condCreate(&state->cond);
 
 	netif->name[0] = 'p';
 	netif->name[1] = 'p';
-
-	if (!cfg)
-		return ERR_ARG;
 
 	if (!state->ppp) {
 		state->ppp = pppapi_pppos_create(state->netif, pppos_output_cb, pppos_link_status_cb, state);
@@ -844,9 +911,9 @@ static int pppos_netifInit(struct netif *netif, char *cfg)
 			ppp_set_usepeerdns(state->ppp, 1);
 #endif /* LWIP_DNS */
 
-#if PPPOS_USE_AUTH
-		ppp_set_auth(state->ppp, PPPOS_AUTH_TYPE, PPPOS_AUTH_USER, PPPOS_AUTH_PASSWD);
-#endif /* PPPOS_USE_AUTH */
+#if PPPOS_MODEM_USE_AUTH && PPP_AUTH_SUPPORT
+		ppp_set_auth(state->ppp, PPPOS_MODEM_AUTH_TYPE, PPPOS_MODEM_AUTH_USER, PPPOS_MODEM_AUTH_PASSWD);
+#endif
 	}
 
 	beginthread(pppos_mainLoop, 4, (void *)state->main_loop_stack, sizeof(state->main_loop_stack), state);
@@ -873,17 +940,25 @@ static int pppos_netifInit(struct netif *netif, char *cfg)
 const char *pppos_media(struct netif *netif)
 {
 	pppos_priv_t *state = pppos_netifState(netif);
+
+	if (state->serialat_fn == NULL) {
+		return "error/not-configured";
+	}
+
 	int fd = open(state->serialat_fn, O_RDWR | O_NONBLOCK);
-	char buffer[256];
-	int result;
 
-	if (fd < 0)
+	if (fd < 0) {
 		return "error/open";
+	}
 
-	if ((result = at_send_cmd_res(fd, "AT+COPS?\r\n", 300, buffer, sizeof(buffer))) != AT_RESULT_OK)
-		return "error/read";
+	char buffer[256];
+	int result = at_send_cmd_res(fd, "AT+COPS?\r\n", 300, buffer, sizeof(buffer));
 
 	close(fd);
+
+	if (result != AT_RESULT_OK) {
+		return "error/read";
+	}
 
 	if (strstr(buffer, "\",0") != NULL)
 		return "2G";
@@ -910,3 +985,5 @@ void register_driver_pppos(void)
 {
 	register_netif_driver(&pppos_drv);
 }
+
+#endif /* PPP_SUPPORT == 0 || PPPOS_SUPPORT == 0 */

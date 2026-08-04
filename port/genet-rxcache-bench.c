@@ -15,7 +15,7 @@
  * is spawned from main() after the netif comes up. It:
  *   1. connects (TCP) to the default gateway on GENET_RXCACHE_BENCH_PORT,
  *   2. streams bytes off the socket — which drags the full GENET RX DMA path
- *      through the cacheable pool + per-frame `dc ivac` maintenance,
+ *      through the cacheable pool + per-frame `dc civac` maintenance,
  *   3. verifies every byte against a known pattern (byte k of the stream ==
  *      k & 0xFF), so a cache-coherency slip (stale line, missed invalidate)
  *      shows up as a mismatch rather than silent corruption,

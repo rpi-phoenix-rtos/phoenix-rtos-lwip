@@ -830,7 +830,20 @@ static int socket_op(msg_t *msg, int sock)
 				msg->o.err = -EINVAL;
 				break;
 			}
-			msg->o.attr.val = poll_one(&polls, msg->i.attr.val, 0);
+			/* atPollStatus val: low 16 bits = poll event mask. The kernel's
+			 * single-socket poll fast-path (posix_poll, ftInetSocket) may pack a
+			 * block timeout (ms) in the high bits so this dedicated per-socket
+			 * thread BLOCKS in lwip_select until the socket is ready (lwip wakes on
+			 * the netconn callback) instead of the kernel spin-polling every
+			 * POLL_INTERVAL. High bits 0 => timeout 0 => the legacy instantaneous
+			 * snapshot, so every other caller (multi-fd poll, non-inet fds) is
+			 * unchanged. Blocking here only stalls THIS socket's own thread. */
+			{
+				long long v = msg->i.attr.val;
+				int pollev = (int)(v & 0xFFFFLL);
+				time_t block_us = (time_t)(((unsigned long long)v >> 16) * 1000ULL);
+				msg->o.attr.val = poll_one(&polls, pollev, block_us);
+			}
 			msg->o.err = (msg->o.attr.val < 0) ? msg->o.attr.val : EOK;
 			break;
 		case mtClose:

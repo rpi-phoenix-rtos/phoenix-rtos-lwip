@@ -14,7 +14,10 @@
  *   - TX: single-slot synchronous polled descriptor (one in-flight frame
  *     at a time; the linkoutput call returns only after the HW consumer
  *     index advances)
- *   - RX: 256-BD ring with cyclic aliasing of 16 unique pinned buffers,
+ *   - RX: 256-BD ring, each BD armed from a pool of GENET_RX_POOL_SLOTS
+ *     (256 BDs + 256 in-flight slack) UNIQUE pinned buffers managed by a
+ *     free-list (no aliasing; an earlier build aliased only 16 buffers and
+ *     corrupted under back-to-back RX — see the pool comment below),
  *     INTRL2_0_RX_DMA_DONE wakes a service thread that drains BDs into
  *     lwip-owned pbufs and hands them to tcpip_input
  *   - Link state: 1 Hz polling thread (the BCM54213PE PHY's INT_B pin

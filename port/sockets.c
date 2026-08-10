@@ -299,9 +299,16 @@ static int socket_ioctl(int sock, unsigned long request, const void *in_data, vo
 #endif
 	switch (request) {
 		case FIONREAD:
-		case FIONBIO:
-			/* implemented in LWiP socket layer */
+			/* read-only ioctl: the byte count is written back through out_data. */
 			return map_errno(lwip_ioctl(sock, request, out_data));
+
+		case FIONBIO:
+			/* write-only ioctl: the on/off flag arrives in in_data. out_data is
+			 * NULL for a write-only request (see ioctl_unpackEx: response_buf is
+			 * only populated when IOC_OUT is set), so passing out_data here made
+			 * lwip_ioctl read a zero flag and leave the socket blocking -- FIONBIO
+			 * could never enable non-blocking mode. Pass the actual flag. */
+			return map_errno(lwip_ioctl(sock, request, (void *)in_data));
 
 		case SIOCGIFNAME: {
 			struct ifreq *ifreq = (struct ifreq *)out_data;

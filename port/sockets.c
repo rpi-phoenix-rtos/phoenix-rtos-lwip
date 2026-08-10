@@ -967,13 +967,19 @@ static int do_getnameinfo(const struct sockaddr *sa, socklen_t addrlen, char *ho
 	if (sa->sa_family == AF_INET) {
 		struct sockaddr_in *sa_in = (struct sockaddr_in *)sa;
 
-		if (host != NULL) {
+		/* Guard on sz > 0: servsz/hostsz are unsigned, so `buf[sz - 1]` with
+		 * sz == 0 wraps to buf[0xffffffff] -> an out-of-bounds write that faulted
+		 * the whole lwip server (a caller may pass a non-NULL buffer with size 0,
+		 * e.g. getnameinfo for only the host or only the service). snprintf already
+		 * NUL-terminates within a non-zero buffer; the explicit terminator is just
+		 * defensive and must not run when sz == 0. */
+		if (host != NULL && hostsz > 0) {
 			snprintf(host, hostsz, "%u.%u.%u.%u", (unsigned char)sa->sa_data[2], (unsigned char)sa->sa_data[3],
 				(unsigned char)sa->sa_data[4], (unsigned char)sa->sa_data[5]);
 			host[hostsz - 1] = '\0';
 		}
 
-		if (serv != NULL) {
+		if (serv != NULL && servsz > 0) {
 			snprintf(serv, servsz, "%u", ntohs(sa_in->sin_port));
 			serv[servsz - 1] = '\0';
 		}

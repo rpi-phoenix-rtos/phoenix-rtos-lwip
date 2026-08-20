@@ -44,6 +44,17 @@ ifeq ($(LWIP_G3_BUILD), yes)
 CFLAGS += -I$(PREFIX_BUILD)/phrtos3-include -I$(PREFIX_PROJECT)/G3-PLC/ps_g3_phy/api/include
 endif
 
+# Raspberry Pi 4B: enable LwIP stats (LINK/IP/TCP/MEM counters + the /dev/ipstats
+# dump device) as a standing network-diagnostic facility. The Pi 4 has 4 GB RAM so
+# the counter overhead is negligible; memory-constrained MCU targets keep the
+# stats-off default (this is scoped to aarch64a72-generic). Must be set BEFORE the
+# lwip-core static-lib include below, or stats.c / the ip4.c+tcp_in.c increment
+# sites would compile without it. LWIP_STATS is #ifndef-guarded in lwipopts.h, so
+# this -D wins and turns on the LWIP_STATS sub-options block.
+ifeq ($(TARGET_FAMILY)-$(TARGET_SUBFAMILY),aarch64a72-generic)
+CFLAGS += -DLWIP_STATS=1
+endif
+
 NAME := lwip-core
 SRCS := $(LWIP_SRCS)
 # Disabling warnings from lib-lwip, as their code does not comply with these rules for now.

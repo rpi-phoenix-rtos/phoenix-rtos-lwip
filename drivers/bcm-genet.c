@@ -1157,6 +1157,12 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	 * BD index wraps at TOTAL_DESC. */
 	state->tx_index = (state->tx_index + 1u) % GENET_TOTAL_DESC;
 	state->tx_prod_index = (state->tx_prod_index + 1u) & 0xFFFFu;
+	/* Fence the TX descriptor + Normal-NC payload writes so they are globally
+	 * visible before the Device-MMIO producer-index doorbell below — genet_write
+	 * is a bare volatile store with no implicit barrier (B7b). Netboot NFS is
+	 * empirically reliable (Normal-NC ordering is looser-but-adequate on this SoC),
+	 * so this is a defensive correctness fence, not a bug fix. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	genet_write(state, ring_off + GENET_TDMA_RING_PROD_INDEX, state->tx_prod_index);
 
 	/* Polled completion. TX is single-slot synchronous: at most one

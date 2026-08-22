@@ -1072,26 +1072,23 @@ static int do_getifaddrs(char *buf, size_t *buflen)
 	struct ifaddrs *dest;
 	struct netif *netif;
 	char *addrdest, *strdest;
-	size_t n_netifs = 0, n_ifaddrs = 0, needed;
-	size_t n_addrs = 0, str_needed = 0, addr_needed = 0;
+	size_t n_ifaddrs = 0, needed;
+	size_t str_needed = 0, addr_needed = 0;
 #if LWIP_IPV6
 	struct sockaddr_in6 *sin6;
 	int i;
 #endif
 
 	NETIF_FOREACH(netif) {
-		n_netifs++;
 		n_ifaddrs++;
 		/* lwip_netif_name | netif_num | '\0' */
 		str_needed += sizeof(netif->name) + 2;
 		/* IPv4 addr, netmask, gw/dsy */
-		n_addrs += 3;
 		addr_needed += 3 * sizeof(struct sockaddr_in);
 #if LWIP_IPV6
 		/* Count IPv6 addresses */
 		for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
 			if (!ip6_addr_isinvalid(netif_ip6_addr_state(netif, i))) {
-				n_addrs += 2;
 				n_ifaddrs++;
 				addr_needed += 2 * sizeof(struct sockaddr_in6);
 			}

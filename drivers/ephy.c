@@ -247,6 +247,7 @@ static uint32_t ephy_readPhyId(const eth_phy_state_t *phy)
 		ephy_printf(phy, "DigCtl 0x%04x AFECtl1 0x%04x", oui, ret);
 	*/
 
+	(void)oui; /* computed only for the optional ephy_printf traces above */
 	return phyid;
 }
 

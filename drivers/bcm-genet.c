@@ -1103,10 +1103,19 @@ static void genet_linkPollThread(void *arg)
 		 * means the drain is falling behind. Healthy = all-zerocopy, copyfb/dropped 0.
 		 * Gated (GENET_RXSTATS_LOG) so user-mode builds keep the console quiet (#31). */
 #if GENET_RXSTATS_LOG
-		if ((++tick % 60u) == 0u) {
-			genet_printf(state, "RXSTATS seen=%lu zerocopy=%lu copyfb=%lu dropped=%lu free=%d",
-				state->rx_pkts_seen, state->rx_zerocopy, state->rx_copyfallback,
-				state->rx_pkts_dropped, state->rx_free_top);
+		if ((++tick % 5u) == 0u) {
+			/* TEMP diag (gigabit RX-loss triage): rbuf_ovfl = HW RX-FIFO overrun
+			 * (RBUF+0x94); prod = HW RDMA producer, cidx = driver consumer — if
+			 * prod races ahead of cidx the drain is wedged/behind. dropped =
+			 * driver-side drop. All three 0 while packets are still lost ⇒ the
+			 * loss is HW-FCS (physical), not ring/drain. */
+			uint32_t rbuf_ovfl = genet_read(state, GENET_RBUF_OFF + 0x94u);
+			uint32_t prod = genet_read(state, GENET_RX_RINGS_OFF +
+				GENET_DEFAULT_RING * GENET_DMA_RING_SIZE +
+				GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu;
+			genet_printf(state, "RXSTATS seen=%lu drop=%lu copyfb=%lu free=%d rbuf_ovfl=%u prod=%u cidx=%u",
+				state->rx_pkts_seen, state->rx_pkts_dropped, state->rx_copyfallback,
+				state->rx_free_top, rbuf_ovfl, prod, state->rx_c_index & 0xFFFFu);
 		}
 #else
 		(void)tick;

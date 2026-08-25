@@ -973,7 +973,19 @@ static void genet_irqThread(void *arg)
 	mutexLock(state->irq_lock);
 	for (;;) {
 		while (state->irq_events == 0u) {
-			condWait(state->irq_cond, state->irq_lock, 0);
+			/* Bounded (100 ms) wait, NOT infinite. genet_irqHandler runs in
+			 * interrupt context and sets state->irq_events WITHOUT holding
+			 * irq_lock (it can't block), so on this 4-core SMP box its signal can
+			 * be lost if it fires in the window between the irq_events==0 test
+			 * above and this thread parking in condWait. An infinite wait would
+			 * then wedge RX forever with RX_DMA_DONE left masked (only line ~990
+			 * re-unmasks, downstream of the missed wake) -> RX dies, host
+			 * retransmits go unanswered, NFS stalls. A 100 ms bound turns a lost
+			 * wakeup into a <=100 ms hiccup: we re-read irq_events (which the ISR
+			 * already set) and recover. Same lost-wakeup class as the libphoenix
+			 * semaphore fix e75c4fe; neither FreeBSD nor NetBSD masks RX during
+			 * service, so they can't wedge this way. */
+			condWait(state->irq_cond, state->irq_lock, 100000);
 		}
 		events = state->irq_events;
 		state->irq_events = 0u;

@@ -595,6 +595,16 @@ static void ephy_restartAN(const eth_phy_state_t *phy)
 		ephy_regWrite(phy, EPHY_COMMON_09_GBCR, (1U << 9));
 	}
 	if (phy->model == ephy_bcm54213pe) {
+		/* Don't advertise EEE (7.60). The BCM54213PE's AutogrEEEn Low-Power-Idle
+		 * puts the PHY to sleep during idle gaps at gigabit; the first RGMII RX
+		 * frame after each wake is occasionally corrupted → HW FCS drop → sparse
+		 * traffic (e.g. an NFS mount handshake, all packets follow an idle gap)
+		 * loses ~1-in-10 while dense traffic (firmware TFTP) never idles and is
+		 * clean. This is the Phoenix equivalent of the Pi's `dtparam=eee=off`
+		 * remedy; the RTL8211 branch above already does the same for the same
+		 * reason. (Clock-delay config is register-identical to Linux, so it was
+		 * NOT the residual-loss cause.) */
+		ephy_mmdWrite(phy, 0x7, 0x3c /* EEE Advertisement (7.60) */, 0);
 		/* rgmii-rxid PHY-side clock delays (RX skew on, TX delay off) — required
 		 * for gigabit RX; ephy_reset() above wiped the firmware's shadow config. */
 		ephy_bcm54213pe_configClockDelay(phy);

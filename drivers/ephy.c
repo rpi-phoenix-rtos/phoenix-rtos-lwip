@@ -142,8 +142,26 @@ enum {
  * negotiated HCD speed/duplex once AN completes, which is the cheapest
  * way to read the link state without parsing AN advertisement masks. */
 enum {
+	EPHY_BCM54213_18_AUXCTL = 0x18,   /* Auxiliary Control (shadow-selected) */
 	EPHY_BCM54213_19_AUXSTAT = 0x19,
+	EPHY_BCM54213_1C_SHD = 0x1C,      /* Shadow register (bank-selected) */
 };
+
+/* Aux-control (0x18) MISC shadow — RGMII RXC-RXD skew (PHY-side RX clock delay).
+ * Values from Linux include/linux/brcmphy.h (MII_BCM54XX_AUXCTL_*). */
+#define BCM_AUXCTL_SHDWSEL_MASK       0x0007
+#define BCM_AUXCTL_SHDWSEL_READ_SHIFT 12
+#define BCM_AUXCTL_SHDWSEL_MISC       0x0007
+#define BCM_AUXCTL_MISC_WREN          0x8000
+#define BCM_AUXCTL_MISC_RGMII_SKEW_EN 0x0100
+
+/* Shadow (0x1C) 1000BASE-T clock control — PHY-side TX (GTXCLK) delay.
+ * Values from brcmphy.h (MII_BCM54XX_SHD_*, BCM54810_SHD_CLK_CTL). */
+#define BCM_SHD_WRITE                  0x8000
+#define BCM_SHD_VAL(x)                 (((x) & 0x1fU) << 10)
+#define BCM_SHD_DATA(x)                ((x) & 0x3ffU)
+#define BCM54810_SHD_CLK_CTL           0x03
+#define BCM54810_SHD_CLK_CTL_GTXCLK_EN (1U << 9)
 
 
 #define ephy_printf(phy, fmt, ...) printf("lwip: ephy%u.%u: " fmt "\n", phy->bus, phy->addr, ##__VA_ARGS__)
@@ -532,6 +550,35 @@ static inline uint16_t ephy_bmcrMaxSpeedMask(const eth_phy_state_t *phy)
 }
 
 
+/* Program the BCM54213PE's PHY-side RGMII clock delays for phy-mode "rgmii-rxid"
+ * (Pi 4 DT): the PHY must add the ~2 ns RX clock delay (RXC-RXD skew) and must NOT
+ * add a TX delay (the GENET MAC provides that via ID_MODE_DIS cleared). ephy_reset()
+ * / the GPHY hard-reset wipe the shadow config the firmware set, so we must
+ * re-establish it here or gigabit RX corrupts (100M's loose timing hides it, but at
+ * 125 MHz DDR the MAC samples RX on the wrong edge → every frame dropped → DHCP fails).
+ * Mirrors Linux bcm54xx_config_clock_delay() (drivers/net/phy/broadcom.c). */
+static void ephy_bcm54213pe_configClockDelay(const eth_phy_state_t *phy)
+{
+	uint16_t val;
+
+	/* Enable RGMII RXC-RXD skew (RX delay) via the 0x18 MISC shadow. */
+	ephy_regWrite(phy, EPHY_BCM54213_18_AUXCTL,
+		BCM_AUXCTL_SHDWSEL_MASK | (BCM_AUXCTL_SHDWSEL_MISC << BCM_AUXCTL_SHDWSEL_READ_SHIFT));
+	val = ephy_regRead(phy, EPHY_BCM54213_18_AUXCTL);
+	val |= BCM_AUXCTL_MISC_WREN | BCM_AUXCTL_MISC_RGMII_SKEW_EN;
+	/* bcm54xx_auxctl_write ORs the shadow-select back into the low 3 bits. */
+	ephy_regWrite(phy, EPHY_BCM54213_18_AUXCTL, BCM_AUXCTL_SHDWSEL_MISC | val);
+
+	/* Disable the PHY TX (GTXCLK) delay via the 0x1C shadow bank 0x03 — otherwise a
+	 * double TX delay stacks on the MAC's ID_MODE_DIS-cleared TX delay at gigabit. */
+	ephy_regWrite(phy, EPHY_BCM54213_1C_SHD, BCM_SHD_VAL(BCM54810_SHD_CLK_CTL));
+	val = BCM_SHD_DATA(ephy_regRead(phy, EPHY_BCM54213_1C_SHD));
+	val &= ~BCM54810_SHD_CLK_CTL_GTXCLK_EN;
+	ephy_regWrite(phy, EPHY_BCM54213_1C_SHD,
+		BCM_SHD_WRITE | BCM_SHD_VAL(BCM54810_SHD_CLK_CTL) | BCM_SHD_DATA(val));
+}
+
+
 static void ephy_restartAN(const eth_phy_state_t *phy)
 {
 	/* max speed, enable AN, restart AN, full-duplex */
@@ -546,6 +593,11 @@ static void ephy_restartAN(const eth_phy_state_t *phy)
 		phy->model == ephy_bcm54213pe) {
 		/* adv: 1000M-FD */
 		ephy_regWrite(phy, EPHY_COMMON_09_GBCR, (1U << 9));
+	}
+	if (phy->model == ephy_bcm54213pe) {
+		/* rgmii-rxid PHY-side clock delays (RX skew on, TX delay off) — required
+		 * for gigabit RX; ephy_reset() above wiped the firmware's shadow config. */
+		ephy_bcm54213pe_configClockDelay(phy);
 	}
 	/* adv: no-next-page, no-rem-fault, no-pause, no-T4, 100M/10M-FD & 10M-HD, 802.3 */
 	ephy_regWrite(phy, EPHY_COMMON_04_ANAR, (1U << 8) | (1U << 6) | (1U << 5) | 1U);

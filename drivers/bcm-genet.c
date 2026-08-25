@@ -540,8 +540,9 @@ static void genet_configRgmii(genet_state_t *state)
 	 * same write for RGMII / RGMII_RXID phy modes. */
 	genet_write(state, SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
 
-	/* Pi 4 DT sets phy-mode = "rgmii-rxid": internal RX delay enabled
-	 * (clear ID_MODE_DIS), TX delay from PCB traces.
+	/* Pi 4 DT sets phy-mode = "rgmii-rxid": clearing ID_MODE_DIS enables the
+	 * GENET MAC's internal *TX* clock delay (the RX delay is added PHY-side —
+	 * see ephy_bcm54213pe_configClockDelay). TX delay may also come from PCB traces.
 	 *
 	 * OOB_DISABLE must be SET: that tells the MAC to take link state
 	 * from RGMII_LINK (which we write below) instead of the out-of-band

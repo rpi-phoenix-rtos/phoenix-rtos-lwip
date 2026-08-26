@@ -94,13 +94,15 @@
  * (-DGENET_RX_CACHEABLE=1) where genet-rxcache-bench verifies byte-correctness.
  */
 #ifndef GENET_RX_CACHEABLE
-#define GENET_RX_CACHEABLE 0  /* uncached RX pool (known-good, ~7.9 MB/s NFS read). Enabling
-                               * cacheable RX corrupts received data (NFS READ → ERANGE) with the
-                               * CURRENT genet_dcacheCleanInvalRx sequence — confirmed 2026-08-26
-                               * with the export-drop confound removed. Cached RX is the design
-                               * Linux/NetBSD/FreeBSD use and is the throughput lever, but it needs
-                               * a corrected invalidate-after-DMA / line-aligned-buffer maintenance
-                               * sequence first (see docs/inprogress/genet-rx-cache-crossos.md).
+#define GENET_RX_CACHEABLE 0  /* uncached RX pool (shipped default). Cacheable RX (=1) is FASTER
+                               * (raw TCP 260→300 Mbit/s, NFS 16.9→18.9 MB/s) and, post-
+                               * LWIP_TCPIP_CORE_LOCKING_INPUT, DATA-SAFE: HW-verified bit-exact
+                               * (sha256 of a 128MB NFS read matched the host) with drop=0/
+                               * rbuf_ovfl=0 — the old ERANGE stopped reproducing (mechanism
+                               * unexplained; it was tied to the pre-core-locking mbox input path).
+                               * NOT yet flipped to 1: the remaining gate is validating no GPU
+                               * framebuffer corruption under combined GPU+network load (an older,
+                               * possibly-stale warning). Flip to 1 once that passes.
                                * copy (the uncached copy is the ~8 MB/s app-drain ceiling
                                * per ss: rwnd_limited 92%, checksum ruled out). The drain
                                * does genet_dcacheCleanInvalRx maintenance under this gate.

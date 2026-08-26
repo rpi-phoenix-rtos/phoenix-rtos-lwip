@@ -51,6 +51,8 @@
 #include "lwip/pbuf.h"
 #include "lwip/dhcp.h"
 #include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h" /* LOCK_TCPIP_CORE / UNLOCK_TCPIP_CORE (RX-input batching) */
+#include "netif/ethernet.h"       /* ethernet_input (un-locked inner RX-input fn) */
 
 #include <sys/interrupt.h>
 #include <sys/mman.h>
@@ -124,6 +126,34 @@
  * harmless no-op once this defines it). */
 #ifndef GENET_RXSTATS_LOG
 #define GENET_RXSTATS_LOG 0
+#endif
+
+/* RX-input core-lock batching (gigabit Option C, lever #1). Under
+ * LWIP_TCPIP_CORE_LOCKING_INPUT, netif->input (=tcpip_input) locks+unlocks the
+ * TCPIP core lock PER PACKET; on this microkernel a mutex op is a ~2.25 us
+ * syscall (~4.5 us/pair, HW-measured), and RXPROF showed ~39.5 us/frame of RX
+ * cost dominated by ~6 such lock pairs/frame. Hold the core lock ONCE across a
+ * drain burst and call ethernet_input directly per frame, removing the per-frame
+ * core-lock pair. Same lock + same serialization (held marginally longer); the
+ * call chain under the lock (ethernet_input -> ... -> tcp_output -> genet TX) is
+ * exactly what already runs under the per-frame lock today, so no new deadlock
+ * class. The value is the CHUNK size: the lock is released+reacquired every N
+ * frames so a large backlog can't hold it unboundedly (releasing between frames
+ * is safe -- no lwip state is carried across the frame boundary). 0 = disabled
+ * (stock per-frame netif->input). DEFAULT-OFF until HW-validated; enable/tune
+ * with `make GENET_RX_INPUT_BATCH=<N>`. Requires LWIP_TCPIP_CORE_LOCKING_INPUT. */
+#ifndef GENET_RX_INPUT_BATCH
+#define GENET_RX_INPUT_BATCH 0
+#endif
+
+#if (GENET_RX_INPUT_BATCH > 0) && LWIP_TCPIP_CORE_LOCKING_INPUT
+#define GENET_RX_INPUT(netif, p) ethernet_input((p), (netif))
+#define GENET_RX_BURST_LOCK()    LOCK_TCPIP_CORE()
+#define GENET_RX_BURST_UNLOCK()  UNLOCK_TCPIP_CORE()
+#else
+#define GENET_RX_INPUT(netif, p) ((netif)->input((p), (netif)))
+#define GENET_RX_BURST_LOCK()    ((void)0)
+#define GENET_RX_BURST_UNLOCK()  ((void)0)
 #endif
 
 /* TEST: adopt the VideoCore firmware's already-trained gigabit PHY — skip the PHY
@@ -947,6 +977,10 @@ static void genet_drainRxRing(genet_state_t *state)
 #if GENET_RXSTATS_LOG
 	state->drain_wakes++;
 #endif
+#if (GENET_RX_INPUT_BATCH > 0) && LWIP_TCPIP_CORE_LOCKING_INPUT
+	unsigned rx_batched = 0;
+	GENET_RX_BURST_LOCK();
+#endif
 	while (prod != (state->rx_c_index & 0xFFFFu)) {
 		uint32_t bd_off = GENET_RX_DESCS_OFF +
 			state->rx_index * GENET_DMA_DESC_SIZE;
@@ -1076,7 +1110,7 @@ static void genet_drainRxRing(genet_state_t *state)
 						time_t _i0 = 0, _i1 = 0;
 						err_t _ir;
 						gettime(&_i0, NULL);
-						_ir = state->netif->input(p, state->netif);
+						_ir = GENET_RX_INPUT(state->netif, p);
 						gettime(&_i1, NULL);
 						state->input_us += (unsigned long long)(_i1 - _i0);
 						state->input_calls++;
@@ -1089,7 +1123,7 @@ static void genet_drainRxRing(genet_state_t *state)
 						}
 					}
 #else
-					if (state->netif->input(p, state->netif) == ERR_OK) {
+					if (GENET_RX_INPUT(state->netif, p) == ERR_OK) {
 						state->rx_zerocopy++;
 					}
 					else {
@@ -1117,7 +1151,7 @@ static void genet_drainRxRing(genet_state_t *state)
 					((uint8_t *)p->payload)[0] = 0;
 					((uint8_t *)p->payload)[1] = 0;
 					if (pbuf_take_at(p, frame, pay_len, ETH_PAD_SIZE) == ERR_OK) {
-						if (state->netif->input(p, state->netif) != ERR_OK) {
+						if (GENET_RX_INPUT(state->netif, p) != ERR_OK) {
 							pbuf_free(p);
 							state->rx_pkts_dropped++;
 						}
@@ -1140,7 +1174,19 @@ static void genet_drainRxRing(genet_state_t *state)
 
 		state->rx_index = (state->rx_index + 1u) % GENET_TOTAL_DESC;
 		state->rx_c_index = (state->rx_c_index + 1u) & 0xFFFFu;
+#if (GENET_RX_INPUT_BATCH > 0) && LWIP_TCPIP_CORE_LOCKING_INPUT
+		/* Bound the core-lock hold: release+reacquire every CHUNK frames so a
+		 * large backlog can't starve other core-lock users (app TX, timers). */
+		if (++rx_batched >= (unsigned)GENET_RX_INPUT_BATCH) {
+			GENET_RX_BURST_UNLOCK();
+			rx_batched = 0;
+			GENET_RX_BURST_LOCK();
+		}
+#endif
 	}
+#if (GENET_RX_INPUT_BATCH > 0) && LWIP_TCPIP_CORE_LOCKING_INPUT
+	GENET_RX_BURST_UNLOCK();
+#endif
 
 	/* Hand all consumed BDs back to HW in one shot. */
 	genet_write(state, ring_off + GENET_RDMA_RING_CONS_INDEX,

@@ -41,6 +41,15 @@ ifneq ($(GENET_RX_CACHEABLE),)
 CFLAGS += -DGENET_RX_CACHEABLE=$(GENET_RX_CACHEABLE)
 endif
 
+# RX-input core-lock batching (gigabit Option C lever #1): hold LOCK_TCPIP_CORE
+# once per N-frame drain burst instead of per packet (netif->input re-locks the
+# TCPIP core lock each call; a mutex op is a ~2.25us syscall here). Value = chunk
+# size (frames per lock hold); 0 = per-frame (stock). Default set by the guard in
+# bcm-genet.c. Requires LWIP_TCPIP_CORE_LOCKING_INPUT.
+ifneq ($(GENET_RX_INPUT_BATCH),)
+CFLAGS += -DGENET_RX_INPUT_BATCH=$(GENET_RX_INPUT_BATCH)
+endif
+
 # Raw TCP throughput bench (gigabit-NFS "size the prize"): opt-in lwiperf TCP
 # server (iperf 2.0.5 protocol) so a host `iperf -c <pi>` measures the
 # lwip-core + driver RX ceiling WITHOUT the socket-copy / NFS-RPC layers above

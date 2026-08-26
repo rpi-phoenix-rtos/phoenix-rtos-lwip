@@ -40,6 +40,16 @@ CFLAGS += -Wundef -Iinclude -Ilib-lwip/src/include -I"$(LWIPOPTS_DIR)"
 ifeq ($(GENET_RX_CACHEABLE),1)
 CFLAGS += -DGENET_RX_CACHEABLE=1
 endif
+
+# Raw TCP throughput bench (gigabit-NFS "size the prize"): opt-in lwiperf TCP
+# server (iperf 2.0.5 protocol) so a host `iperf -c <pi>` measures the
+# lwip-core + driver RX ceiling WITHOUT the socket-copy / NFS-RPC layers above
+# it — isolating whether the ~8 MB/s NFS-read ceiling is the driver drain or a
+# higher layer. DEFAULT-OFF. Enable with `make LWIP_IPERF=1 ...`.
+ifeq ($(LWIP_IPERF),1)
+LWIP_SRCS += $(LWIPERFFILES)
+CFLAGS += -DLWIP_IPERF=1
+endif
 ifeq ($(LWIP_G3_BUILD), yes)
 CFLAGS += -I$(PREFIX_BUILD)/phrtos3-include -I$(PREFIX_PROJECT)/G3-PLC/ps_g3_phy/api/include
 endif

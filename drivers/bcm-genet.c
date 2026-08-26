@@ -100,7 +100,13 @@
 /* TEMP diag: per-frame NFS/TCP RX logging in the drain path to discriminate
  * delivered-but-corrupt from before-ring loss (gigabit NFS triage). Revert to 0. */
 #ifndef GENET_RXFRAME_LOG
-#define GENET_RXFRAME_LOG 1
+#define GENET_RXFRAME_LOG 0
+#endif
+
+/* TEST: adopt the VideoCore firmware's already-trained gigabit PHY — skip the PHY
+ * hard reset here + the soft reset/autoneg-restart in ephy.c. Revert to 0. */
+#ifndef GENET_PHY_ADOPT_FW
+#define GENET_PHY_ADOPT_FW 0
 #endif
 
 /* irq-thread poll-drain backstop interval (us): the RX interrupt for a frame
@@ -529,7 +535,7 @@ static const mdio_bus_ops_t genet_mdio_ops = {
 
 /* --- PHY reset + RGMII configuration ---------------------------- */
 
-static void genet_phyHardReset(genet_state_t *state)
+__attribute__((unused)) static void genet_phyHardReset(genet_state_t *state)
 {
 	/* Strobe EXT_GPHY_RESET low/high. The BCM54213PE on Pi 4 takes its
 	 * hard reset off the GENET block's EXT_GPHY_CTRL register, not a
@@ -807,12 +813,18 @@ static int genet_initRxRing(genet_state_t *state)
 	 *   - RBUF_TBUF_SIZE_CTRL=1 is the v3+ init step
 	 */
 	uint32_t rbuf = genet_read(state, RBUF_CTRL);
-	rbuf |= RBUF_ALIGN_2B | RBUF_64B_EN;
+	rbuf |= RBUF_ALIGN_2B;  /* TEST: RBUF_64B_EN OFF to match firmware (rbufctl fw=0xc040) — no 64-byte RX status block; keep the 2-byte align for lwip's ETH_PAD */
 	genet_write(state, RBUF_CTRL, rbuf);
 
-	uint32_t chk = genet_read(state, RBUF_CHK_CTRL);
-	chk |= RBUF_RXCHK_EN | RBUF_L3_PARSE_DIS;
-	genet_write(state, RBUF_CHK_CTRL, chk);
+	/* TEST: match the VideoCore firmware's proven-working gigabit config, which leaves
+	 * RBUF_CHK_CTRL = 0 (RX checksum checker OFF). Phoenix was enabling RBUF_RXCHK_EN +
+	 * RBUF_L3_PARSE_DIS (dump: fw rbufchk=0x00 vs phx 0x21). The RX checker sits in the
+	 * RBUF front-end — exactly where the missed reply is dropped (MAC-front-end, upstream
+	 * of RDMA, no FCS, MIB doesn't count it) — so a checker misbehaving on a frame that
+	 * closely trails our TX is a candidate for the gigabit post-TX RX drop. The 64-byte
+	 * status prefix (RBUF_64B_EN) is separate and left ON, so RX frame parsing is
+	 * unchanged; the checker just no longer inspects/gates the RX stream. */
+	genet_write(state, RBUF_CHK_CTRL, 0);
 
 	genet_write(state, RBUF_TBUF_SIZE_CTRL, 1);
 
@@ -1275,10 +1287,11 @@ static void genet_setLinkState(void *arg, int state_up)
 		/* Phoenix's post-config MAC state — compare against the "GENETCFG fw:" dump
 		 * (firmware's proven-good gigabit config) taken at driver entry. */
 		genet_printf(state,
-			"GENETCFG phx: oob=0x%08x pwrmgmt=0x%08x portctrl=0x%08x umaccmd=0x%08x gphyctrl=0x%08x",
+			"GENETCFG phx: oob=0x%08x pwrmgmt=0x%08x portctrl=0x%08x umaccmd=0x%08x gphyctrl=0x%08x rbufctl=0x%08x tbufctl=0x%08x rbufchk=0x%08x",
 			genet_read(state, EXT_RGMII_OOB_CTRL), genet_read(state, EXT_EXT_PWR_MGMT),
 			genet_read(state, SYS_PORT_CTRL), genet_read(state, UMAC_CMD),
-			genet_read(state, EXT_GPHY_CTRL));
+			genet_read(state, EXT_GPHY_CTRL), genet_read(state, RBUF_CTRL),
+			genet_read(state, 0x600u /* TBUF_CTRL */), genet_read(state, RBUF_CHK_CTRL));
 #endif
 	}
 	state->last_link_up = 1;
@@ -1308,7 +1321,7 @@ static void genet_setLinkState(void *arg, int state_up)
  * re-enable it with -DGENET_RXSTATS_LOG=1. (The stats counters are always kept;
  * only the console print is gated.) */
 #ifndef GENET_RXSTATS_LOG
-#define GENET_RXSTATS_LOG 1  /* TEMP: gigabit RX-stranding verify */
+#define GENET_RXSTATS_LOG 0  /* TEMP: gigabit RX-stranding verify */
 #endif
 
 static void genet_linkPollThread(void *arg)
@@ -1576,10 +1589,11 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	 * proven-good reference on the same silicon. Compared against Phoenix's post-config
 	 * dump (after link-up), any divergence is a candidate for the post-TX RX-drop. */
 	genet_printf(state,
-		"GENETCFG fw: oob=0x%08x pwrmgmt=0x%08x portctrl=0x%08x umaccmd=0x%08x gphyctrl=0x%08x",
+		"GENETCFG fw: oob=0x%08x pwrmgmt=0x%08x portctrl=0x%08x umaccmd=0x%08x gphyctrl=0x%08x rbufctl=0x%08x tbufctl=0x%08x rbufchk=0x%08x",
 		genet_read(state, EXT_RGMII_OOB_CTRL), genet_read(state, EXT_EXT_PWR_MGMT),
 		genet_read(state, SYS_PORT_CTRL), genet_read(state, UMAC_CMD),
-		genet_read(state, EXT_GPHY_CTRL));
+		genet_read(state, EXT_GPHY_CTRL), genet_read(state, RBUF_CTRL),
+		genet_read(state, 0x600u /* TBUF_CTRL */), genet_read(state, RBUF_CHK_CTRL));
 #endif
 
 	/* MAC source priority on Pi 4:
@@ -1643,7 +1657,15 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	netif->mtu = 1500;
 	netif->flags |= NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_LINK_UP;
 
+#if !GENET_PHY_ADOPT_FW
+	/* GENET_PHY_ADOPT_FW: skip the PHY hard-reset (and, in ephy.c, the soft reset +
+	 * autoneg-restart) to ADOPT the VideoCore firmware's already-trained gigabit PHY.
+	 * 1000BASE-T echo-cancellation/DSP training state is NOT register-visible; a wrong
+	 * post-reset training blinds the PHY to RX during/after its own TX (the exact
+	 * post-TX, no-FCS, gigabit-only drop). Adopting the firmware's trained PHY tests
+	 * that wholesale. genet_configRgmii is MAC-side and always runs. */
 	genet_phyHardReset(state);
+#endif
 	genet_configRgmii(state);
 
 	state->mdio_bus = register_mdio_bus(&genet_mdio_ops, state);

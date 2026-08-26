@@ -329,7 +329,10 @@
  * alignment pad, and the real multicast dst 01:00:5e:00:XX:XX starts
  * at buf[66].
  */
-#define GENET_RX_STATUS_PREFIX   66u
+/* TEST: match the firmware's plain RX (RBUF_64B_EN OFF). With only RBUF_ALIGN_2B the
+ * HW prepends just the 2-byte alignment (no 64-byte status block), so the prefix is 2.
+ * (Was 66 = 2 align + 64 status when RBUF_64B_EN was set.) */
+#define GENET_RX_STATUS_PREFIX   2u
 
 #define GENET_MAX_FRAME      2048u /* per-buffer slot size */
 #define GENET_BUF_ALIGN      32u   /* skb alignment from Linux SKB_ALIGNMENT */

@@ -164,6 +164,12 @@ enum {
 #define BCM54810_SHD_CLK_CTL_GTXCLK_EN (1U << 9)
 
 
+/* TEST: adopt the firmware's already-trained gigabit PHY — skip soft reset + autoneg
+ * restart (and the PHY hard reset in bcm-genet.c). Revert to 0. */
+#ifndef GENET_PHY_ADOPT_FW
+#define GENET_PHY_ADOPT_FW 0
+#endif
+
 #define ephy_printf(phy, fmt, ...) printf("lwip: ephy%u.%u: " fmt "\n", phy->bus, phy->addr, ##__VA_ARGS__)
 
 #if EPHY_DEBUG
@@ -203,7 +209,7 @@ __attribute__((unused)) static inline uint16_t ephy_mmdRead(const eth_phy_state_
 }
 
 
-static void ephy_reset(const eth_phy_state_t *phy)
+__attribute__((unused)) static void ephy_reset(const eth_phy_state_t *phy)
 {
 	if (gpio_valid(&phy->reset)) {
 		ephy_debug_printf(phy, "ephy_reset: start hardware reset...");
@@ -1068,7 +1074,9 @@ int ephy_init(eth_phy_state_t *phy, char *conf, uint8_t board_rev, link_state_cb
 		return err;
 	}
 
+#if !GENET_PHY_ADOPT_FW
 	ephy_reset(phy);
+#endif
 
 	phyid = ephy_readPhyId(phy);
 	if (phyid == 0U || phyid == ~0U) {
@@ -1164,7 +1172,14 @@ int ephy_init(eth_phy_state_t *phy, char *conf, uint8_t board_rev, link_state_cb
 			break;
 	}
 
+#if !GENET_PHY_ADOPT_FW
 	ephy_restartAN(phy);
+#else
+	/* GENET_PHY_ADOPT_FW: do NOT restart autoneg — adopt the firmware's already-
+	 * negotiated, trained gigabit link. The link poll (ephy_linkSpeed) reads the
+	 * still-up firmware link and macSetSpeed programs the MAC accordingly. */
+	ephy_printf(phy, "GENET_PHY_ADOPT_FW: adopting firmware PHY (no reset/autoneg)");
+#endif
 
 	ephy_debug_printf(phy, "Successfully initialized PHY");
 

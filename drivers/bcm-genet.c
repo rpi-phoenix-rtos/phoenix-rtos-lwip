@@ -285,6 +285,12 @@ typedef struct {
 	unsigned long long txspin_us;
 	unsigned long tx_spin_calls;
 	unsigned long drain_wakes;
+	/* tx_total_us/tx_total_calls = mean wall-us in the WHOLE linkOutput (copy +
+	 * clean + ring + doorbell [+ pipelined ring-full wait]). Compared to the
+	 * effective per-frame TX budget it says whether the driver send path or the
+	 * lwip send-side/ACK-clock caps TX. */
+	unsigned long long tx_total_us;
+	unsigned long tx_total_calls;
 #endif
 
 	/* IRQ plumbing: handler runs in interrupt context, masks the level-2
@@ -1505,9 +1511,9 @@ static void genet_linkPollThread(void *arg)
 				state->rx_free_top, rbuf_ovfl, prod, state->rx_c_index & 0xFFFFu,
 				state->rx_rearm_stranded, state->rx_pollrescue, state->rx_polls, rxtmo);
 			/* Per-frame drain-cost attribution (see the profiling accumulators). */
-			genet_printf(state, "RXPROF wakes=%lu seen=%lu input_us=%llu input_calls=%lu txspin_us=%llu tx_spin_calls=%lu",
+			genet_printf(state, "RXPROF wakes=%lu seen=%lu input_us=%llu input_calls=%lu txspin_us=%llu tx_spin_calls=%lu tx_total_us=%llu tx_total_calls=%lu",
 				state->drain_wakes, state->rx_pkts_seen, state->input_us, state->input_calls,
-				state->txspin_us, state->tx_spin_calls);
+				state->txspin_us, state->tx_spin_calls, state->tx_total_us, state->tx_total_calls);
 		}
 #else
 		(void)tick;
@@ -1569,6 +1575,11 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	 * DMA buffer — otherwise the wire frame starts with two bytes of
 	 * zero before the real dst MAC and the switch drops it. */
 	len = p->tot_len - ETH_PAD_SIZE;
+
+#if GENET_RXSTATS_LOG
+	time_t _txe0 = 0;
+	gettime(&_txe0, NULL);
+#endif
 
 	mutexLock(state->tx_lock);
 
@@ -1712,6 +1723,14 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 #endif
 #endif /* !GENET_TX_PIPELINE */
 
+#if GENET_RXSTATS_LOG
+	{
+		time_t _txe1 = 0;
+		gettime(&_txe1, NULL);
+		state->tx_total_us += (unsigned long long)(_txe1 - _txe0);
+		state->tx_total_calls++;
+	}
+#endif
 	state->tx_pkts++;
 	mutexUnlock(state->tx_lock);
 	return ERR_OK;

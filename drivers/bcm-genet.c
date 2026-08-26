@@ -570,8 +570,17 @@ static void genet_configRgmii(genet_state_t *state)
 	 * bcmgenet_setup_rgmii / Circle's mii_config exactly. */
 	uint32_t v = genet_read(state, EXT_RGMII_OOB_CTRL);
 
-	v |= RGMII_LINK | RGMII_MODE_EN | OOB_DISABLE;
-	v &= ~ID_MODE_DIS;
+	/* TEST: match the VideoCore firmware's proven-working gigabit config, which
+	 * CLEARS OOB_DISABLE (dumped: fw oob low-byte=0x50, i.e. RGMII_LINK|RGMII_MODE_EN
+	 * only; Phoenix was setting 0x70 = +OOB_DISABLE). With OOB_DISABLE clear the MAC
+	 * tracks link/status from the RGMII in-band signal the PHY drives, instead of the
+	 * static RGMII_LINK register. Suspected cause of the gigabit post-TX RX-drop
+	 * (frames vanish before the MAC, no FCS): the static-link path mis-handles the RX
+	 * stream after a TX. (The old comment claimed OOB_DISABLE must be SET or RX dies
+	 * with PROD stuck at 0 — but the firmware clearing it receives fine on this exact
+	 * silicon, so that was context-specific.) Also matches U-Boot's bcmgenet. */
+	v |= RGMII_LINK | RGMII_MODE_EN;
+	v &= ~(ID_MODE_DIS | OOB_DISABLE);
 
 	genet_write(state, EXT_RGMII_OOB_CTRL, v);
 }
@@ -645,6 +654,13 @@ static void genet_macSetSpeed(genet_state_t *state, int speed, int full_duplex)
 	}
 
 	cmd |= CMD_TX_EN | CMD_RX_EN;
+
+	/* Ignore 802.3x PAUSE flow control (both directions) — matches the VideoCore
+	 * firmware's proven-working gigabit UMAC_CMD (dumped 0x1000010b: sets bits 8+28).
+	 * Phoenix was leaving these clear (honoring PAUSE). With the newly-added 2.5G
+	 * switch, honoring a PAUSE frame that trails our TX can gate the MAC and drop the
+	 * reply that follows; the firmware never sees this because it ignores PAUSE. */
+	cmd |= CMD_RX_PAUSE_IGNORE | CMD_TX_PAUSE_IGNORE;
 
 	/* PROMISC is set only when we fell back to the locally-administered
 	 * MAC. With a real board MAC from VideoCore, the unicast filter is
@@ -1255,6 +1271,15 @@ static void genet_setLinkState(void *arg, int state_up)
 		 * periodic RX-blackout while still programming the rate on first link-up
 		 * and on genuine renegotiation. */
 		genet_macSetSpeed(state, speed, full_duplex);
+#if GENET_RXFRAME_LOG
+		/* Phoenix's post-config MAC state — compare against the "GENETCFG fw:" dump
+		 * (firmware's proven-good gigabit config) taken at driver entry. */
+		genet_printf(state,
+			"GENETCFG phx: oob=0x%08x pwrmgmt=0x%08x portctrl=0x%08x umaccmd=0x%08x gphyctrl=0x%08x",
+			genet_read(state, EXT_RGMII_OOB_CTRL), genet_read(state, EXT_EXT_PWR_MGMT),
+			genet_read(state, SYS_PORT_CTRL), genet_read(state, UMAC_CMD),
+			genet_read(state, EXT_GPHY_CTRL));
+#endif
 	}
 	state->last_link_up = 1;
 	state->last_speed = speed;
@@ -1544,6 +1569,18 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	if (err < 0) {
 		return err;
 	}
+
+#if GENET_RXFRAME_LOG
+	/* Dump the VideoCore firmware's WORKING gigabit config BEFORE we reset/reconfigure
+	 * anything — it just finished a gigabit TFTP session, so these MAC registers are a
+	 * proven-good reference on the same silicon. Compared against Phoenix's post-config
+	 * dump (after link-up), any divergence is a candidate for the post-TX RX-drop. */
+	genet_printf(state,
+		"GENETCFG fw: oob=0x%08x pwrmgmt=0x%08x portctrl=0x%08x umaccmd=0x%08x gphyctrl=0x%08x",
+		genet_read(state, EXT_RGMII_OOB_CTRL), genet_read(state, EXT_EXT_PWR_MGMT),
+		genet_read(state, SYS_PORT_CTRL), genet_read(state, UMAC_CMD),
+		genet_read(state, EXT_GPHY_CTRL));
+#endif
 
 	/* MAC source priority on Pi 4:
 	 *   1. UMAC_MAC0/MAC1 (if firmware pre-programmed it — Pi 3 does

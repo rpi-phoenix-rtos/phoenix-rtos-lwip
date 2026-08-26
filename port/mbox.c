@@ -15,6 +15,9 @@
 
 #include <sys/threads.h>
 #include <sys/time.h>
+#include <sys/mman.h> /* va2pa — TODO(#129) corruption-PA diagnostic */
+#include <sys/debug.h> /* debug() — TODO(#129) atomic single-syscall line (printf garbles/drops) */
+#include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <time.h>
@@ -104,6 +107,31 @@ err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg)
 }
 
 
+int sys_mbox_trypost_coalesce(sys_mbox_t *mbox, void *msg, sys_mbox_merge_fn merge)
+{
+	int done;
+
+	mutexLock(mbox->lock);
+
+	/* Try to merge onto the newest still-queued entry before checking for a
+	 * free slot: a full mbox whose tail is mergeable still absorbs `msg`
+	 * (turning the would-be ERR_MEM/tcp_fasttmr re-present into an append),
+	 * which is exactly the backlog case this path optimizes. */
+	if (!mbox_is_empty(mbox)) {
+		size_t last = (mbox->tail == 0) ? (mbox->sz - 1) : (mbox->tail - 1);
+		if (merge(mbox->ring[last], msg)) {
+			mutexUnlock(mbox->lock);
+			return SYS_MBOX_COALESCED;
+		}
+	}
+
+	done = mbox_trypost(mbox, msg);
+	mutexUnlock(mbox->lock);
+
+	return done ? SYS_MBOX_POSTED : SYS_MBOX_FULL;
+}
+
+
 void sys_mbox_post(sys_mbox_t *mbox, void *msg)
 {
 	mutexLock(mbox->lock);
@@ -122,6 +150,23 @@ static int mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 
 	if (mbox_is_full(mbox))
 		condSignal(mbox->pop_cond);
+
+	/* TODO(#121): the mbox struct has been seen corrupted during USB enumeration
+	 * (a libc-heap overflow, likely USB-side, clobbers ring/head -> a wild
+	 * ring[head] load faulted in mbox_tryfetch). Validate before dereferencing:
+	 * log the corrupt state (clue to the writer) and recover (report empty)
+	 * instead of crashing the lwip process. This is a survive-not-crash guard,
+	 * not the root-cause fix. */
+	if ((mbox->ring == NULL) || (mbox->sz == 0) || (mbox->head >= mbox->sz)) {
+		/* Rate-limited: once corrupted, every poll re-detects it and the flood
+		 * would back-pressure the UART. Warn once, then recover as empty. */
+		static unsigned corruptCount = 0u;
+		if (corruptCount == 0u) {
+			debug("mbox: ring corrupted (ring/sz/head invalid); recovering as empty\n");
+		}
+		corruptCount++;
+		return 0;
+	}
 
 	*msg = mbox->ring[mbox->head];
 	mbox->head = WRAP(mbox, head);

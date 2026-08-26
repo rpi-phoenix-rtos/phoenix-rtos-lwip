@@ -50,6 +50,17 @@ ifneq ($(GENET_RX_INPUT_BATCH),)
 CFLAGS += -DGENET_RX_INPUT_BATCH=$(GENET_RX_INPUT_BATCH)
 endif
 
+# Gigabit NFS-WRITE levers (TX path). GENET_TX_CACHEABLE: write-back cacheable TX
+# DMA buffer + dc-clean before the doorbell (fast copy vs uncached). GENET_TX_PIPELINE:
+# multi-slot pipelined TX ring (no per-frame poll-wait). Both DEFAULT-ON via the
+# guards in bcm-genet.c; `make GENET_TX_CACHEABLE=0` / `GENET_TX_PIPELINE=0` roll back.
+ifneq ($(GENET_TX_CACHEABLE),)
+CFLAGS += -DGENET_TX_CACHEABLE=$(GENET_TX_CACHEABLE)
+endif
+ifneq ($(GENET_TX_PIPELINE),)
+CFLAGS += -DGENET_TX_PIPELINE=$(GENET_TX_PIPELINE)
+endif
+
 # Raw TCP throughput bench (gigabit-NFS "size the prize"): opt-in lwiperf TCP
 # server (iperf 2.0.5 protocol) so a host `iperf -c <pi>` measures the
 # lwip-core + driver RX ceiling WITHOUT the socket-copy / NFS-RPC layers above

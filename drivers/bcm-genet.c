@@ -114,6 +114,20 @@
                                * path. Override to 0 with `make GENET_RX_CACHEABLE=0` to roll back. */
 #endif
 
+/* Cacheable TX buffer (gigabit NFS-WRITE lever). The TX path COPIES each pbuf
+ * into its DMA slot; with an uncached (dmammap) slot that copy is the write
+ * bottleneck — raw TX measured 18.5 MB/s = HALF the (zero-copy) RX ceiling. A
+ * write-back CACHEABLE slot makes the copy fast; we then `dc cvac`-clean the
+ * copied range so the DMA engine reads the CPU's data from RAM (CPU->device, so
+ * clean-only — no invalidate needed, unlike RX's device->CPU civac). DEFAULT-ON,
+ * HW-validated 2026-08-28: 128 MB Pi->NFS write host-side sha256 BIT-EXACT, 0
+ * faults; raw TX 18.5->20.5 alone, NFS write 16.5->19.7 with the pipeline. No
+ * GPU/scanout aliasing (TX buf is CPU-write/NIC-read only); slots are
+ * GENET_MAX_FRAME apart (no false sharing). Roll back: `make GENET_TX_CACHEABLE=0`. */
+#ifndef GENET_TX_CACHEABLE
+#define GENET_TX_CACHEABLE 1
+#endif
+
 /* TEMP diag: per-frame NFS/TCP RX logging in the drain path to discriminate
  * delivered-but-corrupt from before-ring loss (gigabit NFS triage). Revert to 0. */
 #ifndef GENET_RXFRAME_LOG
@@ -345,6 +359,33 @@ static inline void genet_dcacheCleanInvalRx(void *va, size_t len)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 #endif /* GENET_RX_CACHEABLE */
+
+#if GENET_TX_CACHEABLE
+/*
+ * Clean (write back) the D-cache lines covering [va, va+len) by VA (`dc cvac`)
+ * so the TX DMA engine reads the CPU's just-copied frame from RAM. CPU->device
+ * direction: clean-only (no invalidate) is sufficient and correct — we never
+ * read the TX slot back. `dc cvac` is EL0-legal (SCTLR_EL1.UCI), like the RX
+ * civac. Bracketed by dsb so the flush completes before the caller's PROD_INDEX
+ * doorbell. */
+static inline void genet_dcacheCleanTx(const void *va, size_t len)
+{
+	uint64_t ctr;
+	uintptr_t line, start, end;
+
+	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	line = (uintptr_t)4 << ((ctr >> 16) & 0xfu);  /* CTR_EL0.DminLine */
+
+	start = (uintptr_t)va & ~(line - 1u);
+	end = ((uintptr_t)va + len + line - 1u) & ~(line - 1u);
+
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (; start < end; start += line) {
+		__asm__ volatile("dc cvac, %0" : : "r"(start) : "memory");
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+#endif /* GENET_TX_CACHEABLE */
 
 
 /* --- Reset / MAC / UMAC ----------------------------------------- */
@@ -1490,9 +1531,12 @@ static void genet_linkPollThread(void *arg)
  * completed BDs are reclaimed implicitly via CONS_INDEX, and we only wait when
  * the ring is full. TX copies each pbuf into its slot, so there is no pbuf
  * lifetime to track (unlike zero-copy RX) — the only reuse constraint is the
- * consumer index. DEFAULT-OFF until HW-validated bit-exact. */
+ * consumer index. DEFAULT-ON (pairs with GENET_TX_CACHEABLE): alone it was a
+ * no-op (the poll-wait was hidden behind the slow uncached copy), but once the
+ * copy is fast it adds ~+6% (raw TX 20.5->21.74, NFS write ->19.7); HW bit-exact,
+ * 0 faults. Roll back: `make GENET_TX_PIPELINE=0`. */
 #ifndef GENET_TX_PIPELINE
-#define GENET_TX_PIPELINE 0
+#define GENET_TX_PIPELINE 1
 #endif
 #if GENET_TX_PIPELINE
 #define GENET_TX_SLOTS GENET_TOTAL_DESC  /* one DMA buffer per BD (1:1 slot<->BD) */
@@ -1577,10 +1621,15 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	addr_t tx_dst_phys = state->tx_buf_phys;
 #endif
 
-	/* Linearise the pbuf into its DMA-coherent slot, starting past the
-	 * ETH_PAD_SIZE head pad. dmammap memory is uncached, so no further cache
-	 * maintenance is needed. */
+	/* Linearise the pbuf into its DMA slot, past the ETH_PAD_SIZE head pad. With
+	 * an uncached (dmammap) slot no cache maintenance is needed; with a cacheable
+	 * (GENET_TX_CACHEABLE) slot the copy is fast but must be flushed to RAM below. */
 	pbuf_copy_partial(p, tx_dst, len, ETH_PAD_SIZE);
+#if GENET_TX_CACHEABLE
+	/* Flush the copied frame so the TX DMA reads it from RAM (CPU->device clean).
+	 * The dsb before the PROD_INDEX doorbell below orders it ahead of the kick. */
+	genet_dcacheCleanTx(tx_dst, len);
+#endif
 
 #if GENET_RXFRAME_LOG
 	/* TEMP: log NFS/TCP frames lwip asks us to TRANSMIT, to correlate with the
@@ -1872,7 +1921,11 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	/* TX buffer pool: GENET_TX_SLOTS contiguous GENET_MAX_FRAME slots (one per BD
 	 * when pipelined; a single slot otherwise). dmammap is page-aligned, uncached,
 	 * MAP_CONTIGUOUS — so slot i's physical address is tx_buf_phys + i*frame. */
+#if GENET_TX_CACHEABLE
+	state->tx_buf = dmammap_cached((size_t)GENET_TX_SLOTS * GENET_MAX_FRAME);
+#else
 	state->tx_buf = dmammap((size_t)GENET_TX_SLOTS * GENET_MAX_FRAME);
+#endif
 	if (state->tx_buf == NULL) {
 		genet_printf(state, "dmammap(%u) for TX failed",
 			(unsigned)((size_t)GENET_TX_SLOTS * GENET_MAX_FRAME));

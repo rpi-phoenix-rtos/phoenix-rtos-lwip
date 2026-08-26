@@ -2,3 +2,4 @@ build
 netsrv
 netsrv.map
 .vscode/
+artifacts/

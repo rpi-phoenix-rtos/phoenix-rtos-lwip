@@ -27,6 +27,17 @@ else
   LOCAL_CFLAGS += -DLWIP_WIFI=0
 endif
 
+# The genet driver (Raspberry Pi 4 / BCM2711) reads the board MAC over the
+# VideoCore property mailbox via the rpi4-vcmbox client lib. libvcmbox is built
+# in phoenix-rtos-devices (which builds before lwip) and installed into the
+# shared per-target build prefix, so it is reachable here via the standard
+# -L$(PREFIX_A) / -I$(PREFIX_H) search paths the build sets up — no cross-repo
+# DEP_LIBS (which would force a same-repo build rule). Gated on the genet driver
+# so non-Pi targets, which do not build libvcmbox, still link.
+ifneq ($(filter genet,$(NET_DRIVERS)),)
+  LIBS += libvcmbox
+endif
+
 LWIP_MAIN_THREAD_STACKSIZE ?= 4096
 LOCAL_LDFLAGS := -z stack-size=$(LWIP_MAIN_THREAD_STACKSIZE)
 

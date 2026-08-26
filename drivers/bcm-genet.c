@@ -220,6 +220,17 @@ typedef struct {
 	unsigned long rx_rearm_stranded;   /* frames caught by the post-unmask re-drain */
 	unsigned long rx_pollrescue;       /* frames caught by the irq-thread poll backstop (lost-IRQ) */
 	unsigned long rx_polls;            /* irq-thread condWait timeouts (poll backstop invocations) */
+#if GENET_RXSTATS_LOG
+	/* Throughput-profiling accumulators (GENET_RXSTATS_LOG only): attribute the
+	 * per-frame drain cost. input_us/input_calls = mean us in netif->input()
+	 * (tcpip mbox post+wake); txspin_us/tx_spin_calls = mean us busy-polling TX
+	 * completion; drain_wakes + rx_pkts_seen = frames-per-drain-wake. */
+	unsigned long long input_us;
+	unsigned long input_calls;
+	unsigned long long txspin_us;
+	unsigned long tx_spin_calls;
+	unsigned long drain_wakes;
+#endif
 
 	/* IRQ plumbing: handler runs in interrupt context, masks the level-2
 	 * source bits it's about to service, signals irq_cond; irq_thread
@@ -922,6 +933,9 @@ static void genet_drainRxRing(genet_state_t *state)
 	 * equivalent BUS_DMASYNC_POSTREAD here. */
 	__asm__ volatile("dmb ld" ::: "memory");
 
+#if GENET_RXSTATS_LOG
+	state->drain_wakes++;
+#endif
 	while (prod != (state->rx_c_index & 0xFFFFu)) {
 		uint32_t bd_off = GENET_RX_DESCS_OFF +
 			state->rx_index * GENET_DMA_DESC_SIZE;
@@ -1046,6 +1060,24 @@ static void genet_drainRxRing(genet_state_t *state)
 					genet_write(state, bd_off + 8,
 						(uint32_t)((uint64_t)state->rx_bufs_phys[nb] >> 32));
 					genet_write(state, bd_off + 0, 0);
+#if GENET_RXSTATS_LOG
+					{
+						time_t _i0 = 0, _i1 = 0;
+						err_t _ir;
+						gettime(&_i0, NULL);
+						_ir = state->netif->input(p, state->netif);
+						gettime(&_i1, NULL);
+						state->input_us += (unsigned long long)(_i1 - _i0);
+						state->input_calls++;
+						if (_ir == ERR_OK) {
+							state->rx_zerocopy++;
+						}
+						else {
+							pbuf_free(p);
+							state->rx_pkts_dropped++;
+						}
+					}
+#else
 					if (state->netif->input(p, state->netif) == ERR_OK) {
 						state->rx_zerocopy++;
 					}
@@ -1053,6 +1085,7 @@ static void genet_drainRxRing(genet_state_t *state)
 						pbuf_free(p);   /* returns 'bufidx' via rxbufFree */
 						state->rx_pkts_dropped++;
 					}
+#endif
 					nb = -2;        /* handled (success or dropped) */
 				}
 				else {
@@ -1373,6 +1406,10 @@ static void genet_linkPollThread(void *arg)
 				state->rx_pkts_seen, state->rx_pkts_dropped, state->rx_copyfallback,
 				state->rx_free_top, rbuf_ovfl, prod, state->rx_c_index & 0xFFFFu,
 				state->rx_rearm_stranded, state->rx_pollrescue, state->rx_polls, rxtmo);
+			/* Per-frame drain-cost attribution (see the profiling accumulators). */
+			genet_printf(state, "RXPROF wakes=%lu seen=%lu input_us=%llu input_calls=%lu txspin_us=%llu tx_spin_calls=%lu",
+				state->drain_wakes, state->rx_pkts_seen, state->input_us, state->input_calls,
+				state->txspin_us, state->tx_spin_calls);
 		}
 #else
 		(void)tick;
@@ -1475,6 +1512,9 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	 * an IRQ + free-queue ring. */
 	gettime(&now, NULL);
 	deadline = now + GENET_TX_TIMEOUT_US;
+#if GENET_RXSTATS_LOG
+	time_t _tx0 = now;
+#endif
 
 	for (;;) {
 		uint32_t cons = genet_read(state, ring_off + GENET_TDMA_RING_CONS_INDEX);
@@ -1490,6 +1530,11 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 			return ERR_TIMEOUT;
 		}
 	}
+#if GENET_RXSTATS_LOG
+	gettime(&now, NULL);
+	state->txspin_us += (unsigned long long)(now - _tx0);
+	state->tx_spin_calls++;
+#endif
 
 	state->tx_pkts++;
 	mutexUnlock(state->tx_lock);

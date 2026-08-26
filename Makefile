@@ -50,6 +50,14 @@ ifeq ($(LWIP_IPERF),1)
 LWIP_SRCS += $(LWIPERFFILES)
 CFLAGS += -DLWIP_IPERF=1
 endif
+
+# Expose the GENET driver's RX-stats console line (rx_polls/pollrescue/zerocopy/
+# copyfb/drop/rbuf_ovfl/rxtmo, one line / 5 s) to the build. DEFAULT-OFF (keeps
+# the shared console quiet, #31). Enable with `make GENET_RXSTATS_LOG=1 ...` to
+# read the RX drain mechanism (IRQ- vs poll-clocked) during a throughput bench.
+ifeq ($(GENET_RXSTATS_LOG),1)
+CFLAGS += -DGENET_RXSTATS_LOG=1
+endif
 ifeq ($(LWIP_G3_BUILD), yes)
 CFLAGS += -I$(PREFIX_BUILD)/phrtos3-include -I$(PREFIX_PROJECT)/G3-PLC/ps_g3_phy/api/include
 endif

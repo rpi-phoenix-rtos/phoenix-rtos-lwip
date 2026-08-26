@@ -65,10 +65,24 @@ static int run_pingpong(const char *host, int port, int cnt, int usepoll, int ga
 		printf("PINGPONG: bad host %s\n", host);
 		return -1;
 	}
-	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		printf("PINGPONG: connect to %s:%d failed\n", host, port);
-		close(fd);
-		return -1;
+	/* Retry the connect: as a boot syspage app we start before DHCP has bound the
+	 * Pi's IP, so wait (up to ~40s) for the network + echo server to come up. */
+	{
+		int tries = 0;
+		while (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+			if (++tries >= 200) {
+				printf("PINGPONG: connect to %s:%d failed after retries\n", host, port);
+				close(fd);
+				return -1;
+			}
+			usleep(200000);   /* 200ms */
+			close(fd);
+			fd = socket(AF_INET, SOCK_STREAM, 0);
+			if (fd < 0) {
+				printf("PINGPONG: socket error on retry\n");
+				return -1;
+			}
+		}
 	}
 	/* Disable Nagle so a small ping is sent immediately (clean RTT, not batched). */
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -134,12 +148,16 @@ int main(int argc, char **argv)
 	int nonblock = 0, writesz = 4096;
 	char *client_host = NULL;
 	int port = 7777, usepoll = 0, gap_us = 1000;
+	int recv_sink = 0;
 
-	while ((c = getopt(argc, argv, "v:bw:c:p:hC:Pt:g:")) != -1) {
+	while ((c = getopt(argc, argv, "v:bw:c:p:hC:Pt:g:R")) != -1) {
 		switch (c) {
 
 		case 'b':
 			nonblock = 1;
+			break;
+		case 'R':
+			recv_sink = 1;
 			break;
 		case 'w':
 			writesz = atoi(optarg);
@@ -223,6 +241,26 @@ int main(int argc, char **argv)
 		goto error;
 	}
 	ntmsg(2, "connection accepted\n");
+
+	/* Socket-recv throughput sink (-R): drain the stream to /dev/null-equivalent
+	 * and time it. Isolates the raw lwip socket-recv path (recvmbox handoff +
+	 * recv-copy) from NFS/libnfs — compare its MB/s to lwiperf raw-API (no socket
+	 * copy) and to NFS. Host sends a fixed blob then closes; we read until EOF. */
+	if (recv_sink) {
+		struct timespec t0, t1;
+		unsigned long long total = 0;
+		double dur;
+		printf("RECV-SINK-START (draining until EOF, bufsz=%d)\n", writesz);
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		while ((n = read(fd, buffer, writesz)) > 0)
+			total += (unsigned long long)n;
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		dur = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+		printf("RECV-SINK-DONE bytes=%llu dur=%.3fs rate=%.2f MB/s\n",
+			total, dur, (dur > 0.0) ? ((double)total / 1048576.0) / dur : 0.0);
+		close(fd);
+		goto error;
+	}
 
 	write(fd, header, strlen(header));
 

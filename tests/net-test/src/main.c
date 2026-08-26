@@ -248,16 +248,19 @@ int main(int argc, char **argv)
 	 * copy) and to NFS. Host sends a fixed blob then closes; we read until EOF. */
 	if (recv_sink) {
 		struct timespec t0, t1;
-		unsigned long long total = 0;
+		unsigned long long total = 0, calls = 0;
 		double dur;
 		printf("RECV-SINK-START (draining until EOF, bufsz=%d)\n", writesz);
 		clock_gettime(CLOCK_MONOTONIC, &t0);
-		while ((n = read(fd, buffer, writesz)) > 0)
+		while ((n = read(fd, buffer, writesz)) > 0) {
 			total += (unsigned long long)n;
+			calls++;
+		}
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 		dur = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
-		printf("RECV-SINK-DONE bytes=%llu dur=%.3fs rate=%.2f MB/s\n",
-			total, dur, (dur > 0.0) ? ((double)total / 1048576.0) / dur : 0.0);
+		printf("RECV-SINK-DONE bytes=%llu calls=%llu bytes_per_call=%llu dur=%.3fs rate=%.2f MB/s\n",
+			total, calls, calls ? total / calls : 0, dur,
+			(dur > 0.0) ? ((double)total / 1048576.0) / dur : 0.0);
 		close(fd);
 		goto error;
 	}

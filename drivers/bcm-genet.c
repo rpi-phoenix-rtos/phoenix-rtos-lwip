@@ -1478,6 +1478,27 @@ static void genet_linkPollThread(void *arg)
 /* --- linkoutput / media ----------------------------------------- */
 
 #define GENET_TX_TIMEOUT_US 100000u  /* 100 ms — enough for 1518 B at 10 Mbps */
+/* Ring-full backpressure budget (pipelined TX). Draining a near-full 256-BD ring
+ * is ~3 ms at 1 Gbps but ~310 ms at 10 Mbps — size for the slow link so a full
+ * ring never FALSELY drops a frame lwip already queued (TCP would retransmit). */
+#define GENET_TX_RINGFULL_TIMEOUT_US (GENET_TX_TIMEOUT_US * 5u)  /* 500 ms */
+
+/* Pipelined TX (gigabit NFS-write lever): keep many frames in flight in the TX
+ * ring instead of poll-waiting for each frame to drain (the single-slot path
+ * idled the wire between frames — raw TX ~18.5 MB/s = half the RX ceiling).
+ * With one DMA buffer per BD, linkOutput queues a frame and returns immediately;
+ * completed BDs are reclaimed implicitly via CONS_INDEX, and we only wait when
+ * the ring is full. TX copies each pbuf into its slot, so there is no pbuf
+ * lifetime to track (unlike zero-copy RX) — the only reuse constraint is the
+ * consumer index. DEFAULT-OFF until HW-validated bit-exact. */
+#ifndef GENET_TX_PIPELINE
+#define GENET_TX_PIPELINE 0
+#endif
+#if GENET_TX_PIPELINE
+#define GENET_TX_SLOTS GENET_TOTAL_DESC  /* one DMA buffer per BD (1:1 slot<->BD) */
+#else
+#define GENET_TX_SLOTS 1u
+#endif
 
 
 static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
@@ -1507,10 +1528,59 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 
 	mutexLock(state->tx_lock);
 
-	/* Linearise the pbuf into the single DMA-coherent slot, starting
-	 * past the ETH_PAD_SIZE head pad. dmammap memory is uncached, so
-	 * no further cache maintenance is needed. */
-	pbuf_copy_partial(p, state->tx_buf, len, ETH_PAD_SIZE);
+#if GENET_TX_PIPELINE
+	/* Wait ONLY if the ring is full; completed BDs are reclaimed implicitly via
+	 * CONS_INDEX. Slot-reuse correctness: slot = prod % TOTAL_DESC was last used by
+	 * BD (prod - TOTAL_DESC); we admit only when inflight = (prod-cons) <=
+	 * TOTAL_DESC-2, so cons >= prod-(TOTAL_DESC-2) > prod-TOTAL_DESC — that prior
+	 * use is always already consumed. (Admitting at inflight == TOTAL_DESC-1 would
+	 * reuse the oldest in-flight slot — the bug; hence the strict `< TOTAL_DESC-1`.) */
+	{
+		uint32_t cons = genet_read(state, ring_off + GENET_TDMA_RING_CONS_INDEX) & 0xFFFFu;
+		uint32_t inflight = (state->tx_prod_index - cons) & 0xFFFFu;
+		if (inflight >= (uint32_t)(GENET_TOTAL_DESC - 1u)) {
+#if GENET_RXSTATS_LOG
+			time_t _txf0 = 0;
+			gettime(&_txf0, NULL);
+#endif
+			gettime(&now, NULL);
+			deadline = now + GENET_TX_RINGFULL_TIMEOUT_US;
+			for (;;) {
+				cons = genet_read(state, ring_off + GENET_TDMA_RING_CONS_INDEX) & 0xFFFFu;
+				inflight = (state->tx_prod_index - cons) & 0xFFFFu;
+				if (inflight < (uint32_t)(GENET_TOTAL_DESC - 1u)) {
+					break;
+				}
+				gettime(&now, NULL);
+				if (now >= deadline) {
+					state->tx_timeouts++;
+					mutexUnlock(state->tx_lock);
+					genet_printf(state, "TX ring-full timeout (prod=%u cons=%u)",
+						state->tx_prod_index, cons);
+					return ERR_TIMEOUT;
+				}
+			}
+#if GENET_RXSTATS_LOG
+			/* Under pipelining the ONLY TX-side stall is this ring-full backpressure
+			 * (per-frame completion spin is gone), so record it as txspin to keep the
+			 * RXPROF txspin_us metric meaningful rather than silently zero. */
+			gettime(&now, NULL);
+			state->txspin_us += (unsigned long long)(now - _txf0);
+			state->tx_spin_calls++;
+#endif
+		}
+	}
+	uint8_t *tx_dst = (uint8_t *)state->tx_buf + (size_t)state->tx_index * GENET_MAX_FRAME;
+	addr_t tx_dst_phys = state->tx_buf_phys + (addr_t)state->tx_index * GENET_MAX_FRAME;
+#else
+	uint8_t *tx_dst = (uint8_t *)state->tx_buf;
+	addr_t tx_dst_phys = state->tx_buf_phys;
+#endif
+
+	/* Linearise the pbuf into its DMA-coherent slot, starting past the
+	 * ETH_PAD_SIZE head pad. dmammap memory is uncached, so no further cache
+	 * maintenance is needed. */
+	pbuf_copy_partial(p, tx_dst, len, ETH_PAD_SIZE);
 
 #if GENET_RXFRAME_LOG
 	/* TEMP: log NFS/TCP frames lwip asks us to TRANSMIT, to correlate with the
@@ -1518,7 +1588,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	 * SYN-ACK is delivered, it appears here; if it does not, the gap is in lwip's
 	 * TCP processing, not the driver's TX. */
 	if (len >= 54u) {
-		const uint8_t *f = state->tx_buf;
+		const uint8_t *f = tx_dst;
 		if (((f[12] << 8) | f[13]) == 0x0800 && f[23] == 6u) {
 			uint8_t ihl = (uint8_t)((f[14] & 0x0fu) * 4u);
 			const uint8_t *tcp = f + 14 + ihl;
@@ -1538,8 +1608,8 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 
 	/* Program BD[tx_index]: addr-lo, addr-hi, length+status. */
 	bd_off = GENET_TX_DESCS_OFF + state->tx_index * GENET_DMA_DESC_SIZE;
-	genet_write(state, bd_off + 4, (uint32_t)(state->tx_buf_phys & 0xFFFFFFFFu));
-	genet_write(state, bd_off + 8, (uint32_t)((uint64_t)state->tx_buf_phys >> 32));
+	genet_write(state, bd_off + 4, (uint32_t)(tx_dst_phys & 0xFFFFFFFFu));
+	genet_write(state, bd_off + 8, (uint32_t)((uint64_t)tx_dst_phys >> 32));
 
 	/* Length+flags only. Neither Linux nor U-Boot's bcmgenet_xmit sets the
 	 * DMA_OWN bit on TX; the producer-index write below is what hands the
@@ -1562,11 +1632,10 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	__asm__ volatile("dsb sy" ::: "memory");
 	genet_write(state, ring_off + GENET_TDMA_RING_PROD_INDEX, state->tx_prod_index);
 
-	/* Polled completion. TX is single-slot synchronous: at most one
-	 * frame is in flight, so latency from condWait/IRQ would dominate
-	 * over the few microseconds it takes the MAC to drain a 1518B
-	 * frame at 1 Gbps (~12 us). When MQ TX lands this will move to
-	 * an IRQ + free-queue ring. */
+#if !GENET_TX_PIPELINE
+	/* Polled completion. Single-slot synchronous: at most one frame in flight,
+	 * so we poll until it drains before returning (and reusing the one buffer).
+	 * The pipelined path skips this — it reclaims lazily via CONS_INDEX above. */
 	gettime(&now, NULL);
 	deadline = now + GENET_TX_TIMEOUT_US;
 #if GENET_RXSTATS_LOG
@@ -1592,6 +1661,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	state->txspin_us += (unsigned long long)(now - _tx0);
 	state->tx_spin_calls++;
 #endif
+#endif /* !GENET_TX_PIPELINE */
 
 	state->tx_pkts++;
 	mutexUnlock(state->tx_lock);
@@ -1799,9 +1869,13 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	/* Tier 2: single-slot TX buffer + ring init. dmammap returns a
 	 * page-aligned uncached MAP_CONTIGUOUS region — exactly what GENET
 	 * DMA needs (no D-cache management, low-32-bit physical address). */
-	state->tx_buf = dmammap(GENET_MAX_FRAME);
+	/* TX buffer pool: GENET_TX_SLOTS contiguous GENET_MAX_FRAME slots (one per BD
+	 * when pipelined; a single slot otherwise). dmammap is page-aligned, uncached,
+	 * MAP_CONTIGUOUS — so slot i's physical address is tx_buf_phys + i*frame. */
+	state->tx_buf = dmammap((size_t)GENET_TX_SLOTS * GENET_MAX_FRAME);
 	if (state->tx_buf == NULL) {
-		genet_printf(state, "dmammap(%u) for TX failed", GENET_MAX_FRAME);
+		genet_printf(state, "dmammap(%u) for TX failed",
+			(unsigned)((size_t)GENET_TX_SLOTS * GENET_MAX_FRAME));
 		return -ENOMEM;
 	}
 	state->tx_buf_phys = va2pa(state->tx_buf);

@@ -115,6 +115,14 @@
 #define GENET_RXFRAME_LOG 0
 #endif
 
+/* Early guard: GENET_RXSTATS_LOG is referenced by the state struct + drain
+ * profiling below (well above its console-print site). Default it here so
+ * -Werror=undef is satisfied in the stock build (the later #ifndef is a
+ * harmless no-op once this defines it). */
+#ifndef GENET_RXSTATS_LOG
+#define GENET_RXSTATS_LOG 0
+#endif
+
 /* TEST: adopt the VideoCore firmware's already-trained gigabit PHY — skip the PHY
  * hard reset here + the soft reset/autoneg-restart in ephy.c. Revert to 0. */
 #ifndef GENET_PHY_ADOPT_FW

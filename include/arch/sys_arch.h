@@ -43,6 +43,29 @@ typedef struct sys_mbox_s sys_mbox_t;
 #define sys_mbox_set_invalid(m) do (m)->ring = NULL; while (0)
 
 
+/* Coalescing post for streaming (TCP) receive.
+ *
+ * Under the mbox lock, if the newest still-queued entry exists and the caller's
+ * merge() absorbs `msg` into it, no new ring slot is consumed and no waiter is
+ * signalled (the queued entry already signalled readiness when it was posted).
+ * Otherwise `msg` is posted as a normal new entry. This lets the TCP recv
+ * callback fold back-to-back segments onto a single pbuf chain, cutting the
+ * per-segment recvmbox handoff (post/fetch + consumer wakeup) that dominates
+ * the socket-recv throughput gap. See docs/inprogress/gigabit-nfs-perf-decision.md
+ * (Option B). merge(tail_entry, msg) returns nonzero iff it absorbed msg.
+ *
+ * Dequeue and this append serialize on the same mbox lock, so there is no
+ * producer/consumer race and no lost wakeup (coalesce only runs when non-empty,
+ * and sys_arch_mbox_fetch only condWaits when empty). */
+typedef int (*sys_mbox_merge_fn)(void *tail_entry, void *new_msg);
+
+#define SYS_MBOX_POSTED    0    /* posted as a new entry (waiter signalled iff was empty) */
+#define SYS_MBOX_COALESCED 1    /* merged onto the queued tail entry; no new slot, no signal */
+#define SYS_MBOX_FULL      (-1) /* mbox full and tail unmergeable; nothing posted */
+
+int sys_mbox_trypost_coalesce(sys_mbox_t *mbox, void *msg, sys_mbox_merge_fn merge);
+
+
 #define sys_msleep(m) usleep((time_t)(m) * 1000)
 
 

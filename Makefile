@@ -32,16 +32,65 @@ endif
 
 CFLAGS += -Wundef -Iinclude -Ilib-lwip/src/include -I"$(LWIPOPTS_DIR)"
 
-# Policy B (task #11): opt-in cacheable/streaming-DMA GENET RX path + integrity
-# bench. DEFAULT-OFF — the stock build keeps the proven uncached RX path. Enable
-# for the bench with `make GENET_RX_CACHEABLE=1 ...`; the -D reaches both the
-# driver lib (drivers/bcm-genet.c) and the port lib (port/genet-rxcache-bench.c,
-# port/main.c). See drivers/bcm-genet.c for the NEEDS-CAREFUL-HW-REVIEW notes.
-ifeq ($(GENET_RX_CACHEABLE),1)
-CFLAGS += -DGENET_RX_CACHEABLE=1
+# Cacheable/streaming-DMA GENET RX path. Now DEFAULT-ON in the driver (HW-
+# validated bit-exact + GPU+net FB-clean, 2026-08-26; see bcm-genet.c). This
+# forwards an explicit override to both the driver lib and the port lib, so
+# `make GENET_RX_CACHEABLE=0 ...` rolls back to the uncached pool and
+# `GENET_RX_CACHEABLE=1` is the (redundant) explicit enable.
+ifneq ($(GENET_RX_CACHEABLE),)
+CFLAGS += -DGENET_RX_CACHEABLE=$(GENET_RX_CACHEABLE)
+endif
+
+# RX-input core-lock batching (gigabit Option C lever #1): hold LOCK_TCPIP_CORE
+# once per N-frame drain burst instead of per packet (netif->input re-locks the
+# TCPIP core lock each call; a mutex op is a ~2.25us syscall here). Value = chunk
+# size (frames per lock hold); 0 = per-frame (stock). Default set by the guard in
+# bcm-genet.c. Requires LWIP_TCPIP_CORE_LOCKING_INPUT.
+ifneq ($(GENET_RX_INPUT_BATCH),)
+CFLAGS += -DGENET_RX_INPUT_BATCH=$(GENET_RX_INPUT_BATCH)
+endif
+
+# Raw TCP throughput bench (gigabit-NFS "size the prize"): opt-in lwiperf TCP
+# server (iperf 2.0.5 protocol) so a host `iperf -c <pi>` measures the
+# lwip-core + driver RX ceiling WITHOUT the socket-copy / NFS-RPC layers above
+# it — isolating whether the ~8 MB/s NFS-read ceiling is the driver drain or a
+# higher layer. DEFAULT-OFF. Enable with `make LWIP_IPERF=1 ...`.
+ifeq ($(LWIP_IPERF),1)
+LWIP_SRCS += $(LWIPERFFILES)
+CFLAGS += -DLWIP_IPERF=1
+endif
+
+# Expose the GENET driver's RX-stats console line (rx_polls/pollrescue/zerocopy/
+# copyfb/drop/rbuf_ovfl/rxtmo, one line / 5 s) to the build. DEFAULT-OFF (keeps
+# the shared console quiet, #31). Enable with `make GENET_RXSTATS_LOG=1 ...` to
+# read the RX drain mechanism (IRQ- vs poll-clocked) during a throughput bench.
+ifeq ($(GENET_RXSTATS_LOG),1)
+CFLAGS += -DGENET_RXSTATS_LOG=1
+endif
+
+# Coalesce back-to-back TCP segments onto one recvmbox pbuf chain (gigabit-NFS
+# Option B): folds the per-segment tcpip->socket handoff so the socket-recv path
+# stops paying an mbox post/fetch + consumer wakeup per ~1448-byte segment. Only
+# helps under a recv backlog (self-tuning: no queued entry -> normal post).
+# Default is set by the guard in api_msg.c; this forwards an explicit override to
+# the whole lwip build, so `make LWIP_RECVMBOX_COALESCE=0 ...` is the rollback
+# off-switch and `=1` the explicit enable (same pattern as GENET_RX_CACHEABLE).
+ifneq ($(LWIP_RECVMBOX_COALESCE),)
+CFLAGS += -DLWIP_RECVMBOX_COALESCE=$(LWIP_RECVMBOX_COALESCE)
 endif
 ifeq ($(LWIP_G3_BUILD), yes)
 CFLAGS += -I$(PREFIX_BUILD)/phrtos3-include -I$(PREFIX_PROJECT)/G3-PLC/ps_g3_phy/api/include
+endif
+
+# Raspberry Pi 4B: enable LwIP stats (LINK/IP/TCP/MEM counters + the /dev/ipstats
+# dump device) as a standing network-diagnostic facility. The Pi 4 has 4 GB RAM so
+# the counter overhead is negligible; memory-constrained MCU targets keep the
+# stats-off default (this is scoped to aarch64a72-generic). Must be set BEFORE the
+# lwip-core static-lib include below, or stats.c / the ip4.c+tcp_in.c increment
+# sites would compile without it. LWIP_STATS is #ifndef-guarded in lwipopts.h, so
+# this -D wins and turns on the LWIP_STATS sub-options block.
+ifeq ($(TARGET_FAMILY)-$(TARGET_SUBFAMILY),aarch64a72-generic)
+CFLAGS += -DLWIP_STATS=1
 endif
 
 NAME := lwip-core

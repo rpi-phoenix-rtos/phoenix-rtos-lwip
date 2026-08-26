@@ -149,8 +149,9 @@ int main(int argc, char **argv)
 	char *client_host = NULL;
 	int port = 7777, usepoll = 0, gap_us = 1000;
 	int recv_sink = 0;
+	int slow_sink = 0;
 
-	while ((c = getopt(argc, argv, "v:bw:c:p:hC:Pt:g:R")) != -1) {
+	while ((c = getopt(argc, argv, "v:bw:c:p:hC:Pt:g:RS")) != -1) {
 		switch (c) {
 
 		case 'b':
@@ -158,6 +159,9 @@ int main(int argc, char **argv)
 			break;
 		case 'R':
 			recv_sink = 1;
+			break;
+		case 'S':
+			slow_sink = 1;
 			break;
 		case 'w':
 			writesz = atoi(optarg);
@@ -261,6 +265,26 @@ int main(int argc, char **argv)
 		printf("RECV-SINK-DONE bytes=%llu calls=%llu bytes_per_call=%llu dur=%.3fs rate=%.2f MB/s\n",
 			total, calls, calls ? total / calls : 0, dur,
 			(dur > 0.0) ? ((double)total / 1048576.0) / dur : 0.0);
+		close(fd);
+		goto error;
+	}
+
+	/* Slow/non-draining consumer (-S): accept, then DO NOT read for ~60 s while the
+	 * host streams in. Tests LWIP_INGRESS_CREDIT's self-limiting: the window is
+	 * credited at ingress, so data buffers into the recvmbox up to ~the window,
+	 * then the mbox fills -> recv_tcp returns ERR_MEM before crediting -> refused_data
+	 * clamps the advertised window (host-side ss should show it near 0). The periodic
+	 * heartbeat proves the lwip process stays responsive (not wedged) meanwhile. */
+	if (slow_sink) {
+		int i;
+		printf("SLOW-SINK-START (accepted; NOT reading for 60s; host may stream in)\n");
+		for (i = 0; i < 12; i++) {
+			usleep(5000000);   /* 5 s */
+			printf("SLOW-SINK-ALIVE t=%ds (still not reading; lwip responsive)\n", (i + 1) * 5);
+		}
+		printf("SLOW-SINK-DONE (draining a little to confirm data survived + connection intact)\n");
+		n = read(fd, buffer, writesz);
+		printf("SLOW-SINK-DRAIN first read after stall = %d bytes\n", n);
 		close(fd);
 		goto error;
 	}

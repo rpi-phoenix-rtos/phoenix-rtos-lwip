@@ -107,6 +107,31 @@ err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg)
 }
 
 
+int sys_mbox_trypost_coalesce(sys_mbox_t *mbox, void *msg, sys_mbox_merge_fn merge)
+{
+	int done;
+
+	mutexLock(mbox->lock);
+
+	/* Try to merge onto the newest still-queued entry before checking for a
+	 * free slot: a full mbox whose tail is mergeable still absorbs `msg`
+	 * (turning the would-be ERR_MEM/tcp_fasttmr re-present into an append),
+	 * which is exactly the backlog case this path optimizes. */
+	if (!mbox_is_empty(mbox)) {
+		size_t last = (mbox->tail == 0) ? (mbox->sz - 1) : (mbox->tail - 1);
+		if (merge(mbox->ring[last], msg)) {
+			mutexUnlock(mbox->lock);
+			return SYS_MBOX_COALESCED;
+		}
+	}
+
+	done = mbox_trypost(mbox, msg);
+	mutexUnlock(mbox->lock);
+
+	return done ? SYS_MBOX_POSTED : SYS_MBOX_FULL;
+}
+
+
 void sys_mbox_post(sys_mbox_t *mbox, void *msg)
 {
 	mutexLock(mbox->lock);

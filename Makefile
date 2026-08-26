@@ -58,6 +58,17 @@ endif
 ifeq ($(GENET_RXSTATS_LOG),1)
 CFLAGS += -DGENET_RXSTATS_LOG=1
 endif
+
+# Coalesce back-to-back TCP segments onto one recvmbox pbuf chain (gigabit-NFS
+# Option B): folds the per-segment tcpip->socket handoff so the socket-recv path
+# stops paying an mbox post/fetch + consumer wakeup per ~1448-byte segment. Only
+# helps under a recv backlog (self-tuning: no queued entry -> normal post).
+# Default is set by the guard in api_msg.c; this forwards an explicit override to
+# the whole lwip build, so `make LWIP_RECVMBOX_COALESCE=0 ...` is the rollback
+# off-switch and `=1` the explicit enable (same pattern as GENET_RX_CACHEABLE).
+ifneq ($(LWIP_RECVMBOX_COALESCE),)
+CFLAGS += -DLWIP_RECVMBOX_COALESCE=$(LWIP_RECVMBOX_COALESCE)
+endif
 ifeq ($(LWIP_G3_BUILD), yes)
 CFLAGS += -I$(PREFIX_BUILD)/phrtos3-include -I$(PREFIX_PROJECT)/G3-PLC/ps_g3_phy/api/include
 endif

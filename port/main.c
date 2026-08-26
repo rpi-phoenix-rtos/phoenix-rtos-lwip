@@ -38,6 +38,10 @@
 void genet_rxcacheBench(struct netif *netif);
 #endif
 
+#ifndef LWIP_RECVMBOX_COALESCE
+#define LWIP_RECVMBOX_COALESCE 1
+#endif
+
 #ifndef LWIP_IPERF
 #define LWIP_IPERF 0
 #endif
@@ -140,6 +144,12 @@ int main(int argc, char **argv)
 
 	init_lwip_tcpip();
 	init_lwip_sockets();
+#if LWIP_RECVMBOX_COALESCE
+	/* One-line confirmation that the streaming-RX coalesce fast path (gigabit-NFS
+	 * Option B) is compiled into this /sbin/lwip. Boot log disambiguates a null
+	 * throughput result (feature ineffective) from "flag never reached the build". */
+	printf("lwip: recvmbox-coalesce enabled (TCP RX segment folding)\n");
+#endif
 #ifdef HAVE_DRIVER_rtl
 	register_driver_rtl();
 #endif

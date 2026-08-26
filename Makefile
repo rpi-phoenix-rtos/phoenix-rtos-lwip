@@ -32,13 +32,13 @@ endif
 
 CFLAGS += -Wundef -Iinclude -Ilib-lwip/src/include -I"$(LWIPOPTS_DIR)"
 
-# Policy B (task #11): opt-in cacheable/streaming-DMA GENET RX path + integrity
-# bench. DEFAULT-OFF — the stock build keeps the proven uncached RX path. Enable
-# for the bench with `make GENET_RX_CACHEABLE=1 ...`; the -D reaches both the
-# driver lib (drivers/bcm-genet.c) and the port lib (port/genet-rxcache-bench.c,
-# port/main.c). See drivers/bcm-genet.c for the NEEDS-CAREFUL-HW-REVIEW notes.
-ifeq ($(GENET_RX_CACHEABLE),1)
-CFLAGS += -DGENET_RX_CACHEABLE=1
+# Cacheable/streaming-DMA GENET RX path. Now DEFAULT-ON in the driver (HW-
+# validated bit-exact + GPU+net FB-clean, 2026-08-26; see bcm-genet.c). This
+# forwards an explicit override to both the driver lib and the port lib, so
+# `make GENET_RX_CACHEABLE=0 ...` rolls back to the uncached pool and
+# `GENET_RX_CACHEABLE=1` is the (redundant) explicit enable.
+ifneq ($(GENET_RX_CACHEABLE),)
+CFLAGS += -DGENET_RX_CACHEABLE=$(GENET_RX_CACHEABLE)
 endif
 
 # Raw TCP throughput bench (gigabit-NFS "size the prize"): opt-in lwiperf TCP

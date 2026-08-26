@@ -27,10 +27,14 @@
 #include "wifi-api.h"
 #include "ipsec-api.h"
 
-#ifndef GENET_RX_CACHEABLE
-#define GENET_RX_CACHEABLE 0
+/* The cacheable-RX integrity/throughput bench is a dev tool (connects to a host
+ * bench server on :5099); gate it on its OWN opt-in flag, NOT on GENET_RX_CACHEABLE
+ * — cacheable RX is now default-on and must not drag the bench (+ its connect
+ * delay) into every production boot. Build with `make GENET_RXCACHE_BENCH=1`. */
+#ifndef GENET_RXCACHE_BENCH
+#define GENET_RXCACHE_BENCH 0
 #endif
-#if GENET_RX_CACHEABLE
+#if GENET_RXCACHE_BENCH
 void genet_rxcacheBench(struct netif *netif);
 #endif
 
@@ -195,9 +199,9 @@ int main(int argc, char **argv)
 	}
 #endif
 
-#if GENET_RX_CACHEABLE
-	/* Policy B integrity + throughput bench. Resolves the gateway itself once
-	 * DHCP completes; netif_default is the genet interface here. */
+#if GENET_RXCACHE_BENCH
+	/* RX-cache integrity + throughput bench (dev opt-in). Resolves the gateway
+	 * itself once DHCP completes; netif_default is the genet interface here. */
 	genet_rxcacheBench(netif_default);
 #endif
 

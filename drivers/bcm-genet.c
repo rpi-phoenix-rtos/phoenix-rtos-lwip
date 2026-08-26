@@ -101,10 +101,12 @@
                                * HW-VALIDATED 2026-08-26 (requires LWIP_TCPIP_CORE_LOCKING_INPUT):
                                *   Gate 1 data-integrity: sha256 of a 128MB NFS read == host, bit-
                                *     exact, drop=0/rbuf_ovfl=0/copyfb=0.
-                               *   Gate 2 GPU+net: glamor X (WindowMaker) renders a CLEAN framebuffer
-                               *     on HDMI under concurrent NFS load — NO FB corruption. The V3D
-                               *     BIN/RENDER binner wedges seen are PRE-EXISTING (an uncached
-                               *     control reproduced them identically), unrelated to RX caching.
+                               *   Gate 2 GPU+net: glamor X up, NO FB corruption observed on the
+                               *     (idle) WindowMaker desktop during concurrent NFS load — kills the
+                               *     scanout-PA-overlap + gross-coherency stories. (Continuous GPU
+                               *     rendering-under-load + net not yet stressed; the V3D BIN/RENDER
+                               *     binner wedges seen are PRE-EXISTING — an uncached control
+                               *     reproduced them identically — unrelated to RX caching.)
                                * The old "cacheable corrupts the GPU FB / NFS ERANGE" warnings were
                                * REFUTED here — they were tied to the pre-core-locking mbox input
                                * path. Override to 0 with `make GENET_RX_CACHEABLE=0` to roll back. */

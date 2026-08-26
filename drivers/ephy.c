@@ -142,9 +142,33 @@ enum {
  * negotiated HCD speed/duplex once AN completes, which is the cheapest
  * way to read the link state without parsing AN advertisement masks. */
 enum {
+	EPHY_BCM54213_18_AUXCTL = 0x18,   /* Auxiliary Control (shadow-selected) */
 	EPHY_BCM54213_19_AUXSTAT = 0x19,
+	EPHY_BCM54213_1C_SHD = 0x1C,      /* Shadow register (bank-selected) */
 };
 
+/* Aux-control (0x18) MISC shadow — RGMII RXC-RXD skew (PHY-side RX clock delay).
+ * Values from Linux include/linux/brcmphy.h (MII_BCM54XX_AUXCTL_*). */
+#define BCM_AUXCTL_SHDWSEL_MASK       0x0007
+#define BCM_AUXCTL_SHDWSEL_READ_SHIFT 12
+#define BCM_AUXCTL_SHDWSEL_MISC       0x0007
+#define BCM_AUXCTL_MISC_WREN          0x8000
+#define BCM_AUXCTL_MISC_RGMII_SKEW_EN 0x0100
+
+/* Shadow (0x1C) 1000BASE-T clock control — PHY-side TX (GTXCLK) delay.
+ * Values from brcmphy.h (MII_BCM54XX_SHD_*, BCM54810_SHD_CLK_CTL). */
+#define BCM_SHD_WRITE                  0x8000
+#define BCM_SHD_VAL(x)                 (((x) & 0x1fU) << 10)
+#define BCM_SHD_DATA(x)                ((x) & 0x3ffU)
+#define BCM54810_SHD_CLK_CTL           0x03
+#define BCM54810_SHD_CLK_CTL_GTXCLK_EN (1U << 9)
+
+
+/* TEST: adopt the firmware's already-trained gigabit PHY — skip soft reset + autoneg
+ * restart (and the PHY hard reset in bcm-genet.c). Revert to 0. */
+#ifndef GENET_PHY_ADOPT_FW
+#define GENET_PHY_ADOPT_FW 0
+#endif
 
 #define ephy_printf(phy, fmt, ...) printf("lwip: ephy%u.%u: " fmt "\n", phy->bus, phy->addr, ##__VA_ARGS__)
 
@@ -185,7 +209,7 @@ __attribute__((unused)) static inline uint16_t ephy_mmdRead(const eth_phy_state_
 }
 
 
-static void ephy_reset(const eth_phy_state_t *phy)
+__attribute__((unused)) static void ephy_reset(const eth_phy_state_t *phy)
 {
 	if (gpio_valid(&phy->reset)) {
 		ephy_debug_printf(phy, "ephy_reset: start hardware reset...");
@@ -247,6 +271,7 @@ static uint32_t ephy_readPhyId(const eth_phy_state_t *phy)
 		ephy_printf(phy, "DigCtl 0x%04x AFECtl1 0x%04x", oui, ret);
 	*/
 
+	(void)oui; /* computed only for the optional ephy_printf traces above */
 	return phyid;
 }
 
@@ -531,6 +556,35 @@ static inline uint16_t ephy_bmcrMaxSpeedMask(const eth_phy_state_t *phy)
 }
 
 
+/* Program the BCM54213PE's PHY-side RGMII clock delays for phy-mode "rgmii-rxid"
+ * (Pi 4 DT): the PHY must add the ~2 ns RX clock delay (RXC-RXD skew) and must NOT
+ * add a TX delay (the GENET MAC provides that via ID_MODE_DIS cleared). ephy_reset()
+ * / the GPHY hard-reset wipe the shadow config the firmware set, so we must
+ * re-establish it here or gigabit RX corrupts (100M's loose timing hides it, but at
+ * 125 MHz DDR the MAC samples RX on the wrong edge → every frame dropped → DHCP fails).
+ * Mirrors Linux bcm54xx_config_clock_delay() (drivers/net/phy/broadcom.c). */
+static void ephy_bcm54213pe_configClockDelay(const eth_phy_state_t *phy)
+{
+	uint16_t val;
+
+	/* Enable RGMII RXC-RXD skew (RX delay) via the 0x18 MISC shadow. */
+	ephy_regWrite(phy, EPHY_BCM54213_18_AUXCTL,
+		BCM_AUXCTL_SHDWSEL_MASK | (BCM_AUXCTL_SHDWSEL_MISC << BCM_AUXCTL_SHDWSEL_READ_SHIFT));
+	val = ephy_regRead(phy, EPHY_BCM54213_18_AUXCTL);
+	val |= BCM_AUXCTL_MISC_WREN | BCM_AUXCTL_MISC_RGMII_SKEW_EN;
+	/* bcm54xx_auxctl_write ORs the shadow-select back into the low 3 bits. */
+	ephy_regWrite(phy, EPHY_BCM54213_18_AUXCTL, BCM_AUXCTL_SHDWSEL_MISC | val);
+
+	/* Disable the PHY TX (GTXCLK) delay via the 0x1C shadow bank 0x03 — otherwise a
+	 * double TX delay stacks on the MAC's ID_MODE_DIS-cleared TX delay at gigabit. */
+	ephy_regWrite(phy, EPHY_BCM54213_1C_SHD, BCM_SHD_VAL(BCM54810_SHD_CLK_CTL));
+	val = BCM_SHD_DATA(ephy_regRead(phy, EPHY_BCM54213_1C_SHD));
+	val &= ~BCM54810_SHD_CLK_CTL_GTXCLK_EN;
+	ephy_regWrite(phy, EPHY_BCM54213_1C_SHD,
+		BCM_SHD_WRITE | BCM_SHD_VAL(BCM54810_SHD_CLK_CTL) | BCM_SHD_DATA(val));
+}
+
+
 static void ephy_restartAN(const eth_phy_state_t *phy)
 {
 	/* max speed, enable AN, restart AN, full-duplex */
@@ -545,6 +599,64 @@ static void ephy_restartAN(const eth_phy_state_t *phy)
 		phy->model == ephy_bcm54213pe) {
 		/* adv: 1000M-FD */
 		ephy_regWrite(phy, EPHY_COMMON_09_GBCR, (1U << 9));
+	}
+	if (phy->model == ephy_bcm54213pe) {
+		/* FULLY disable EEE / AutogrEEEn Low-Power-Idle. HW-proven on-Pi via the
+		 * GENET MIB counters: after a TX the BCM54213PE enters LPI on its own
+		 * (AutogrEEEn is autonomous — no EEE negotiation needed), and a frame
+		 * arriving before the PHY finishes waking is dropped BEFORE the MAC — with
+		 * NO FCS error and no ring/DMA trace (rx_pkt/PROD never count it). Sparse
+		 * traffic (an NFS mount handshake: every packet follows an idle gap) loses
+		 * the first reply and stalls ~1 s per TCP RTO at gigabit, while dense
+		 * traffic (firmware TFTP) never idles and is clean. Clearing only the EEE
+		 * *advertisement* (7.60) is insufficient — AutogrEEEn ignores it — so mirror
+		 * Linux bcm54xx_config_init and kill LPI at the source. These writes survive
+		 * an autoneg restart (below) but a BMCR soft-reset would revert them, so they
+		 * must run here (after ephy_reset(), before the BMCR write). */
+
+		/* 1. AutogrEEEn OFF: TOP_MISC expansion reg 0x0D00, clear bit0
+		 * (BCM54XX_MII_BUF_CNTL0_AUTOGREEEN_EN). Expansion access = write the page
+		 * select (0x17) then r/m/w the data reg (0x15); restore select to 0. */
+		ephy_regWrite(phy, 0x17 /* EXP_SEL */, 0x0d00 /* TOP_MISC_MII_BUF_CNTL0 */);
+		ephy_regWrite(phy, 0x15 /* EXP_DATA */,
+			(uint16_t)(ephy_regRead(phy, 0x15) & (uint16_t)~0x0001u));
+		ephy_regWrite(phy, 0x17, 0x0000);
+
+		/* 2. EEE LPI FUNCTION OFF: Broadcom vendor EEE control MMD7 0x803D, clear
+		 * LPI_FEATURE_EN (bit15) + LPI_FEATURE_EN_DIG1000X (bit14). This is the
+		 * register that actually gates LPI generation (distinct from the 7.60
+		 * advertisement). */
+		ephy_mmdWrite(phy, 0x7, 0x803d,
+			(uint16_t)(ephy_mmdRead(phy, 0x7, 0x803d) & (uint16_t)~0xc000u));
+
+		/* 3. EEE advertisement OFF (MMD7 7.60). */
+		ephy_mmdWrite(phy, 0x7, 0x3c, 0);
+
+		/* 4. Auto-Power-Down OFF: shadow 0x0A, clear APD_EN (bit5) — APD can also
+		 * blank RX briefly after an idle gap (Linux leaves APD off on the Pi). */
+		ephy_regWrite(phy, EPHY_BCM54213_1C_SHD, BCM_SHD_VAL(0x0a));
+		{
+			uint16_t apd = BCM_SHD_DATA(ephy_regRead(phy, EPHY_BCM54213_1C_SHD));
+			apd &= (uint16_t)~0x0020u;
+			ephy_regWrite(phy, EPHY_BCM54213_1C_SHD,
+				BCM_SHD_WRITE | BCM_SHD_VAL(0x0a) | BCM_SHD_DATA(apd));
+		}
+
+		/* Readback verification: confirm the EEE/AutogrEEEn/APD writes actually
+		 * stuck (ephy_mmdRead had never been exercised on HW). Expect autogreeen
+		 * bit0=0, eee bits15,14=0, apd bit5=0. */
+		ephy_regWrite(phy, 0x17, 0x0d00);
+		uint16_t rb_agr = ephy_regRead(phy, 0x15);
+		ephy_regWrite(phy, 0x17, 0x0000);
+		uint16_t rb_eee = ephy_mmdRead(phy, 0x7, 0x803d);
+		ephy_regWrite(phy, EPHY_BCM54213_1C_SHD, BCM_SHD_VAL(0x0a));
+		uint16_t rb_apd = BCM_SHD_DATA(ephy_regRead(phy, EPHY_BCM54213_1C_SHD));
+		ephy_printf(phy, "EEE-off readback: autogreeen(exp0x0D00)=0x%04x eee(7.803D)=0x%04x apd(shd0x0A)=0x%04x",
+			rb_agr, rb_eee, rb_apd);
+
+		/* rgmii-rxid PHY-side clock delays (RX skew on, TX delay off) — required
+		 * for gigabit RX; ephy_reset() above wiped the firmware's shadow config. */
+		ephy_bcm54213pe_configClockDelay(phy);
 	}
 	/* adv: no-next-page, no-rem-fault, no-pause, no-T4, 100M/10M-FD & 10M-HD, 802.3 */
 	ephy_regWrite(phy, EPHY_COMMON_04_ANAR, (1U << 8) | (1U << 6) | (1U << 5) | 1U);
@@ -962,7 +1074,9 @@ int ephy_init(eth_phy_state_t *phy, char *conf, uint8_t board_rev, link_state_cb
 		return err;
 	}
 
+#if !GENET_PHY_ADOPT_FW
 	ephy_reset(phy);
+#endif
 
 	phyid = ephy_readPhyId(phy);
 	if (phyid == 0U || phyid == ~0U) {
@@ -1058,7 +1172,14 @@ int ephy_init(eth_phy_state_t *phy, char *conf, uint8_t board_rev, link_state_cb
 			break;
 	}
 
+#if !GENET_PHY_ADOPT_FW
 	ephy_restartAN(phy);
+#else
+	/* GENET_PHY_ADOPT_FW: do NOT restart autoneg — adopt the firmware's already-
+	 * negotiated, trained gigabit link. The link poll (ephy_linkSpeed) reads the
+	 * still-up firmware link and macSetSpeed programs the MAC accordingly. */
+	ephy_printf(phy, "GENET_PHY_ADOPT_FW: adopting firmware PHY (no reset/autoneg)");
+#endif
 
 	ephy_debug_printf(phy, "Successfully initialized PHY");
 

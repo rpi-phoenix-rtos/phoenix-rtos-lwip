@@ -276,6 +276,17 @@
 #define GENET_TDMA_STATUS           0x08u  /* per-ring disabled bitmap (mirror of CTRL when stopped) */
 #define GENET_TDMA_SCB_BURST_SIZE   0x0Cu
 
+/* Global DMA per-ring interrupt-coalescing TIMEOUT registers (same layout in the
+ * RDMA and TDMA control blocks). Linux: DMA_RING0_TIMEOUT = 0x2C, +4 per ring, so
+ * the default queue (ring 16) TIMEOUT = 0x2C + 16*4 = 0x6C. Programming it gives
+ * the RX ring a HARDWARE liveness backstop: the timer re-raises the ring's RX
+ * interrupt when >=1 buffer has been undelivered for the programmed interval,
+ * even if the MBUF_DONE edge was missed. Reset value 0 = timer disabled. */
+#define GENET_DMA_RING16_TIMEOUT    0x6Cu
+/* Timeout is counted in 8.192 us ticks. Linux default rx_coalesce_usecs = 50 =>
+ * DIV_ROUND_UP(50*1000, 8192) = 7 ticks (~57 us). NetBSD uses the same ~57 us. */
+#define GENET_DMA_TIMEOUT_TICKS     7u
+
 #define GENET_DMA_TIMEOUT_US        100000u  /* Linux DMA_TIMEOUT_VAL */
 
 #define GENET_TDMA_CTRL_TDMA_EN     (1u << 0)
@@ -318,7 +329,10 @@
  * alignment pad, and the real multicast dst 01:00:5e:00:XX:XX starts
  * at buf[66].
  */
-#define GENET_RX_STATUS_PREFIX   66u
+/* TEST: match the firmware's plain RX (RBUF_64B_EN OFF). With only RBUF_ALIGN_2B the
+ * HW prepends just the 2-byte alignment (no 64-byte status block), so the prefix is 2.
+ * (Was 66 = 2 align + 64 status when RBUF_64B_EN was set.) */
+#define GENET_RX_STATUS_PREFIX   2u
 
 #define GENET_MAX_FRAME      2048u /* per-buffer slot size */
 #define GENET_BUF_ALIGN      32u   /* skb alignment from Linux SKB_ALIGNMENT */

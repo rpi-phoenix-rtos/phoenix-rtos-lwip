@@ -595,16 +595,59 @@ static void ephy_restartAN(const eth_phy_state_t *phy)
 		ephy_regWrite(phy, EPHY_COMMON_09_GBCR, (1U << 9));
 	}
 	if (phy->model == ephy_bcm54213pe) {
-		/* Don't advertise EEE (7.60). The BCM54213PE's AutogrEEEn Low-Power-Idle
-		 * puts the PHY to sleep during idle gaps at gigabit; the first RGMII RX
-		 * frame after each wake is occasionally corrupted → HW FCS drop → sparse
-		 * traffic (e.g. an NFS mount handshake, all packets follow an idle gap)
-		 * loses ~1-in-10 while dense traffic (firmware TFTP) never idles and is
-		 * clean. This is the Phoenix equivalent of the Pi's `dtparam=eee=off`
-		 * remedy; the RTL8211 branch above already does the same for the same
-		 * reason. (Clock-delay config is register-identical to Linux, so it was
-		 * NOT the residual-loss cause.) */
-		ephy_mmdWrite(phy, 0x7, 0x3c /* EEE Advertisement (7.60) */, 0);
+		/* FULLY disable EEE / AutogrEEEn Low-Power-Idle. HW-proven on-Pi via the
+		 * GENET MIB counters: after a TX the BCM54213PE enters LPI on its own
+		 * (AutogrEEEn is autonomous — no EEE negotiation needed), and a frame
+		 * arriving before the PHY finishes waking is dropped BEFORE the MAC — with
+		 * NO FCS error and no ring/DMA trace (rx_pkt/PROD never count it). Sparse
+		 * traffic (an NFS mount handshake: every packet follows an idle gap) loses
+		 * the first reply and stalls ~1 s per TCP RTO at gigabit, while dense
+		 * traffic (firmware TFTP) never idles and is clean. Clearing only the EEE
+		 * *advertisement* (7.60) is insufficient — AutogrEEEn ignores it — so mirror
+		 * Linux bcm54xx_config_init and kill LPI at the source. These writes survive
+		 * an autoneg restart (below) but a BMCR soft-reset would revert them, so they
+		 * must run here (after ephy_reset(), before the BMCR write). */
+
+		/* 1. AutogrEEEn OFF: TOP_MISC expansion reg 0x0D00, clear bit0
+		 * (BCM54XX_MII_BUF_CNTL0_AUTOGREEEN_EN). Expansion access = write the page
+		 * select (0x17) then r/m/w the data reg (0x15); restore select to 0. */
+		ephy_regWrite(phy, 0x17 /* EXP_SEL */, 0x0d00 /* TOP_MISC_MII_BUF_CNTL0 */);
+		ephy_regWrite(phy, 0x15 /* EXP_DATA */,
+			(uint16_t)(ephy_regRead(phy, 0x15) & (uint16_t)~0x0001u));
+		ephy_regWrite(phy, 0x17, 0x0000);
+
+		/* 2. EEE LPI FUNCTION OFF: Broadcom vendor EEE control MMD7 0x803D, clear
+		 * LPI_FEATURE_EN (bit15) + LPI_FEATURE_EN_DIG1000X (bit14). This is the
+		 * register that actually gates LPI generation (distinct from the 7.60
+		 * advertisement). */
+		ephy_mmdWrite(phy, 0x7, 0x803d,
+			(uint16_t)(ephy_mmdRead(phy, 0x7, 0x803d) & (uint16_t)~0xc000u));
+
+		/* 3. EEE advertisement OFF (MMD7 7.60). */
+		ephy_mmdWrite(phy, 0x7, 0x3c, 0);
+
+		/* 4. Auto-Power-Down OFF: shadow 0x0A, clear APD_EN (bit5) — APD can also
+		 * blank RX briefly after an idle gap (Linux leaves APD off on the Pi). */
+		ephy_regWrite(phy, EPHY_BCM54213_1C_SHD, BCM_SHD_VAL(0x0a));
+		{
+			uint16_t apd = BCM_SHD_DATA(ephy_regRead(phy, EPHY_BCM54213_1C_SHD));
+			apd &= (uint16_t)~0x0020u;
+			ephy_regWrite(phy, EPHY_BCM54213_1C_SHD,
+				BCM_SHD_WRITE | BCM_SHD_VAL(0x0a) | BCM_SHD_DATA(apd));
+		}
+
+		/* Readback verification: confirm the EEE/AutogrEEEn/APD writes actually
+		 * stuck (ephy_mmdRead had never been exercised on HW). Expect autogreeen
+		 * bit0=0, eee bits15,14=0, apd bit5=0. */
+		ephy_regWrite(phy, 0x17, 0x0d00);
+		uint16_t rb_agr = ephy_regRead(phy, 0x15);
+		ephy_regWrite(phy, 0x17, 0x0000);
+		uint16_t rb_eee = ephy_mmdRead(phy, 0x7, 0x803d);
+		ephy_regWrite(phy, EPHY_BCM54213_1C_SHD, BCM_SHD_VAL(0x0a));
+		uint16_t rb_apd = BCM_SHD_DATA(ephy_regRead(phy, EPHY_BCM54213_1C_SHD));
+		ephy_printf(phy, "EEE-off readback: autogreeen(exp0x0D00)=0x%04x eee(7.803D)=0x%04x apd(shd0x0A)=0x%04x",
+			rb_agr, rb_eee, rb_apd);
+
 		/* rgmii-rxid PHY-side clock delays (RX skew on, TX delay off) — required
 		 * for gigabit RX; ephy_reset() above wiped the firmware's shadow config. */
 		ephy_bcm54213pe_configClockDelay(phy);

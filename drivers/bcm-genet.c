@@ -97,6 +97,20 @@
 #define GENET_RX_CACHEABLE 0
 #endif
 
+/* TEMP diag: per-frame NFS/TCP RX logging in the drain path to discriminate
+ * delivered-but-corrupt from before-ring loss (gigabit NFS triage). Revert to 0. */
+#ifndef GENET_RXFRAME_LOG
+#define GENET_RXFRAME_LOG 1
+#endif
+
+/* irq-thread poll-drain backstop interval (us): the RX interrupt for a frame
+ * arriving right after a TX is empirically lost at gigabit, so the thread polls
+ * the RX ring at least this often and drains any stranded frame. Bounds RX
+ * latency to this interval when the interrupt is missed. */
+#ifndef GENET_RX_POLL_US
+#define GENET_RX_POLL_US 2000u
+#endif
+
 /*
  * RX ring depth. The HW default-queue ring is GENET_TOTAL_DESC (256) BDs and
  * the BUF_SIZE/END_ADDR are programmed for that full count. We MUST back every
@@ -185,6 +199,9 @@ typedef struct {
 	uint32_t rx_c_index;     /* SW's view, mirrors RDMA_RING_CONS_INDEX */
 	unsigned long rx_pkts_seen;
 	unsigned long rx_pkts_dropped;
+	unsigned long rx_rearm_stranded;   /* frames caught by the post-unmask re-drain */
+	unsigned long rx_pollrescue;       /* frames caught by the irq-thread poll backstop (lost-IRQ) */
+	unsigned long rx_polls;            /* irq-thread condWait timeouts (poll backstop invocations) */
 
 	/* IRQ plumbing: handler runs in interrupt context, masks the level-2
 	 * source bits it's about to service, signals irq_cond; irq_thread
@@ -741,6 +758,24 @@ static int genet_initRxRing(genet_state_t *state)
 		(GENET_TOTAL_DESC << 16) | (GENET_MAX_FRAME & 0xFFFFu));
 	genet_write(state, ring_off + GENET_RDMA_RING_MBUF_DONE, 1);
 
+	/* RX interrupt-coalescing TIMEOUT backstop for the default queue (ring 16).
+	 * MBUF_DONE=1 above requests an interrupt per completed buffer, but the ring's
+	 * RXDMA_DONE is a single latched bit: genet_irqHandler clears it on entry and
+	 * genet_drainRxRing snapshots the producer index once, so a buffer whose
+	 * producer update becomes visible in the sub-microsecond window after that
+	 * snapshot — seen only at gigabit line rate — is left undelivered with NO
+	 * pending interrupt. Its only rescue was the NEXT inbound frame's IRQ, i.e.
+	 * the peer's ~200 ms TCP RTO retransmit; at gigabit a lone unicast reply (an
+	 * ARP reply or TCP SYN-ACK) can strand this way and stall the whole
+	 * connection. This HW timer re-raises the ring RX interrupt within ~57 us
+	 * whenever >=1 buffer is undelivered, bounding the stall to microseconds.
+	 * Both IRQ-driven upstream drivers (Linux DMA_RING16_TIMEOUT, NetBSD
+	 * genet_set_rxthresh) program it; Phoenix previously left it at reset 0
+	 * (disabled). The timeout lives in the GLOBAL RDMA control block at 0x6C, NOT
+	 * the per-ring block (where 0x2C is READ_PTR). */
+	genet_write(state, GENET_RDMA_REGS_OFF + GENET_DMA_RING16_TIMEOUT,
+		GENET_DMA_TIMEOUT_TICKS);
+
 	/* XON/XOFF threshold — at 0 the RX engine is always-XOFF. */
 	genet_write(state, ring_off + GENET_RDMA_RING_XON_XOFF,
 		(GENET_DMA_FC_THRESH_LO << GENET_DMA_XOFF_THRESH_SHIFT) |
@@ -764,6 +799,17 @@ static int genet_initRxRing(genet_state_t *state)
 	genet_write(state, RBUF_CHK_CTRL, chk);
 
 	genet_write(state, RBUF_TBUF_SIZE_CTRL, 1);
+
+	/* Disable MAC-side EEE / energy-saving on the RX path — the MAC-side half of
+	 * the PHY AutogrEEEn/LPI RX-drop (a frame arriving while the RX path is powering
+	 * back up after an idle gap is lost before it reaches the ring). Linux
+	 * force-clears RBUF_ENERGY_CTRL with the note "RBUF EEE/PM can break the RX path
+	 * on GENET. Keep it disabled." Also clear UMAC EEE_EN. Pairs with the PHY-side
+	 * AutogrEEEn/LPI/EEE disable in ephy.c (= the Pi's dtparam=eee=off). */
+	genet_write(state, GENET_RBUF_OFF + 0x9Cu /* RBUF_ENERGY_CTRL */,
+		genet_read(state, GENET_RBUF_OFF + 0x9Cu) & ~0x3u /* RBUF_EEE_EN|RBUF_PM_EN */);
+	genet_write(state, GENET_UMAC_OFF + 0x064u /* UMAC_EEE_CTRL */,
+		genet_read(state, GENET_UMAC_OFF + 0x064u) & ~0x8u /* EEE_EN (bit3) */);
 
 	/* Now the Linux-style two-phase DMA enable:
 	 *   1. RDMA_RING_CFG: per-ring enable bitmap (ring 16 only).
@@ -822,6 +868,20 @@ static void genet_drainRxRing(genet_state_t *state)
 	uint32_t prod = genet_read(state,
 		ring_off + GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu;
 
+	/* DMA read barrier (Linux dma_rmb()): the RX DMA engine writes the frame
+	 * payload into the (uncached Normal-NC) buffer BEFORE it advances PROD_INDEX.
+	 * Reading PROD above tells us frames are ready, but without a load-load
+	 * barrier the CPU may speculatively read the descriptor status / payload
+	 * ahead of the PROD read and observe pre-DMA (stale/partial) bytes — the
+	 * frame is delivered up the stack CORRUPT, lwip's checksum rejects it, and
+	 * the peer only makes progress on its ~200 ms RTO retransmit. This races
+	 * hardest right after a TX (the irq thread is already awake, so the drain
+	 * runs at minimum latency), which is exactly when the NFS SYN-ACK / RPC
+	 * reply were being dropped at gigabit. Ordering all payload reads after the
+	 * PROD observation closes the window. Both BSD genet drivers issue the
+	 * equivalent BUS_DMASYNC_POSTREAD here. */
+	__asm__ volatile("dmb ld" ::: "memory");
+
 	while (prod != (state->rx_c_index & 0xFFFFu)) {
 		uint32_t bd_off = GENET_RX_DESCS_OFF +
 			state->rx_index * GENET_DMA_DESC_SIZE;
@@ -842,6 +902,72 @@ static void genet_drainRxRing(genet_state_t *state)
 			uint8_t *buf = state->rx_bufs[bufidx];
 			uint8_t *frame = buf + GENET_RX_STATUS_PREFIX;
 			int nb;
+
+#if GENET_RXFRAME_LOG
+			/* Discriminating RX diagnostic (gigabit delivered-but-corrupt triage):
+			 * for NFS/TCP frames (port 2049) log the header fields AS THE DRIVER
+			 * READS THEM FROM THE DMA BUFFER, plus the IP-header checksum computed
+			 * over those bytes. The host emits a correct IP header, so iphdrck==0xFFFF
+			 * means the bytes in Pi memory are intact (delivered clean -> lwip
+			 * rejects for another reason); iphdrck!=0xFFFF proves the frame is CORRUPT
+			 * in memory when handed up (stale/aliased/partial-DMA). Only TCP:2049 so
+			 * the UART isn't flooded (~a dozen frames per mount attempt). */
+			if (pay_len >= 54u) {
+				const uint8_t *f = frame;
+				uint16_t eth = (uint16_t)((f[12] << 8) | f[13]);
+				if (eth == 0x0800u && f[23] == 6u) {
+					uint8_t ihl = (uint8_t)((f[14] & 0x0fu) * 4u);
+					const uint8_t *tcp = f + 14 + ihl;
+					uint16_t sport = (uint16_t)((tcp[0] << 8) | tcp[1]);
+					uint16_t dport = (uint16_t)((tcp[2] << 8) | tcp[3]);
+					if (sport == 2049u || dport == 2049u) {
+						uint32_t s = 0;
+						unsigned i;
+						uint16_t iplen = (uint16_t)((f[16] << 8) | f[17]);
+						for (i = 0; i < ihl; i += 2)
+							s += (uint32_t)((f[14 + i] << 8) | f[14 + i + 1]);
+						while ((s >> 16) != 0u)
+							s = (s & 0xFFFFu) + (s >> 16);
+						/* Full TCP checksum over the bytes AS DELIVERED (pseudo-header
+						 * src/dst IP + proto 6 + TCP length, then TCP header+payload).
+						 * ==0xFFFF => the ENTIRE frame (incl. the TCP tail after the IP
+						 * header) is intact in the driver's hands -> corruption is
+						 * post-handoff or lwip mis-rejects. !=0xFFFF => the TCP tail is
+						 * corrupt in memory (DMA/partial-write) even though the IP header
+						 * survived. Discriminates the two remaining hypotheses. */
+						{
+							uint32_t ts = 0;
+							uint16_t tcplen = (uint16_t)(iplen - ihl);
+							ts += (uint32_t)((f[26] << 8) | f[27]);
+							ts += (uint32_t)((f[28] << 8) | f[29]);
+							ts += (uint32_t)((f[30] << 8) | f[31]);
+							ts += (uint32_t)((f[32] << 8) | f[33]);
+							ts += 6u;
+							ts += tcplen;
+							for (i = 0; i < tcplen; i += 2) {
+								uint16_t hi = tcp[i];
+								uint16_t lo = ((i + 1u) < tcplen) ? tcp[i + 1] : 0u;
+								ts += (uint32_t)((hi << 8) | lo);
+							}
+							while ((ts >> 16) != 0u)
+								ts = (ts & 0xFFFFu) + (ts >> 16);
+							time_t tnow = 0;
+							uint32_t mibrx = genet_read(state, GENET_UMAC_OFF + 0x428u);
+							gettime(&tnow, NULL);
+							/* mib=MAC total-received count AT delivery. If a stranded
+							 * SYN-ACK's mib here is ~equal to the value logged at the
+							 * preceding SYN TX, the frame JUST arrived (retransmit; the
+							 * original never hit the MAC -> PHY/wire loss). If mib jumped
+							 * long ago, the original was received but held (MAC/RBUF/DMA). */
+							genet_printf(state,
+								"RXF t=%llu mib=%u 2049 sp=%u dp=%u flags=0x%02x len=%u iplen=%u iphdrck=0x%04x tcpck=0x%04x",
+								(unsigned long long)tnow, mibrx, sport, dport, tcp[13], pay_len, iplen,
+								(unsigned)(s & 0xFFFFu), (unsigned)(ts & 0xFFFFu));
+						}
+					}
+				}
+			}
+#endif
 
 #if GENET_RX_CACHEABLE
 			/* dma_sync_for_cpu: clean+invalidate this slot's lines before ANY
@@ -973,19 +1099,59 @@ static void genet_irqThread(void *arg)
 	mutexLock(state->irq_lock);
 	for (;;) {
 		while (state->irq_events == 0u) {
-			/* Bounded (100 ms) wait, NOT infinite. genet_irqHandler runs in
-			 * interrupt context and sets state->irq_events WITHOUT holding
-			 * irq_lock (it can't block), so on this 4-core SMP box its signal can
-			 * be lost if it fires in the window between the irq_events==0 test
-			 * above and this thread parking in condWait. An infinite wait would
-			 * then wedge RX forever with RX_DMA_DONE left masked (only line ~990
-			 * re-unmasks, downstream of the missed wake) -> RX dies, host
-			 * retransmits go unanswered, NFS stalls. A 100 ms bound turns a lost
-			 * wakeup into a <=100 ms hiccup: we re-read irq_events (which the ISR
-			 * already set) and recover. Same lost-wakeup class as the libphoenix
-			 * semaphore fix e75c4fe; neither FreeBSD nor NetBSD masks RX during
-			 * service, so they can't wedge this way. */
-			condWait(state->irq_cond, state->irq_lock, 100000);
+			/* Short bounded wait + poll-drain backstop. HW-measured: an RX frame
+			 * arriving ~100 us after a TX (e.g. the NFS SYN-ACK right after our SYN,
+			 * at gigabit) has its RX_DMA_DONE interrupt lost — the frame is DMA'd into
+			 * the ring (PROD advances) but the irq thread is never woken, so it
+			 * strands until the NEXT inbound frame re-fires the IRQ ~= the peer's
+			 * ~1 s RTO retransmit -> the mount times out. Neither the post-unmask
+			 * re-drain nor the HW RX-coalesce timeout (DMA_RING16_TIMEOUT) rescues it.
+			 * So on every wait return, unconditionally re-read PROD_INDEX and drain
+			 * any frame the missing interrupt stranded. This bounds RX latency to the
+			 * poll interval (2 ms) regardless of the interrupt-loss root cause, the
+			 * same poll-robustness U-Boot's bcmgenet has by construction. */
+			condWait(state->irq_cond, state->irq_lock, GENET_RX_POLL_US);
+			if (state->irq_events == 0u) {
+				uint32_t rring = GENET_RX_RINGS_OFF +
+					GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
+				mutexUnlock(state->irq_lock);
+				state->rx_polls++;   /* fork-closer: proves the poll actually runs */
+				uint32_t prod_full = genet_read(state, rring + GENET_RDMA_RING_PROD_INDEX);
+				if ((prod_full & 0xFFFFu) != (state->rx_c_index & 0xFFFFu)) {
+					state->rx_pollrescue++;
+					genet_drainRxRing(state);
+				}
+#if GENET_RXFRAME_LOG
+				/* When the ring looks empty but frames should be arriving, dump the
+				 * pre-ring state ~1/s: full PROD (top 16b = HW discard counter),
+				 * INTRL2 STAT/MASK (is RX_DMA_DONE latched while the ring is empty?),
+				 * and RDMA DMA_CTRL (did RX DMA_EN drop?). Distinguishes discard vs
+				 * latched-but-not-woken vs DMA-disabled. */
+				else if ((state->rx_polls % 500u) == 0u) {
+					time_t tnow = 0;
+					uint32_t istat = genet_read(state, GENET_INTRL2_0_OFF + INTRL2_CPU_STAT);
+					/* Read-and-CLEAR the sticky, masked RX-DMA per-packet/per-buffer
+					 * completion bits (14=PDONE, 15=BDONE) so the NEXT dump's istat
+					 * shows whether the RX DMA completed anything in the interval
+					 * (safe: masked, wakes nothing). */
+					genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_CLEAR,
+						(1u << 14) | (1u << 15));
+					/* MIB HW counters (free-running; deltas): rx total received pkts
+					 * (UMAC+0x428) and rx FCS/CRC errors (UMAC+0x438). Proves whether
+					 * the frame reached the MAC at all: rx_pkt climbing while PROD
+					 * frozen => frame in MAC/RBUF, DMA stall; rx_fcs climbing =>
+					 * corrupt at gigabit (RGMII); neither => frame never hit the MAC. */
+					uint32_t mib_rxpkt = genet_read(state, GENET_UMAC_OFF + 0x428u);
+					uint32_t mib_rxfcs = genet_read(state, GENET_UMAC_OFF + 0x438u);
+					gettime(&tnow, NULL);
+					genet_printf(state,
+						"RXPOLL t=%llu polls=%lu prodfull=0x%08x cidx=%u istat=0x%08x mib_rxpkt=%u mib_rxfcs=%u",
+						(unsigned long long)tnow, state->rx_polls, prod_full,
+						state->rx_c_index & 0xFFFFu, istat, mib_rxpkt, mib_rxfcs);
+				}
+#endif
+				mutexLock(state->irq_lock);
+			}
 		}
 		events = state->irq_events;
 		state->irq_events = 0u;
@@ -998,9 +1164,37 @@ static void genet_irqThread(void *arg)
 		 * If they ever fire (spurious), the mask-then-clear in the
 		 * handler still leaves them safe to ignore here. */
 
-		/* Re-unmask the bits we just serviced so future events wake us. */
+		/* Re-unmask the bits we just serviced so future events wake us. Unmask
+		 * FIRST (before the re-drain below) so a frame arriving after the re-check
+		 * re-fires the LIVE interrupt rather than relying on the latch semantics. */
 		genet_write(state, GENET_INTRL2_0_OFF + INTRL2_CPU_MASK_CLEAR,
 			events);
+
+		/* Level-triggered close for the edge-dependent RX drain (the gigabit
+		 * NFS-stall root cause). RX_DMA_DONE is a SINGLE latched bit for the whole
+		 * ring; genet_irqHandler CLEARs it on entry and genet_drainRxRing snapshots
+		 * RDMA PROD_INDEX only ONCE. A frame that latched the bit but whose
+		 * producer-index update was not visible to that snapshot (a sub-us window
+		 * under a 1 Gbps micro-burst) is stranded in the ring with NO pending
+		 * interrupt -> the thread parks and the frame is drained only when the NEXT
+		 * inbound frame re-fires RX_DMA_DONE, ~200 ms later = the peer's RTO
+		 * retransmit -> a delayed ACK -> the mount stalls/times out. HW counters
+		 * stay clean because nothing is dropped, only drained late; it is
+		 * gigabit-only because at 100 Mbps the inter-arrival gap (>=14 us) hides the
+		 * window. Now that RX is unmasked, re-read the producer and drain while the
+		 * ring is non-empty: a frame past this check re-fires the live IRQ, a frame
+		 * before it is caught here -> none can be stranded regardless of
+		 * producer/STAT/DMA visibility ordering. Reentrancy-safe: drain runs only
+		 * in this thread; worst case is a spurious empty drain. */
+		if ((events & INTRL2_0_RX_DMA_DONE) != 0u) {
+			uint32_t rring = GENET_RX_RINGS_OFF +
+				GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
+			while ((genet_read(state, rring + GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu)
+					!= (state->rx_c_index & 0xFFFFu)) {
+				state->rx_rearm_stranded++;
+				genet_drainRxRing(state);
+			}
+		}
 
 		mutexLock(state->irq_lock);
 	}
@@ -1050,14 +1244,21 @@ static void genet_setLinkState(void *arg, int state_up)
 		full_duplex != state->last_duplex) {
 		genet_printf(state, "link up: %d Mbps %s-duplex",
 			speed, full_duplex ? "full" : "half");
+		/* Program UMAC_CMD.SPEED/duplex (+ TX_EN|RX_EN) ONLY on an actual link
+		 * change — NOT on every 1 s link-poll tick. genet_setLinkState is called
+		 * from the 1 Hz link poll; re-writing UMAC_CMD each tick momentarily
+		 * re-syncs the MAC and drops a frame that is in-flight across the write
+		 * (no FCS error, no HW discard, not produced into the RX ring). At gigabit
+		 * that manifests as deterministic loss of the first reply after a request
+		 * (NFS SYN-ACK / RPC reply), recovered only on the peer's ~1 s RTO
+		 * retransmit -> the mount times out. Gating it on a real change removes the
+		 * periodic RX-blackout while still programming the rate on first link-up
+		 * and on genuine renegotiation. */
+		genet_macSetSpeed(state, speed, full_duplex);
 	}
 	state->last_link_up = 1;
 	state->last_speed = speed;
 	state->last_duplex = full_duplex;
-
-	/* Program UMAC_CMD.SPEED + TX_EN now that the negotiated rate is known.
-	 * RX_EN lands in Tier 3 once the RDMA ring is set up. */
-	genet_macSetSpeed(state, speed, full_duplex);
 
 	netif_set_link_up(netif);
 
@@ -1082,7 +1283,7 @@ static void genet_setLinkState(void *arg, int state_up)
  * re-enable it with -DGENET_RXSTATS_LOG=1. (The stats counters are always kept;
  * only the console print is gated.) */
 #ifndef GENET_RXSTATS_LOG
-#define GENET_RXSTATS_LOG 0
+#define GENET_RXSTATS_LOG 1  /* TEMP: gigabit RX-stranding verify */
 #endif
 
 static void genet_linkPollThread(void *arg)
@@ -1113,9 +1314,15 @@ static void genet_linkPollThread(void *arg)
 			uint32_t prod = genet_read(state, GENET_RX_RINGS_OFF +
 				GENET_DEFAULT_RING * GENET_DMA_RING_SIZE +
 				GENET_RDMA_RING_PROD_INDEX) & 0xFFFFu;
-			genet_printf(state, "RXSTATS seen=%lu drop=%lu copyfb=%lu free=%d rbuf_ovfl=%u prod=%u cidx=%u",
+			/* Read back the RX interrupt-coalescing timeout register so we can
+			 * confirm the init write to DMA_RING16_TIMEOUT actually took effect
+			 * (expect GENET_DMA_TIMEOUT_TICKS, not the reset 0). */
+			uint32_t rxtmo = genet_read(state,
+				GENET_RDMA_REGS_OFF + GENET_DMA_RING16_TIMEOUT);
+			genet_printf(state, "RXSTATS seen=%lu drop=%lu copyfb=%lu free=%d rbuf_ovfl=%u prod=%u cidx=%u rearm_stranded=%lu pollrescue=%lu polls=%lu rxtmo=%u",
 				state->rx_pkts_seen, state->rx_pkts_dropped, state->rx_copyfallback,
-				state->rx_free_top, rbuf_ovfl, prod, state->rx_c_index & 0xFFFFu);
+				state->rx_free_top, rbuf_ovfl, prod, state->rx_c_index & 0xFFFFu,
+				state->rx_rearm_stranded, state->rx_pollrescue, state->rx_polls, rxtmo);
 		}
 #else
 		(void)tick;
@@ -1160,6 +1367,30 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	 * past the ETH_PAD_SIZE head pad. dmammap memory is uncached, so
 	 * no further cache maintenance is needed. */
 	pbuf_copy_partial(p, state->tx_buf, len, ETH_PAD_SIZE);
+
+#if GENET_RXFRAME_LOG
+	/* TEMP: log NFS/TCP frames lwip asks us to TRANSMIT, to correlate with the
+	 * RXF log + host pcap. If lwip generates the handshake ACK after a valid
+	 * SYN-ACK is delivered, it appears here; if it does not, the gap is in lwip's
+	 * TCP processing, not the driver's TX. */
+	if (len >= 54u) {
+		const uint8_t *f = state->tx_buf;
+		if (((f[12] << 8) | f[13]) == 0x0800 && f[23] == 6u) {
+			uint8_t ihl = (uint8_t)((f[14] & 0x0fu) * 4u);
+			const uint8_t *tcp = f + 14 + ihl;
+			uint16_t sp = (uint16_t)((tcp[0] << 8) | tcp[1]);
+			uint16_t dp = (uint16_t)((tcp[2] << 8) | tcp[3]);
+			if (sp == 2049u || dp == 2049u) {
+				time_t tnow = 0;
+				gettime(&tnow, NULL);
+				genet_printf(state, "TXF t=%llu mib=%u 2049 sp=%u dp=%u flags=0x%02x len=%u seq=%u ack=%u",
+					(unsigned long long)tnow, genet_read(state, GENET_UMAC_OFF + 0x428u), sp, dp, tcp[13], len,
+					(unsigned)((tcp[4] << 24) | (tcp[5] << 16) | (tcp[6] << 8) | tcp[7]),
+					(unsigned)((tcp[8] << 24) | (tcp[9] << 16) | (tcp[10] << 8) | tcp[11]));
+			}
+		}
+	}
+#endif
 
 	/* Program BD[tx_index]: addr-lo, addr-hi, length+status. */
 	bd_off = GENET_TX_DESCS_OFF + state->tx_index * GENET_DMA_DESC_SIZE;

@@ -135,6 +135,7 @@ int main(int argc, char **argv)
 	void register_driver_rtl(void);
 	void register_driver_enet(void);
 	void register_driver_genet(void);
+	void register_driver_wifi43455(void);
 	void register_driver_greth(void);
 	void register_driver_pppos(void);
 	void register_driver_pppou(void);
@@ -158,6 +159,9 @@ int main(int argc, char **argv)
 #endif
 #ifdef HAVE_DRIVER_genet
 	register_driver_genet();
+#endif
+#ifdef HAVE_DRIVER_wifi43455
+	register_driver_wifi43455();
 #endif
 #ifdef HAVE_DRIVER_greth
 	register_driver_greth();

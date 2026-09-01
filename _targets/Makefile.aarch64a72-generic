@@ -3,13 +3,17 @@
 #
 # Raspberry Pi 4-B / BCM2711 / Cortex-A72 target
 #
-# Driver list: GENET (built-in 1 GbE) + tuntap. WiFi (BCM43455) is
-# parked; ports for it would require an SDIO host driver first.
+# Driver list: GENET (built-in 1 GbE), WiFi (BCM43455) and tuntap.
+#
+# The WiFi driver owns no hardware: the SDIO/SDPCM stack for the BCM43455
+# lives in the rpi4-wifi daemon (phoenix-rtos-devices), which must remain the
+# single owner of the bus, and wifi43455.c is the lwIP end of the /dev/wifidata
+# + /dev/wifi seam it exposes.
 #
 # Copyright 2026 Phoenix Systems
 #
 
-NET_DRIVERS_SUPPORTED := genet tuntap
+NET_DRIVERS_SUPPORTED := genet wifi43455 tuntap
 NET_DRIVERS ?= $(NET_DRIVERS_SUPPORTED)
 
 # ephy.c references gpio_set/gpio_init for the per-PHY reset/IRQ pin
@@ -19,3 +23,5 @@ NET_DRIVERS ?= $(NET_DRIVERS_SUPPORTED)
 # stubs return -ENOSYS while gpio_valid() reports the pin as uninitialised,
 # which makes ephy.c skip the GPIO-based reset and IRQ paths cleanly.
 DRIVERS_SRCS_genet = bcm-genet.c ephy.c null-gpio.c $(DRIVERS_SRCS_UTIL)
+
+DRIVERS_SRCS_wifi43455 = wifi43455.c $(DRIVERS_SRCS_UTIL)

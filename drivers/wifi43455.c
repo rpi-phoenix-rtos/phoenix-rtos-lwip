@@ -85,7 +85,13 @@
 /* /dev/wifidata never blocks, so an idle RX thread polls. 1.5 ms costs ~660
  * wakeups/s at idle and adds at most that much latency to a frame; the radio
  * ceiling over SDIO is a few MB/s, far below what a tighter poll would buy. */
-#define WIFI_RX_IDLE_US   1500u
+/* Idle RX poll cadence. This is the dominant throughput term, not the radio:
+ * TCP cannot advance its window faster than ACKs are picked up, so an idle
+ * sleep of N us puts a ceiling near one frame per N us. Measured on hardware:
+ * 1500 us gave 0.58 MB/s = 402 frames/s = 2.49 ms/frame, i.e. almost exactly
+ * the poll interval plus processing. The real fix is an event-driven read on
+ * the daemon side; until then keep this small. */
+#define WIFI_RX_IDLE_US   200u
 #define WIFI_RX_ERR_US    20000u /* back off a little on a read error */
 #define WIFI_DEV_RETRY_S  2u     /* device files appear when rpi4-wifi starts */
 #define WIFI_JOIN_RETRY_S 10u
@@ -308,7 +314,14 @@ static void wifi_dhcpStartCb(void *arg)
 	struct netif *netif = arg;
 	err_t err;
 
-	netif_set_default(netif);
+	/* Do NOT take the default route away from a link that already has it: on
+	 * this board genet is the primary interface and comes up first. Traffic to
+	 * the WiFi subnet still selects this netif by address, so the only thing
+	 * grabbing the default would change is silently pushing every off-subnet
+	 * packet over WiFi. */
+	if (netif_default == NULL) {
+		netif_set_default(netif);
+	}
 
 	/* Bring the netif administratively UP. lwIP's dhcp_start() refuses with
 	 * ERR_ARG (-16) unless netif_is_up(), and unlike genet we never got

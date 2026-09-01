@@ -299,9 +299,16 @@ static int socket_ioctl(int sock, unsigned long request, const void *in_data, vo
 #endif
 	switch (request) {
 		case FIONREAD:
-		case FIONBIO:
-			/* implemented in LWiP socket layer */
+			/* read-only ioctl: the byte count is written back through out_data. */
 			return map_errno(lwip_ioctl(sock, request, out_data));
+
+		case FIONBIO:
+			/* write-only ioctl: the on/off flag arrives in in_data. out_data is
+			 * NULL for a write-only request (see ioctl_unpackEx: response_buf is
+			 * only populated when IOC_OUT is set), so passing out_data here made
+			 * lwip_ioctl read a zero flag and leave the socket blocking -- FIONBIO
+			 * could never enable non-blocking mode. Pass the actual flag. */
+			return map_errno(lwip_ioctl(sock, request, (void *)in_data));
 
 		case SIOCGIFNAME: {
 			struct ifreq *ifreq = (struct ifreq *)out_data;
@@ -830,7 +837,20 @@ static int socket_op(msg_t *msg, int sock)
 				msg->o.err = -EINVAL;
 				break;
 			}
-			msg->o.attr.val = poll_one(&polls, msg->i.attr.val, 0);
+			/* atPollStatus val: low 16 bits = poll event mask. The kernel's
+			 * single-socket poll fast-path (posix_poll, ftInetSocket) may pack a
+			 * block timeout (ms) in the high bits so this dedicated per-socket
+			 * thread BLOCKS in lwip_select until the socket is ready (lwip wakes on
+			 * the netconn callback) instead of the kernel spin-polling every
+			 * POLL_INTERVAL. High bits 0 => timeout 0 => the legacy instantaneous
+			 * snapshot, so every other caller (multi-fd poll, non-inet fds) is
+			 * unchanged. Blocking here only stalls THIS socket's own thread. */
+			{
+				long long v = msg->i.attr.val;
+				int pollev = (int)(v & 0xFFFFLL);
+				time_t block_us = (time_t)(((unsigned long long)v >> 16) * 1000ULL);
+				msg->o.attr.val = poll_one(&polls, pollev, block_us);
+			}
 			msg->o.err = (msg->o.attr.val < 0) ? msg->o.attr.val : EOK;
 			break;
 		case mtClose:
@@ -954,13 +974,19 @@ static int do_getnameinfo(const struct sockaddr *sa, socklen_t addrlen, char *ho
 	if (sa->sa_family == AF_INET) {
 		struct sockaddr_in *sa_in = (struct sockaddr_in *)sa;
 
-		if (host != NULL) {
+		/* Guard on sz > 0: servsz/hostsz are unsigned, so `buf[sz - 1]` with
+		 * sz == 0 wraps to buf[0xffffffff] -> an out-of-bounds write that faulted
+		 * the whole lwip server (a caller may pass a non-NULL buffer with size 0,
+		 * e.g. getnameinfo for only the host or only the service). snprintf already
+		 * NUL-terminates within a non-zero buffer; the explicit terminator is just
+		 * defensive and must not run when sz == 0. */
+		if (host != NULL && hostsz > 0) {
 			snprintf(host, hostsz, "%u.%u.%u.%u", (unsigned char)sa->sa_data[2], (unsigned char)sa->sa_data[3],
 				(unsigned char)sa->sa_data[4], (unsigned char)sa->sa_data[5]);
 			host[hostsz - 1] = '\0';
 		}
 
-		if (serv != NULL) {
+		if (serv != NULL && servsz > 0) {
 			snprintf(serv, servsz, "%u", ntohs(sa_in->sin_port));
 			serv[servsz - 1] = '\0';
 		}
@@ -1046,26 +1072,23 @@ static int do_getifaddrs(char *buf, size_t *buflen)
 	struct ifaddrs *dest;
 	struct netif *netif;
 	char *addrdest, *strdest;
-	size_t n_netifs = 0, n_ifaddrs = 0, needed;
-	size_t n_addrs = 0, str_needed = 0, addr_needed = 0;
+	size_t n_ifaddrs = 0, needed;
+	size_t str_needed = 0, addr_needed = 0;
 #if LWIP_IPV6
 	struct sockaddr_in6 *sin6;
 	int i;
 #endif
 
 	NETIF_FOREACH(netif) {
-		n_netifs++;
 		n_ifaddrs++;
 		/* lwip_netif_name | netif_num | '\0' */
 		str_needed += sizeof(netif->name) + 2;
 		/* IPv4 addr, netmask, gw/dsy */
-		n_addrs += 3;
 		addr_needed += 3 * sizeof(struct sockaddr_in);
 #if LWIP_IPV6
 		/* Count IPv6 addresses */
 		for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
 			if (!ip6_addr_isinvalid(netif_ip6_addr_state(netif, i))) {
-				n_addrs += 2;
 				n_ifaddrs++;
 				addr_needed += 2 * sizeof(struct sockaddr_in6);
 			}
@@ -1245,7 +1268,8 @@ __constructor__(1000) void init_lwip_sockets(void)
 	if ((err = portCreate(&oid.port)) < 0)
 		errout(err, "portCreate(socketsrv)");
 
-	if ((err = create_dev(&oid, PATH_SOCKSRV))) {
+	err = create_dev(&oid, PATH_SOCKSRV);
+	if (err) {
 		errout(err, "create_dev(%s)", PATH_SOCKSRV);
 	}
 

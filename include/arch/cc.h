@@ -48,7 +48,14 @@
 #endif
 
 
-#define LWIP_CHKSUM_ALGORITHM 2
+/* Algorithm 3 (Broadcom's unrolled 32-bit/8-byte sum) reads wider than algo-2's
+ * 16-bit accesses — on ports whose RX pbufs live in uncached DMA memory (e.g.
+ * the Pi 4 GENET pool) that ~halves the uncached bus transactions the checksum
+ * pays, and it is bit-identical on all targets. #ifndef so a project lwipopts
+ * may still override. */
+#ifndef LWIP_CHKSUM_ALGORITHM
+#define LWIP_CHKSUM_ALGORITHM 3
+#endif
 
 
 /* diagnostics */

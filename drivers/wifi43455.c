@@ -85,12 +85,18 @@
 /* /dev/wifidata never blocks, so an idle RX thread polls. 1.5 ms costs ~660
  * wakeups/s at idle and adds at most that much latency to a frame; the radio
  * ceiling over SDIO is a few MB/s, far below what a tighter poll would buy. */
-/* Idle RX poll cadence. This is the dominant throughput term, not the radio:
- * TCP cannot advance its window faster than ACKs are picked up, so an idle
- * sleep of N us puts a ceiling near one frame per N us. Measured on hardware:
- * 1500 us gave 0.58 MB/s = 402 frames/s = 2.49 ms/frame, i.e. almost exactly
- * the poll interval plus processing. The real fix is an event-driven read on
- * the daemon side; until then keep this small. */
+/* Idle RX pause. The daemon now WAITS for a frame inside read() (bounded), so
+ * an empty return already means it waited, and this is only a safety valve
+ * against a read that fails fast -- not the pacing mechanism it used to be.
+ *
+ * History, measured on hardware: 1500 us gave 0.58 MB/s (402 frames/s =
+ * 2.49 ms/frame, i.e. the poll interval plus processing) and 200 us gave up to
+ * 1.73. Treat that as directional, not exact -- repeat runs of identical code
+ * later spanned 0.66-1.73 MB/s, so a single throughput run on this link cannot
+ * settle a comparison. The reliable measurement is per-frame cost inside the
+ * daemon: 178 us to receive a frame, 121 us to transmit one, but 1.1 MILLION
+ * empty probes burning 24.9 s of bus time. Polling is the bottleneck, not the
+ * radio or the SDIO. */
 #define WIFI_RX_IDLE_US   200u
 #define WIFI_RX_ERR_US    20000u /* back off a little on a read error */
 #define WIFI_DEV_RETRY_S  2u     /* device files appear when rpi4-wifi starts */

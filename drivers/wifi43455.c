@@ -25,6 +25,7 @@
  *                    "joinwpa <ssid> <psk>"  -> associate + WPA2 4-way key,
  *                                               NO DHCP; 20-40 s; reply has
  *                                               "JOINWPA ok|fail ..." + "MAC ..."
+ *                    "leave"                 -> disassociate
  *
  * Consequences for the netif lifecycle:
  *
@@ -34,9 +35,14 @@
  *     leaves all device I/O to a join thread that retries the opens forever.
  *   - The join itself takes 20-40 s and init() runs on the tcpip thread, so the
  *     join must not happen inline either -- same join thread.
- *   - DHCP is this driver's job (the daemon's `joinwpa` deliberately skips it),
- *     exactly as in bcm-genet.c: on the first link-up we kick dhcp_start() from
- *     a tcpip_callback.
+ *   - DHCP is this driver's job (the daemon's `joinwpa` deliberately skips it):
+ *     every link-up starts it and every leave releases the lease, both in the
+ *     tcpip thread via netifapi_netif_common().
+ *   - The join thread never exits. It keeps the association in line with the
+ *     wanted credentials, so a network can be joined, changed or left at run
+ *     time -- `wifi connect` / `wifi disconnect` just edit /etc/wifi.conf.
+ *   - The default route stays with genet, the primary interface, unless genet
+ *     has no address (e.g. SD boot with no cable); then WiFi takes it.
  *
  * Config string (everything after the first ':' of the boot token):
  *
@@ -44,13 +50,14 @@
  *                            so it may itself contain ':')
  *   wifi43455                credentials from /etc/wifi.conf ("ssid=" / "psk="
  *                            key=value lines, '#' comments) so the boot config
- *                            carries no secret.
+ *                            carries no secret. Re-read every WIFI_WATCH_S.
  */
 #include "netif-driver.h"
 
 #include "lwip/dhcp.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/netifapi.h"
 #include "lwip/pbuf.h"
 #include "lwip/snmp.h"
 #include "lwip/tcpip.h"
@@ -100,12 +107,12 @@
 #define WIFI_RX_IDLE_US   200u
 #define WIFI_RX_ERR_US    20000u /* back off a little on a read error */
 #define WIFI_DEV_RETRY_S  2u     /* device files appear when rpi4-wifi starts */
-#define WIFI_JOIN_RETRY_S 10u
-#define WIFI_JOIN_TRIES   3u
-/* /etc/wifi.conf is only consulted once the daemon's device files exist, which
- * proves the filesystem holding both is mounted -- a few tries cover a slow
- * first read, not a pending root takeover. */
-#define WIFI_CONF_TRIES   5u
+#define WIFI_WATCH_S      3u  /* how often /etc/wifi.conf is re-read */
+#define WIFI_JOIN_RETRY_S 10u /* failed join: wait 10 s, 20 s, ... */
+#define WIFI_JOIN_BACKOFF_MAX 6u /* ... capped at 60 s */
+
+#define WIFI_SSID_CAP 33u /* 32 + NUL, per IEEE 802.11 */
+#define WIFI_PSK_CAP  65u /* 64 + NUL, per WPA2-PSK */
 
 
 typedef struct {
@@ -114,18 +121,23 @@ typedef struct {
 	int data_fd; /* /dev/wifidata -- raw frames */
 	int ctl_fd;  /* /dev/wifi     -- text commands */
 
-	char ssid[33]; /* 32 + NUL, per IEEE 802.11 */
-	char psk[65];  /* 64 + NUL, per WPA2-PSK */
+	/* Boot-cfg credentials (empty = use /etc/wifi.conf), and the ones the
+	 * current or last join used. */
+	char cfg_ssid[WIFI_SSID_CAP];
+	char cfg_psk[WIFI_PSK_CAP];
+	char ssid[WIFI_SSID_CAP];
+	char psk[WIFI_PSK_CAP];
 
 	uint8_t mac[6];
 	bool mac_valid;
 	bool joined;
+	bool route_checked; /* default-route decision taken for this lease */
 
 	/* Written by the join thread, read by linkoutput/media/stats on other
-	 * threads. Plain int: a torn read is impossible on this target and the
-	 * only transition is 0 -> 1 (a stale 0 just delays the first TX). */
+	 * threads. Plain int: a torn read is impossible on this target. A stale 0
+	 * delays a TX; a stale 1 lets one frame reach a daemon that is leaving,
+	 * which drops it -- both harmless. */
 	volatile int link_up;
-	int dhcp_started;
 
 	handle_t tx_lock; /* lwIP may call linkoutput from several threads */
 	uint8_t tx_buf[WIFI_TX_MAX];
@@ -245,14 +257,14 @@ static int wifi_parseCfg(wifi_state_t *state, const char *cfg)
 	}
 
 	ssid_len = (size_t)(sep - cfg);
-	if ((ssid_len >= sizeof(state->ssid)) || (strlen(sep + 1) >= sizeof(state->psk))) {
+	if ((ssid_len >= sizeof(state->cfg_ssid)) || (strlen(sep + 1) >= sizeof(state->cfg_psk))) {
 		wifi_printf("bad cfg: ssid or psk too long");
 		return -EINVAL;
 	}
 
-	memcpy(state->ssid, cfg, ssid_len);
-	state->ssid[ssid_len] = '\0';
-	strcpy(state->psk, sep + 1);
+	memcpy(state->cfg_ssid, cfg, ssid_len);
+	state->cfg_ssid[ssid_len] = '\0';
+	strcpy(state->cfg_psk, sep + 1);
 
 	return 0;
 }
@@ -276,14 +288,16 @@ static char *wifi_trim(char *s)
 
 
 /* /etc/wifi.conf: INI-lite "key=value" per line, '#' comments, blanks trimmed.
- * Matches the tolerance of the `wifi up` client's parser. Unknown keys are
- * ignored. Returns 0 if BOTH ssid and psk were found. */
-static int wifi_readConf(wifi_state_t *state)
+ * Unknown keys are ignored. Fills ssid/psk (sized like the state fields) and
+ * returns 0 only if BOTH were found; a missing file is just -ENOENT. */
+static int wifi_readConf(char *ssid, char *psk)
 {
 	FILE *f = fopen(WIFI_CONF, "r");
 	char line[192];
 	char *key, *val, *eq;
 
+	ssid[0] = '\0';
+	psk[0] = '\0';
 	if (f == NULL) {
 		return -ENOENT;
 	}
@@ -300,102 +314,109 @@ static int wifi_readConf(wifi_state_t *state)
 		}
 		val = wifi_trim(eq + 1);
 
-		if ((strcmp(key, "ssid") == 0) && (strlen(val) < sizeof(state->ssid))) {
-			strcpy(state->ssid, val);
+		if ((strcmp(key, "ssid") == 0) && (strlen(val) < WIFI_SSID_CAP)) {
+			strcpy(ssid, val);
 		}
-		else if ((strcmp(key, "psk") == 0) && (strlen(val) < sizeof(state->psk))) {
-			strcpy(state->psk, val);
+		else if ((strcmp(key, "psk") == 0) && (strlen(val) < WIFI_PSK_CAP)) {
+			strcpy(psk, val);
 		}
 	}
 	fclose(f);
 
-	return ((state->ssid[0] != '\0') && (state->psk[0] != '\0')) ? 0 : -ENOENT;
+	return ((ssid[0] != '\0') && (psk[0] != '\0')) ? 0 : -ENOENT;
 }
 
 
-/* --- link up + DHCP ---------------------------------------------- */
+/* --- link up / down ---------------------------------------------- */
 
-static void wifi_dhcpStartCb(void *arg)
+/* Whether an interface can actually carry default-routed traffic: it is up, has
+ * its link, and holds an IPv4 address. */
+static int wifi_canRoute(struct netif *n)
 {
-	struct netif *netif = arg;
-	err_t err;
+	return (n != NULL) && netif_is_up(n) && netif_is_link_up(n) &&
+		!ip4_addr_isany(netif_ip4_addr(n));
+}
 
-	/* Do NOT take the default route away from a link that already has it: on
-	 * this board genet is the primary interface and comes up first. Traffic to
-	 * the WiFi subnet still selects this netif by address, so the only thing
-	 * grabbing the default would change is silently pushing every off-subnet
-	 * packet over WiFi. */
-	if (netif_default == NULL) {
+
+/* Runs in the tcpip thread (via netifapi_netif_common): everything here touches
+ * lwIP core state. Take the default route only from an interface that cannot
+ * use it -- see wifi_joinThread. */
+static void wifi_takeDefaultFn(struct netif *netif)
+{
+	if ((netif_default != netif) && !wifi_canRoute(netif_default) && wifi_canRoute(netif)) {
+		wifi_printf("default route now via WiFi (%s)",
+			(netif_default == NULL) ? "there was none" : "the primary interface has no address");
 		netif_set_default(netif);
 	}
-
-	/* Bring the netif administratively UP. lwIP's dhcp_start() refuses with
-	 * ERR_ARG (-16) unless netif_is_up(), and unlike genet we never got
-	 * NETIF_FLAG_UP for free: netif_dev_init() only applies that default to a
-	 * hardcoded list of driver names ("enet"/"rtl"/"greth"/"genet"), which a
-	 * new name cannot match. Observed on hardware as `dhcp_start: -16` right
-	 * after a successful join. */
-	netif_set_up(netif);
-
-	err = dhcp_start(netif);
-	wifi_printf("dhcp_start: %d (0=ok); netif waits for OFFER", (int)err);
-
-	/* Gratuitous ARP right after dhcp_start is a no-op (the netif IP is still
-	 * 0.0.0.0) and lwIP handles that gracefully; the first useful ARP fires
-	 * from dhcp.c when the lease completes and netif_set_addr runs. */
-	(void)etharp_gratuitous(netif);
 }
 
 
-static void wifi_linkUp(wifi_state_t *state)
+static err_t wifi_linkUpFn(struct netif *netif)
 {
-	struct netif *netif = state->netif;
+	wifi_state_t *state = netif->state;
+	err_t err;
 
 	/* lwIP reads netif->hwaddr when it builds the ARP and DHCP frames, so the
-	 * address must be in place BEFORE the link comes up -- the join thread
-	 * learns it from the daemon and only then calls this. */
+	 * address must be in place BEFORE the link comes up. */
 	memcpy(netif->hwaddr, state->mac, 6);
 	netif->hwaddr_len = 6;
 
+	/* Administratively UP too: dhcp_start() refuses with ERR_ARG (-16) unless
+	 * netif_is_up(), and unlike genet we never get NETIF_FLAG_UP for free --
+	 * netif_dev_init() applies that default only to a hardcoded list of driver
+	 * names. Observed on hardware as `dhcp_start: -16` after a good join. */
+	netif_set_up(netif);
 	netif_set_link_up(netif);
 
-	/* dhcp_start touches lwIP's timer + UDP state, which needs the tcpip-thread
-	 * context under LWIP_TCPIP_CORE_LOCKING: calling it from this thread
-	 * "succeeds" but the DISCOVER never reaches the wire because the DHCP timer
-	 * never starts. Schedule it via tcpip_callback (see bcm-genet.c). */
-	if (state->dhcp_started == 0) {
-		err_t err = tcpip_callback(wifi_dhcpStartCb, netif);
-		wifi_printf("tcpip_callback(dhcp_start): %d", (int)err);
-		state->dhcp_started = 1;
+	/* dhcp_start() after an earlier dhcp_release_and_stop() starts a fresh
+	 * DISCOVER, which is exactly what a rejoin wants. */
+	err = dhcp_start(netif);
+	wifi_printf("dhcp_start: %d (0=ok); waiting for a lease", (int)err);
+
+	return ERR_OK;
+}
+
+
+static void wifi_linkDownFn(struct netif *netif)
+{
+	struct netif *n;
+
+	/* Release the lease while the link can still carry the DHCPRELEASE: the
+	 * join thread clears link_up (which makes linkoutput refuse) only after
+	 * this returns. */
+	dhcp_release_and_stop(netif);
+	netif_set_link_down(netif);
+	netif_set_down(netif);
+
+	/* If WiFi held the default route, hand it back to any interface that can
+	 * still use it; otherwise leave none rather than a dead one. */
+	if (netif_default == netif) {
+		netif_set_default(NULL);
+		NETIF_FOREACH(n)
+		{
+			if ((n != netif) && wifi_canRoute(n)) {
+				netif_set_default(n);
+				break;
+			}
+		}
 	}
 }
 
 
-/* --- join thread -------------------------------------------------- */
+/* --- credentials watch -------------------------------------------- */
 
-/* Resolve credentials: inline cfg wins, else /etc/wifi.conf. Returns 0 once
- * both an ssid and a psk are known. */
-static int wifi_resolveCreds(wifi_state_t *state)
+/* The credentials the netif should be joined with right now: the boot cfg's, if
+ * it named any, else whatever /etc/wifi.conf holds at this moment. Returns 0
+ * when both an ssid and a psk are known. */
+static int wifi_wantedCreds(wifi_state_t *state, char *ssid, char *psk)
 {
-	unsigned try;
-
-	if ((state->ssid[0] != '\0') && (state->psk[0] != '\0')) {
+	if (state->cfg_ssid[0] != '\0') {
+		strcpy(ssid, state->cfg_ssid);
+		strcpy(psk, state->cfg_psk);
 		return 0;
 	}
 
-	for (try = 0; try < WIFI_CONF_TRIES; ++try) {
-		if (wifi_readConf(state) == 0) {
-			return 0;
-		}
-		sleep(WIFI_DEV_RETRY_S);
-	}
-
-	/* Not an error worth failing the netif over: the interface simply stays
-	 * down until someone adds credentials and restarts. Logged once. */
-	wifi_printf("no credentials (boot cfg is empty and %s has no ssid=/psk=); link stays down",
-		WIFI_CONF);
-
-	return -ENOENT;
+	return wifi_readConf(ssid, psk);
 }
 
 
@@ -426,11 +447,98 @@ static int wifi_openDevs(wifi_state_t *state)
 }
 
 
+/* One WPA2 join attempt with the credentials in state->ssid/psk. On success the
+ * link is up and DHCP is running. Returns 0 on success. */
+static int wifi_join(wifi_state_t *state)
+{
+	char cmd[128];
+	int n = snprintf(cmd, sizeof(cmd), "joinwpa %s %s", state->ssid, state->psk);
+
+	if ((n < 0) || (n >= (int)sizeof(cmd))) {
+		wifi_printf("ssid/psk too long for a joinwpa command");
+		return -EINVAL;
+	}
+
+	wifi_printf("joining \"%s\" (WPA2 associate + 4-way key, 20-40s)", state->ssid);
+	if (wifi_command(state, cmd) < 0) {
+		wifi_printf("joinwpa: no reply from %s", WIFI_CTL_DEV);
+		return -EIO;
+	}
+	if (strstr(state->resp, "JOINWPA ok") == NULL) {
+		/* The reply's first line carries setssid=/psksup=/link= detail. */
+		wifi_printf("joinwpa failed: %s", state->resp);
+		return -ECONNREFUSED;
+	}
+
+	/* The MAC is echoed by the joinwpa reply too, in case the `mac` query at
+	 * startup failed; the link must not come up without it. */
+	if (!state->mac_valid && (wifi_parseMac(state->resp, state->mac) == 0)) {
+		state->mac_valid = true;
+	}
+	if (!state->mac_valid) {
+		wifi_printf("joined \"%s\" but the station MAC is unknown; leaving", state->ssid);
+		(void)wifi_command(state, "leave");
+		return -ENODEV;
+	}
+
+	state->joined = true;
+	state->link_up = 1;
+	(void)netifapi_netif_common(state->netif, NULL, wifi_linkUpFn);
+	state->route_checked = false;
+	wifi_printf("joined \"%s\"; link up", state->ssid);
+
+	return 0;
+}
+
+
+/* Tear the association down: release the lease and drop the link first (while
+ * frames can still go out), then tell the daemon to disassociate. */
+static void wifi_leave(wifi_state_t *state)
+{
+	wifi_printf("leaving \"%s\"", state->ssid);
+	(void)netifapi_netif_common(state->netif, wifi_linkDownFn, NULL);
+	state->link_up = 0;
+	state->joined = false;
+	if (wifi_command(state, "leave") < 0) {
+		wifi_printf("leave: no reply from %s", WIFI_CTL_DEV);
+	}
+}
+
+
+/* Sleep up to `secs`, but return early once the wanted credentials stop being
+ * the ones in state->ssid/psk -- so a corrected `wifi connect` during a long
+ * back-off takes effect within WIFI_WATCH_S, not at the next attempt. */
+static void wifi_backoff(wifi_state_t *state, unsigned secs)
+{
+	char ssid[sizeof(state->ssid)];
+	char psk[sizeof(state->psk)];
+	unsigned slept;
+
+	for (slept = 0; slept < secs; slept += WIFI_WATCH_S) {
+		sleep(WIFI_WATCH_S);
+		if ((wifi_wantedCreds(state, ssid, psk) != 0) ||
+			(strcmp(ssid, state->ssid) != 0) || (strcmp(psk, state->psk) != 0)) {
+			return;
+		}
+	}
+}
+
+
+/* --- join thread (supervisor) -------------------------------------- */
+
+/* Keeps the association in line with the wanted credentials for as long as the
+ * netif exists. /etc/wifi.conf is the whole control interface: `wifi connect`
+ * rewrites it and `wifi disconnect` removes it, and this loop notices within
+ * WIFI_WATCH_S. It compares CONTENT, not mtime -- over NFS an mtime goes through
+ * attribute caching, and this bench steps its clock at boot. */
 static void wifi_joinThread(void *arg)
 {
 	wifi_state_t *state = arg;
+	char ssid[sizeof(state->ssid)];
+	char psk[sizeof(state->psk)];
 	bool waiting_logged = false;
-	unsigned try;
+	unsigned fails = 0;
+	int have;
 
 	/* Wait for the daemon indefinitely but cheaply -- there is no sensible
 	 * "give up" point: the operator may start rpi4-wifi at any time. */
@@ -443,17 +551,6 @@ static void wifi_joinThread(void *arg)
 	}
 	wifi_printf("%s + %s open", WIFI_DATA_DEV, WIFI_CTL_DEV);
 
-	/* Credentials are resolved only AFTER the device files appear, never before:
-	 * on netboot lwip starts on a dummyfs "/" and the real root (holding both
-	 * the rpi4-wifi binary and /etc/wifi.conf) is taken over later. The daemon
-	 * being up therefore proves the filesystem carrying the conf is mounted, so
-	 * a bounded retry here is enough. */
-	if (wifi_resolveCreds(state) < 0) {
-		endthread();
-	}
-
-	/* The MAC is also echoed by the joinwpa reply, so a failure here is not
-	 * fatal yet -- but the link must not come up without it (see wifi_linkUp). */
 	if ((wifi_command(state, "mac") == 0) && (wifi_parseMac(state->resp, state->mac) == 0)) {
 		state->mac_valid = true;
 		wifi_printf("MAC %02x:%02x:%02x:%02x:%02x:%02x",
@@ -461,50 +558,55 @@ static void wifi_joinThread(void *arg)
 			state->mac[3], state->mac[4], state->mac[5]);
 	}
 
-	for (try = 1; try <= WIFI_JOIN_TRIES; ++try) {
-		char cmd[128];
-		int n = snprintf(cmd, sizeof(cmd), "joinwpa %s %s", state->ssid, state->psk);
+	/* Credentials are read only once the device files exist, never before: on
+	 * netboot lwip starts on a dummyfs "/" and the real root (holding both the
+	 * rpi4-wifi binary and /etc/wifi.conf) is taken over later. */
+	waiting_logged = false;
+	for (;;) {
+		have = (wifi_wantedCreds(state, ssid, psk) == 0);
 
-		if ((n < 0) || (n >= (int)sizeof(cmd))) {
-			wifi_printf("ssid/psk too long for a joinwpa command");
-			endthread();
-		}
-
-		wifi_printf("joining \"%s\" (WPA2 associate + 4-way key, 20-40s)", state->ssid);
-		if (wifi_command(state, cmd) < 0) {
-			wifi_printf("joinwpa: no reply from %s (attempt %u/%u)",
-				WIFI_CTL_DEV, try, WIFI_JOIN_TRIES);
-		}
-		else if (strstr(state->resp, "JOINWPA ok") != NULL) {
-			state->joined = true;
-			if (!state->mac_valid && (wifi_parseMac(state->resp, state->mac) == 0)) {
-				state->mac_valid = true;
+		if (state->joined) {
+			if (have && (strcmp(ssid, state->ssid) == 0) && (strcmp(psk, state->psk) == 0)) {
+				/* Steady state. A DHCP lease arrives a few seconds after the
+				 * join; once it has, check the default route once. */
+				if (!state->route_checked && !ip4_addr_isany(netif_ip4_addr(state->netif))) {
+					(void)netifapi_netif_common(state->netif, wifi_takeDefaultFn, NULL);
+					state->route_checked = true;
+				}
+				sleep(WIFI_WATCH_S);
+				continue;
 			}
-			if (!state->mac_valid) {
-				wifi_printf("joined \"%s\" but the station MAC is unknown; link stays down",
-					state->ssid);
-				endthread();
-			}
-			wifi_printf("joined \"%s\"; bringing link up", state->ssid);
-			state->link_up = 1;
-			wifi_linkUp(state);
-			endthread();
-		}
-		else {
-			/* The reply's first line carries setssid=/psksup=/link= detail. */
-			wifi_printf("joinwpa failed (attempt %u/%u): %s", try, WIFI_JOIN_TRIES, state->resp);
+			wifi_leave(state);
+			fails = 0;
 		}
 
-		if (try < WIFI_JOIN_TRIES) {
-			sleep(WIFI_JOIN_RETRY_S);
+		if (!have) {
+			if (!waiting_logged) {
+				wifi_printf("no credentials (boot cfg empty, no ssid=/psk= in %s); "
+					"waiting -- run `wifi connect <ssid> <psk>`", WIFI_CONF);
+				waiting_logged = true;
+			}
+			sleep(WIFI_WATCH_S);
+			continue;
 		}
+		waiting_logged = false;
+
+		strcpy(state->ssid, ssid);
+		strcpy(state->psk, psk);
+		if (wifi_join(state) == 0) {
+			fails = 0;
+			continue;
+		}
+
+		/* Keep trying for as long as these credentials are wanted -- the AP may
+		 * simply be out of range -- but back off, so a wrong key does not keep
+		 * the daemon's single thread (and with it every RX read) busy for 30 s
+		 * of every 40. */
+		if (fails < WIFI_JOIN_BACKOFF_MAX) {
+			fails++;
+		}
+		wifi_backoff(state, WIFI_JOIN_RETRY_S * fails);
 	}
-
-	/* Give up quietly: the netif stays registered with the link down, so a
-	 * later `wifi netup` from the shell still works over the daemon. */
-	wifi_printf("giving up on \"%s\" after %u attempts; link stays down",
-		state->ssid, WIFI_JOIN_TRIES);
-	endthread();
 }
 
 
@@ -648,7 +750,7 @@ static int wifi_netifInit(struct netif *netif, char *cfg)
 	int err;
 
 	/* create_netif() malloc()s the state, so it arrives dirty; every flag here
-	 * (link_up, dhcp_started, mac_valid, the counters) must start at zero. */
+	 * (link_up, joined, mac_valid, the counters) must start at zero. */
 	memset(state, 0, sizeof(*state));
 	state->netif = netif;
 	state->data_fd = -1;

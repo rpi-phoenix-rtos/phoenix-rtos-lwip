@@ -26,6 +26,8 @@
  *                                               NO DHCP; 20-40 s; reply has
  *                                               "JOINWPA ok|fail ..." + "MAC ..."
  *                    "leave"                 -> disassociate
+ *                    "status"                -> "STATUS joined=0|1 ..." (joined=0
+ *                                               also after a lost association)
  *
  * Consequences for the netif lifecycle:
  *
@@ -574,6 +576,15 @@ static void wifi_joinThread(void *arg)
 					state->route_checked = true;
 				}
 				sleep(WIFI_WATCH_S);
+
+				/* The daemon notices a deauth, a disassoc or the link dropping
+				 * (the AP went away) and reports joined=0; rejoin then, rather
+				 * than keep a lease on a link that no longer carries frames. */
+				if ((wifi_command(state, "status") == 0) && (strstr(state->resp, "joined=0") != NULL)) {
+					wifi_printf("association with \"%s\" lost; rejoining", state->ssid);
+					wifi_leave(state);
+					fails = 0;
+				}
 				continue;
 			}
 			wifi_leave(state);

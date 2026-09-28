@@ -23,6 +23,22 @@
 #define WAITTID_THREAD_PRIO 3
 #endif
 
+/*
+ * The collector frees each exited thread's stack and descriptor, so its deepest
+ * path runs through free(): chunk coalescing and a malloc bin-tree removal.
+ * On aarch64 that path alone needs 512 bytes. The stack is a static array, and
+ * overflowing it writes silently into the variables the linker placed below it
+ * (rt_table, whose corrupted head then crashed _route_find()). Other targets
+ * keep their previous size; override if a target's malloc frames are larger.
+ */
+#ifndef WAITTID_THREAD_STACKSZ
+#ifdef __aarch64__
+#define WAITTID_THREAD_STACKSZ 4096
+#else
+#define WAITTID_THREAD_STACKSZ 512
+#endif
+#endif
+
 
 typedef struct {
 	rbnode_t linkage;
@@ -36,7 +52,7 @@ typedef struct {
 
 
 static struct {
-	char collector_stack[512] __attribute__((aligned(8)));
+	char collector_stack[WAITTID_THREAD_STACKSZ] __attribute__((aligned(16)));
 	rbtree_t threads;
 	handle_t lock;
 	handle_t join_cond;

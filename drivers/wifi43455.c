@@ -31,10 +31,11 @@
  *
  * Consequences for the netif lifecycle:
  *
- *   - The daemon is started from the shell, i.e. AFTER lwIP is already running,
- *     so at init() time both device files are normally still absent. init()
- *     must not fail on that: it brings the netif up with the link DOWN and
- *     leaves all device I/O to a join thread that retries the opens forever.
+ *   - The daemon starts at boot, but registers the device files only after
+ *     its firmware download, i.e. AFTER lwIP is already running, so at init()
+ *     time both are normally still absent. init() must not fail on that: it
+ *     brings the netif up with the link DOWN and leaves all device I/O to a
+ *     join thread that retries the opens forever.
  *   - The join itself takes 20-40 s and init() runs on the tcpip thread, so the
  *     join must not happen inline either -- same join thread.
  *   - DHCP is this driver's job (the daemon's `joinwpa` deliberately skips it):
@@ -109,6 +110,7 @@
 #define WIFI_RX_IDLE_US   200u
 #define WIFI_RX_ERR_US    20000u /* back off a little on a read error */
 #define WIFI_DEV_RETRY_S  2u     /* device files appear when rpi4-wifi starts */
+#define WIFI_RX_NOLINK_US 100000u /* not associated: nothing to receive */
 #define WIFI_WATCH_S      3u  /* how often /etc/wifi.conf is re-read */
 #define WIFI_JOIN_RETRY_S 10u /* failed join: wait 10 s, 20 s, ... */
 #define WIFI_JOIN_BACKOFF_MAX 6u /* ... capped at 60 s */
@@ -422,8 +424,9 @@ static int wifi_wantedCreds(wifi_state_t *state, char *ssid, char *psk)
 }
 
 
-/* Open both device files. The rpi4-wifi daemon is started from the shell, so
- * this normally fails for the first few seconds (or minutes) of uptime. */
+/* Open both device files. The rpi4-wifi daemon starts at boot but registers
+ * them only once the chip runs its firmware, so this normally fails for the
+ * first few seconds of uptime. */
 static int wifi_openDevs(wifi_state_t *state)
 {
 	int data_fd, ctl_fd;
@@ -543,10 +546,11 @@ static void wifi_joinThread(void *arg)
 	int have;
 
 	/* Wait for the daemon indefinitely but cheaply -- there is no sensible
-	 * "give up" point: the operator may start rpi4-wifi at any time. */
+	 * "give up" point: it starts at boot but loads its firmware first, and it
+	 * can also be (re)started from the shell at any time. */
 	while (wifi_openDevs(state) < 0) {
 		if (!waiting_logged) {
-			wifi_printf("waiting for %s (start the rpi4-wifi daemon)", WIFI_DATA_DEV);
+			wifi_printf("waiting for %s (the rpi4-wifi daemon)", WIFI_DATA_DEV);
 			waiting_logged = true;
 		}
 		sleep(WIFI_DEV_RETRY_S);
@@ -562,7 +566,7 @@ static void wifi_joinThread(void *arg)
 
 	/* Credentials are read only once the device files exist, never before: on
 	 * netboot lwip starts on a dummyfs "/" and the real root (holding both the
-	 * rpi4-wifi binary and /etc/wifi.conf) is taken over later. */
+	 * firmware the daemon loads and /etc/wifi.conf) is taken over later. */
 	waiting_logged = false;
 	for (;;) {
 		have = (wifi_wantedCreds(state, ssid, psk) == 0);
@@ -671,6 +675,14 @@ static void wifi_rxThread(void *arg)
 		 * it, which must not stall TX or the join. */
 		if (state->data_fd < 0) {
 			sleep(WIFI_DEV_RETRY_S);
+			continue;
+		}
+		/* Not associated: no data frame can arrive, and every empty read is a
+		 * round trip to the daemon plus an SDIO probe -- ~4000 a second from a
+		 * radio that is up but joined to nothing, which is every boot without
+		 * /etc/wifi.conf now that the daemon starts at boot. */
+		if (state->link_up == 0) {
+			usleep(WIFI_RX_NOLINK_US);
 			continue;
 		}
 

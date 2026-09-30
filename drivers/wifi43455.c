@@ -92,24 +92,41 @@
 
 #define WIFI_RESP_MAX 512u /* text reply from /dev/wifi ("mac"/"joinwpa" are short) */
 
-/* /dev/wifidata never blocks, so an idle RX thread polls. 1.5 ms costs ~660
- * wakeups/s at idle and adds at most that much latency to a frame; the radio
- * ceiling over SDIO is a few MB/s, far below what a tighter poll would buy. */
-/* Idle RX pause. The daemon now WAITS for a frame inside read() (bounded), so
- * an empty return already means it waited, and this is only a safety valve
- * against a read that fails fast -- not the pacing mechanism it used to be.
+/* RX pacing. /dev/wifidata never blocks and the daemon has no interrupt to wait
+ * on (see the rpi4-wifi notes on CARD_INTR), so this thread polls: every read()
+ * is one IPC round trip plus one SDIO probe of the chip's F2 FIFO (~22 us of
+ * bus time in the daemon). A fixed 200 us poll -- ~5000 probes a second -- is
+ * what the link needs while frames flow, but on an idle joined link it cost a
+ * CPU-bound game (vkQuake) ~10 % of its frame rate. So the interval adapts:
  *
- * History, measured on hardware: 1500 us gave 0.58 MB/s (402 frames/s =
- * 2.49 ms/frame, i.e. the poll interval plus processing) and 200 us gave up to
- * 1.73. Treat that as directional, not exact -- repeat runs of identical code
- * later spanned 0.66-1.73 MB/s, so a single throughput run on this link cannot
- * settle a comparison. The reliable measurement is per-frame cost inside the
- * daemon: 178 us to receive a frame, 121 us to transmit one, but 1.1 MILLION
- * empty probes burning 24.9 s of bus time. Polling is the bottleneck, not the
- * radio or the SDIO. */
-#define WIFI_RX_IDLE_US   200u
-#define WIFI_RX_ERR_US    20000u /* back off a little on a read error */
-#define WIFI_DEV_RETRY_S  2u     /* device files appear when rpi4-wifi starts */
+ *   - after a received frame, poll every WIFI_RX_FAST_US for WIFI_RX_HOLD_RX
+ *     more empty reads (a burst, or the rest of an aggregated superframe, is
+ *     likely right behind it);
+ *   - after a TRANSMITTED frame, stay fast for WIFI_RX_HOLD_TX empty reads
+ *     (~20 ms): whatever we sent -- a TCP segment, an ACK, a ping, a DHCP or
+ *     ARP request -- usually draws a reply, and the measured round trip to the
+ *     AP is 2-6 ms. The transmit path also wakes a sleeping RX thread (see
+ *     wifi_rxKick), so a reply never waits out an idle interval;
+ *   - past the hold, the interval doubles on every empty read up to
+ *     WIFI_RX_IDLE_MAX_US.
+ *
+ * Any flow in either direction therefore polls exactly as fast as before (both
+ * TCP directions transmit: data one way, ACKs the other), and an idle link
+ * settles at 100 probes a second instead of ~5000. The price is latency for an
+ * UNSOLICITED frame arriving at an idle link -- at most WIFI_RX_IDLE_MAX_US
+ * (5 ms on average), once, since that frame restores the fast rate.
+ *
+ * Throughput history, measured on hardware: 1500 us fixed gave 0.58 MB/s and
+ * 200 us up to 1.73 (before later SDIO work raised it to TX 3.6 / RX 3.3). Treat
+ * single runs as directional -- repeat runs of identical code spanned
+ * 0.66-1.73 MB/s -- which is why the fast rate is kept exactly as it was. */
+#define WIFI_RX_FAST_US     200u   /* poll interval while frames flow */
+#define WIFI_RX_IDLE_MAX_US 10000u /* poll interval on an idle link */
+#define WIFI_RX_HOLD_RX     8u     /* empty reads at the fast rate after an RX frame (~1.6 ms) */
+#define WIFI_RX_HOLD_TX     100u   /* ... and after a TX frame (~20 ms) */
+
+#define WIFI_RX_ERR_US    20000u  /* back off a little on a read error */
+#define WIFI_DEV_RETRY_S  2u      /* device files appear when rpi4-wifi starts */
 #define WIFI_RX_NOLINK_US 100000u /* not associated: nothing to receive */
 #define WIFI_WATCH_S      3u  /* how often /etc/wifi.conf is re-read */
 #define WIFI_JOIN_RETRY_S 10u /* failed join: wait 10 s, 20 s, ... */
@@ -144,6 +161,16 @@ typedef struct {
 	volatile int link_up;
 
 	handle_t tx_lock; /* lwIP may call linkoutput from several threads */
+
+	/* TX -> RX wakeup (wifi_rxKick). tx_kicks counts transmitted frames;
+	 * rx_napping is set while the RX thread sleeps on rx_cond through an idle
+	 * interval. Both are accessed with __atomic builtins: the pair is a
+	 * store-then-load handshake on each side, which needs full ordering. */
+	handle_t rx_lock;
+	handle_t rx_cond;
+	unsigned int tx_kicks;
+	int rx_napping;
+
 	uint8_t tx_buf[WIFI_TX_MAX];
 	uint8_t rx_buf[WIFI_RX_BUF];
 	char resp[WIFI_RESP_MAX];
@@ -663,9 +690,44 @@ static void wifi_deliverRx(wifi_state_t *state, size_t len)
 }
 
 
+/* Called after every transmitted frame: count it, and wake the RX thread if it
+ * is sleeping through an idle interval, so the reply is picked up at the fast
+ * rate. Only the (rare) wakeup takes a lock; the common case is two atomics. */
+static void wifi_rxKick(wifi_state_t *state)
+{
+	(void)__atomic_fetch_add(&state->tx_kicks, 1u, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&state->rx_napping, __ATOMIC_SEQ_CST) != 0) {
+		mutexLock(state->rx_lock);
+		(void)condSignal(state->rx_cond);
+		mutexUnlock(state->rx_lock);
+	}
+}
+
+
+/* Sleep up to `us`, or until wifi_rxKick() reports a frame transmitted after
+ * the one counted in `seen`. No kick can be lost: one that lands before
+ * rx_napping is raised is caught by the re-check below, and one that lands
+ * after it sees the flag and signals -- which it can only do once condWait()
+ * has released rx_lock, i.e. once this thread is actually waiting. */
+static void wifi_rxNap(wifi_state_t *state, unsigned int seen, unsigned int us)
+{
+	mutexLock(state->rx_lock);
+	__atomic_store_n(&state->rx_napping, 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&state->tx_kicks, __ATOMIC_SEQ_CST) == seen) {
+		(void)condWait(state->rx_cond, state->rx_lock, (time_t)us);
+	}
+	__atomic_store_n(&state->rx_napping, 0, __ATOMIC_SEQ_CST);
+	mutexUnlock(state->rx_lock);
+}
+
+
 static void wifi_rxThread(void *arg)
 {
 	wifi_state_t *state = arg;
+	unsigned int seen = 0u;                  /* tx_kicks value last acted on */
+	unsigned int hold = 0u;                  /* empty reads left at the fast rate */
+	unsigned int interval = WIFI_RX_FAST_US; /* current idle interval */
+	unsigned int kicks;
 	ssize_t n;
 
 	for (;;) {
@@ -686,12 +748,34 @@ static void wifi_rxThread(void *arg)
 			continue;
 		}
 
+		/* Something went out since the last look: its reply is on the way. */
+		kicks = __atomic_load_n(&state->tx_kicks, __ATOMIC_SEQ_CST);
+		if (kicks != seen) {
+			seen = kicks;
+			hold = WIFI_RX_HOLD_TX;
+			interval = WIFI_RX_FAST_US;
+		}
+
 		n = read(state->data_fd, state->rx_buf, sizeof(state->rx_buf));
 		if (n > 0) {
+			/* Read again at once: more may be queued behind this frame. */
 			wifi_deliverRx(state, (size_t)n);
+			if (hold < WIFI_RX_HOLD_RX) {
+				hold = WIFI_RX_HOLD_RX;
+			}
+			interval = WIFI_RX_FAST_US;
 		}
 		else if (n == 0) {
-			usleep(WIFI_RX_IDLE_US); /* nothing queued -- read() never blocks */
+			/* Nothing queued (read() never blocks): stay fast while a reply
+			 * or a burst is expected, then back off towards the idle rate. */
+			if (hold > 0u) {
+				hold--;
+				usleep(WIFI_RX_FAST_US);
+			}
+			else {
+				interval = (interval >= (WIFI_RX_IDLE_MAX_US / 2u)) ? WIFI_RX_IDLE_MAX_US : (interval * 2u);
+				wifi_rxNap(state, seen, interval);
+			}
 		}
 		else {
 			if (errno == EMSGSIZE) {
@@ -738,6 +822,8 @@ static err_t wifi_linkOutput(struct netif *netif, struct pbuf *p)
 	state->tx_ok++;
 
 	mutexUnlock(state->tx_lock);
+
+	wifi_rxKick(state);
 
 	return ERR_OK;
 }
@@ -798,8 +884,9 @@ static int wifi_netifInit(struct netif *netif, char *cfg)
 
 	netif->linkoutput = wifi_linkOutput;
 
-	if (mutexCreate(&state->tx_lock) != 0) {
-		wifi_printf("tx_lock mutexCreate failed");
+	if ((mutexCreate(&state->tx_lock) != 0) || (mutexCreate(&state->rx_lock) != 0) ||
+		(condCreate(&state->rx_cond) != 0)) {
+		wifi_printf("lock/cond creation failed");
 		return -ENOMEM;
 	}
 

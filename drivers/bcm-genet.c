@@ -20,10 +20,12 @@
  *     corrupted under back-to-back RX — see the pool comment below),
  *     INTRL2_0_RX_DMA_DONE wakes a service thread that drains BDs into
  *     lwip-owned pbufs and hands them to tcpip_input
- *   - Link state: 1 Hz polling thread (the BCM54213PE PHY's INT_B pin
- *     is not routed to a GIC SPI on the Pi 4 board, so MDIO polling is
- *     the only portable option here — TODO(TD-Eth-LinkIRQ) revisit if
- *     a future board variant exposes the line)
+ *   - Link state: 1 Hz MDIO polling thread, by design. The BCM54213PE
+ *     PHY's INT_B pin is not routed to a GIC SPI on the Pi 4 board, and
+ *     GENET's own INTRL2_0_LINK_UP/LINK_DOWN sources are left masked;
+ *     Linux and U-Boot both poll here too. Link changes are rare, so a
+ *     1 s latency is acceptable. Revisit only for a board variant that
+ *     routes INT_B to the GIC.
  *
  * Caveats still in place:
  *   - MAC source is the VideoCore mailbox property tag 0x10003

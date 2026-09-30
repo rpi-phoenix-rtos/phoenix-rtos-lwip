@@ -29,6 +29,9 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/sockport.h>
+
+/* The system's AF_INET6 (<sys/socket.h>), which lwip/sockets.h redefines to AF_UNSPEC without IPv6 */
+#define PHX_AF_INET6 10
 #include <sys/sockios.h>
 #include <net/if.h>
 #include <net/route.h>
@@ -1202,8 +1205,10 @@ static void socketsrv_thread(void *arg)
 #if !LWIP_IPV6
 				/* Without IPv6, lwip_socket() ignores the domain and returns an
 				 * IPv4 socket, on which the caller's first sockaddr_in6 fails
-				 * with EIO. Refuse it here so it can fall back to AF_INET. */
-				if (smi->socket.domain == AF_INET6) {
+				 * with EIO. Refuse it here so it can fall back to AF_INET.
+				 * The domain is the system's value (<sys/socket.h>, 10): lwip's own
+				 * AF_INET6 is AF_UNSPEC (0) when it is built without IPv6. */
+				if (smi->socket.domain == PHX_AF_INET6) {
 					msg.o.err = -EAFNOSUPPORT;
 					break;
 				}

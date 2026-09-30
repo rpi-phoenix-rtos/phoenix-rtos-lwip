@@ -1199,6 +1199,15 @@ static void socketsrv_thread(void *arg)
 #endif /* LWIP_IPSEC */
 					break;
 				}
+#if !LWIP_IPV6
+				/* Without IPv6, lwip_socket() ignores the domain and returns an
+				 * IPv4 socket, on which the caller's first sockaddr_in6 fails
+				 * with EIO. Refuse it here so it can fall back to AF_INET. */
+				if (smi->socket.domain == AF_INET6) {
+					msg.o.err = -EAFNOSUPPORT;
+					break;
+				}
+#endif
 				if ((sock = lwip_socket(smi->socket.domain, type, smi->socket.protocol)) < 0)
 					msg.o.err = -errno;
 				else {

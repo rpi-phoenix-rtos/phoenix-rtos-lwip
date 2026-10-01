@@ -78,6 +78,7 @@
 
 #define WIFI_DATA_DEV "/dev/wifidata"
 #define WIFI_CTL_DEV  "/dev/wifi"
+#define WIFI_IRQ_DEV  "/dev/wifiirq"
 #define WIFI_CONF     "/etc/wifi.conf"
 
 /* TX bounds are the daemon's accepted write() range (frame >= Ethernet header,
@@ -92,10 +93,21 @@
 
 #define WIFI_RESP_MAX 512u /* text reply from /dev/wifi ("mac"/"joinwpa" are short) */
 
-/* RX pacing. /dev/wifidata never blocks and the daemon has no interrupt to wait
- * on (see the rpi4-wifi notes on CARD_INTR), so this thread polls: every read()
- * is one IPC round trip plus one SDIO probe of the chip's F2 FIFO (~22 us of
- * bus time in the daemon). A fixed 200 us poll -- ~5000 probes a second -- is
+/* RX: interrupt first. When the daemon serves /dev/wifiirq, this thread drains
+ * /dev/wifidata until it reads empty and then sleeps in a /dev/wifiirq read,
+ * which returns when the chip raises its frame interrupt, or after the daemon's
+ * fallback timeout (10 ms, the idle poll below) if none comes. The thread leaves
+ * that mode for polling, for the rest of the boot, if the device is absent or
+ * fails (`wifi rxpoll`), or if the interrupt evidently does not work:
+ *
+ *   - WIFI_IRQ_EMPTY_RUN wakeups in a row found nothing to read: the line is
+ *     stuck (the ack does not clear it). Without the check that would spin.
+ *   - at least WIFI_IRQ_MISSED_MIN frames, and more than there were
+ *     wakeups, were found only by the read after a timeout: it does not fire.
+ *
+ * RX pacing when polling. /dev/wifidata never blocks, so without the interrupt
+ * this thread polls: every read() is one IPC round trip plus one SDIO probe of
+ * the chip's F2 FIFO (~22 us of bus time in the daemon). A fixed 200 us poll -- ~5000 probes a second -- is
  * what the link needs while frames flow, but on an idle joined link it cost a
  * CPU-bound game (vkQuake) ~10 % of its frame rate. So the interval adapts:
  *
@@ -125,6 +137,9 @@
 #define WIFI_RX_HOLD_RX     8u     /* empty reads at the fast rate after an RX frame (~1.6 ms) */
 #define WIFI_RX_HOLD_TX     100u   /* ... and after a TX frame (~20 ms) */
 
+#define WIFI_IRQ_EMPTY_RUN 64u  /* interrupt mode: empty wakeups in a row = stuck line */
+#define WIFI_IRQ_MISSED_MIN 32u /* ... frames found only after a timeout = no interrupt */
+
 #define WIFI_RX_ERR_US    20000u  /* back off a little on a read error */
 #define WIFI_DEV_RETRY_S  2u      /* device files appear when rpi4-wifi starts */
 #define WIFI_RX_NOLINK_US 100000u /* not associated: nothing to receive */
@@ -141,6 +156,7 @@ typedef struct {
 
 	int data_fd; /* /dev/wifidata -- raw frames */
 	int ctl_fd;  /* /dev/wifi     -- text commands */
+	int irq_fd;  /* /dev/wifiirq  -- frame interrupts; -1 = poll. RX thread only, once set */
 
 	/* Boot-cfg credentials (empty = use /etc/wifi.conf), and the ones the
 	 * current or last join used. */
@@ -180,6 +196,13 @@ typedef struct {
 	unsigned long rx_toobig;
 	unsigned long tx_ok;
 	unsigned long tx_err;
+
+	/* Interrupt-mode RX (RX thread only). */
+	unsigned long irq_wakes;    /* /dev/wifiirq reads that returned an interrupt */
+	unsigned long irq_timeouts; /* ... that timed out */
+	unsigned long irq_empty;    /* interrupts after which the FIFO read empty */
+	unsigned long irq_missed;   /* frames found only by the read after a timeout */
+	unsigned int irq_empty_run;
 
 	/* 16 KB: the RX thread runs netif->input() -> tcpip mailbox post; sized
 	 * like genet's drain thread (these stacks have no guard page). */
@@ -469,11 +492,16 @@ static int wifi_openDevs(wifi_state_t *state)
 		return -ENOENT;
 	}
 
+	/* Optional: an older daemon, or one started with `pollrx`, has none, and the
+	 * RX thread polls. The daemon creates it before /dev/wifidata, so it is
+	 * there by the time the open above succeeds. */
+	state->irq_fd = open(WIFI_IRQ_DEV, O_RDONLY);
+
 	/* Publish data_fd only once BOTH opens succeeded: the RX thread polls that
 	 * field, and a half-open state would have it read from a descriptor this
-	 * thread is about to close. */
+	 * thread is about to close. irq_fd is set before it, for the same reason. */
 	state->ctl_fd = ctl_fd;
-	state->data_fd = data_fd;
+	__atomic_store_n(&state->data_fd, data_fd, __ATOMIC_RELEASE);
 
 	return 0;
 }
@@ -582,7 +610,8 @@ static void wifi_joinThread(void *arg)
 		}
 		sleep(WIFI_DEV_RETRY_S);
 	}
-	wifi_printf("%s + %s open", WIFI_DATA_DEV, WIFI_CTL_DEV);
+	wifi_printf("%s + %s open; RX mode: %s", WIFI_DATA_DEV, WIFI_CTL_DEV,
+		(state->irq_fd >= 0) ? "irq (" WIFI_IRQ_DEV ")" : "poll (no " WIFI_IRQ_DEV ")");
 
 	if ((wifi_command(state, "mac") == 0) && (wifi_parseMac(state->resp, state->mac) == 0)) {
 		state->mac_valid = true;
@@ -721,12 +750,85 @@ static void wifi_rxNap(wifi_state_t *state, unsigned int seen, unsigned int us)
 }
 
 
+/* What led to an interrupt-mode data read. */
+#define WIFI_WAKE_FRAME   0 /* the previous read returned a frame: drain on */
+#define WIFI_WAKE_IRQ     1 /* /dev/wifiirq returned an interrupt */
+#define WIFI_WAKE_TIMEOUT 2 /* /dev/wifiirq timed out: a fallback poll */
+
+
+/* Leave interrupt mode for polling, for the rest of this boot. */
+static void wifi_rxIrqOff(wifi_state_t *state, const char *why)
+{
+	wifi_printf("RX mode: poll (%s; irq wakes=%lu timeouts=%lu empty=%lu missed=%lu)", why,
+		state->irq_wakes, state->irq_timeouts, state->irq_empty, state->irq_missed);
+	close(state->irq_fd);
+	state->irq_fd = -1;
+}
+
+
+/* One interrupt-mode step: a data read, and after an empty one, the wait for
+ * the next interrupt. Returns what leads to the next read. */
+static int wifi_rxIrqStep(wifi_state_t *state, int wake)
+{
+	ssize_t n;
+	char c;
+
+	n = read(state->data_fd, state->rx_buf, sizeof(state->rx_buf));
+	if (n > 0) {
+		if (wake == WIFI_WAKE_TIMEOUT) {
+			state->irq_missed++; /* queued, but no interrupt said so */
+		}
+		state->irq_empty_run = 0u;
+		wifi_deliverRx(state, (size_t)n);
+		return WIFI_WAKE_FRAME;
+	}
+	if (n < 0) {
+		if (errno == EMSGSIZE) {
+			state->rx_toobig++;
+		}
+		else {
+			state->rx_err++;
+		}
+		usleep(WIFI_RX_ERR_US);
+		return WIFI_WAKE_FRAME;
+	}
+
+	/* Empty: the daemon reads past non-data frames while this path is on, so
+	 * the FIFO really is drained, and the chip will interrupt for the next. */
+	if (wake == WIFI_WAKE_IRQ) {
+		state->irq_empty++;
+		state->irq_empty_run++;
+		if (state->irq_empty_run >= WIFI_IRQ_EMPTY_RUN) {
+			wifi_rxIrqOff(state, "interrupt keeps firing with nothing queued");
+			return WIFI_WAKE_FRAME;
+		}
+	}
+	if ((state->irq_missed >= WIFI_IRQ_MISSED_MIN) && (state->irq_missed > state->irq_wakes)) {
+		wifi_rxIrqOff(state, "frames arrive without an interrupt");
+		return WIFI_WAKE_FRAME;
+	}
+
+	n = read(state->irq_fd, &c, 1);
+	if (n == 1) {
+		state->irq_wakes++;
+		return WIFI_WAKE_IRQ;
+	}
+	if (n == 0) {
+		state->irq_timeouts++;
+		return WIFI_WAKE_TIMEOUT;
+	}
+	wifi_rxIrqOff(state, "the daemon switched the interrupt off");
+	return WIFI_WAKE_FRAME;
+}
+
+
 static void wifi_rxThread(void *arg)
 {
 	wifi_state_t *state = arg;
 	unsigned int seen = 0u;                  /* tx_kicks value last acted on */
 	unsigned int hold = 0u;                  /* empty reads left at the fast rate */
 	unsigned int interval = WIFI_RX_FAST_US; /* current idle interval */
+	int wake = WIFI_WAKE_FRAME;              /* interrupt mode: why the next read happens */
 	unsigned int kicks;
 	ssize_t n;
 
@@ -735,7 +837,7 @@ static void wifi_rxThread(void *arg)
 		 * poll. No lock is held across read(): during the 20-40 s join the
 		 * daemon's single message thread is busy and this read queues behind
 		 * it, which must not stall TX or the join. */
-		if (state->data_fd < 0) {
+		if (__atomic_load_n(&state->data_fd, __ATOMIC_ACQUIRE) < 0) {
 			sleep(WIFI_DEV_RETRY_S);
 			continue;
 		}
@@ -745,6 +847,11 @@ static void wifi_rxThread(void *arg)
 		 * /etc/wifi.conf now that the daemon starts at boot. */
 		if (state->link_up == 0) {
 			usleep(WIFI_RX_NOLINK_US);
+			continue;
+		}
+
+		if (state->irq_fd >= 0) {
+			wake = wifi_rxIrqStep(state, wake);
 			continue;
 		}
 
@@ -843,9 +950,12 @@ static int wifi_stats(struct netif *netif, char *buf, size_t cap)
 	int r;
 
 	r = snprintf(buf, cap,
-		"rx=%lu rx_err=%lu rx_toobig=%lu tx=%lu tx_err=%lu link=%d ssid=\"%s\"",
+		"rx=%lu rx_err=%lu rx_toobig=%lu tx=%lu tx_err=%lu link=%d ssid=\"%s\" "
+		"rxmode=%s irq_wakes=%lu irq_timeouts=%lu irq_empty=%lu irq_missed=%lu",
 		state->rx_ok, state->rx_err, state->rx_toobig,
-		state->tx_ok, state->tx_err, state->link_up, state->ssid);
+		state->tx_ok, state->tx_err, state->link_up, state->ssid,
+		(state->irq_fd >= 0) ? "irq" : "poll", state->irq_wakes, state->irq_timeouts,
+		state->irq_empty, state->irq_missed);
 
 	return ((r > 0) && ((size_t)r < cap)) ? r : 0;
 }
@@ -864,6 +974,7 @@ static int wifi_netifInit(struct netif *netif, char *cfg)
 	state->netif = netif;
 	state->data_fd = -1;
 	state->ctl_fd = -1;
+	state->irq_fd = -1;
 
 	err = wifi_parseCfg(state, cfg);
 	if (err < 0) {

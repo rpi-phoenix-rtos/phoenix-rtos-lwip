@@ -13,30 +13,62 @@
 
 
 #include <sys/threads.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <time.h>
 
 
+/*
+ * Mutexes, semaphores and mailboxes are built on libphoenix's pthread mutexes
+ * and condition variables. These are user-space locks (futex based): taking a
+ * free one, releasing one nobody waits for and signalling a condition nobody
+ * waits on cost one atomic operation each, and the kernel is entered only to
+ * sleep or to wake a sleeper. The kernel-handle mutexes used before cost a
+ * system call per lock and per unlock, contended or not -- on the NFS-root
+ * receive path that was most of the network stack's kernel time.
+ *
+ * Every wait object signals while holding its lock and touches nothing of the
+ * object after the unlock, so the woken thread may free it as soon as it runs
+ * (lwIP does that with a netconn's op_completed semaphore).
+ */
 struct sys_mbox_s
 {
-	handle_t lock, push_cond, pop_cond;
+	pthread_mutex_t lock;
+	pthread_cond_t push_cond, pop_cond;
 	size_t sz, head, tail;
 	void **ring;
 };
 
 
+struct sys_sem_s
+{
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	unsigned int count;
+	int valid;
+};
+
+
+struct sys_mutex_s
+{
+	pthread_mutex_t mutex;
+	int valid;
+};
+
+
 typedef handle_t sys_thread_t;
-typedef handle_t sys_mutex_t;
-typedef semaphore_t sys_sem_t;
+typedef struct sys_mutex_s sys_mutex_t;
+typedef struct sys_sem_s sys_sem_t;
 typedef struct sys_mbox_s sys_mbox_t;
 
 
-#define sys_mutex_valid(m) (*(m) != 0)
-#define sys_mutex_set_invalid(m) do *(m) = 0; while (0)
+/* A zeroed object is invalid: lwIP tests objects it has never created */
+#define sys_mutex_valid(m) ((m)->valid != 0)
+#define sys_mutex_set_invalid(m) do (m)->valid = 0; while (0)
 
 
-#define sys_sem_valid(m) ((m)->cond != 0)
-#define sys_sem_set_invalid(m) do (m)->cond = 0; while (0)
+#define sys_sem_valid(m) ((m)->valid != 0)
+#define sys_sem_set_invalid(m) do (m)->valid = 0; while (0)
 
 
 #define sys_mbox_valid(m) ((m)->ring != NULL)
@@ -56,10 +88,10 @@ typedef struct sys_mbox_s sys_mbox_t;
  *
  * Dequeue and this append serialize on the same mbox lock, so there is no
  * producer/consumer race and no lost wakeup (coalesce only runs when non-empty,
- * and sys_arch_mbox_fetch only condWaits when empty). */
+ * and sys_arch_mbox_fetch only waits when empty). */
 typedef int (*sys_mbox_merge_fn)(void *tail_entry, void *new_msg);
 
-#define SYS_MBOX_POSTED    0    /* posted as a new entry (waiter signalled iff was empty) */
+#define SYS_MBOX_POSTED    0    /* posted as a new entry (a waiter is signalled) */
 #define SYS_MBOX_COALESCED 1    /* merged onto the queued tail entry; no new slot, no signal */
 #define SYS_MBOX_FULL      (-1) /* mbox full and tail unmergeable; nothing posted */
 
@@ -69,6 +101,7 @@ int sys_mbox_trypost_coalesce(sys_mbox_t *mbox, void *msg, sys_mbox_merge_fn mer
 #define sys_msleep(m) usleep((time_t)(m) * 1000)
 
 
+/* SYS_ARCH_PROTECT: one process-wide lock, recursive so that nesting is safe */
 void sys_arch_global_lock(void);
 void sys_arch_global_unlock(void);
 

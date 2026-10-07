@@ -13,6 +13,9 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
+#include "sys_sync.h"
+
+#include <pthread.h>
 #include <sys/threads.h>
 #include <sys/time.h>
 #include <sys/mman.h> /* va2pa — TODO(#129) corruption-PA diagnostic */
@@ -28,25 +31,25 @@ err_t sys_mbox_new(sys_mbox_t *mbox, int size)
 	if (!mbox)
 		return ERR_ARG;
 
-	if (mutexCreate(&mbox->lock))
+	if (pthread_mutex_init(&mbox->lock, NULL) != 0)
 		return ERR_MEM;
 
-	if (condCreate(&mbox->push_cond)) {
-		resourceDestroy(mbox->lock);
+	if (sys_sync_condInit(&mbox->push_cond) != 0) {
+		(void)pthread_mutex_destroy(&mbox->lock);
 		return ERR_MEM;
 	}
 
-	if (condCreate(&mbox->pop_cond)) {
-		resourceDestroy(mbox->push_cond);
-		resourceDestroy(mbox->lock);
+	if (sys_sync_condInit(&mbox->pop_cond) != 0) {
+		(void)pthread_cond_destroy(&mbox->push_cond);
+		(void)pthread_mutex_destroy(&mbox->lock);
 		return ERR_MEM;
 	}
 
 	mbox->ring = calloc(size, sizeof(*mbox->ring));
 	if (!mbox->ring) {
-		resourceDestroy(mbox->pop_cond);
-		resourceDestroy(mbox->push_cond);
-		resourceDestroy(mbox->lock);
+		(void)pthread_cond_destroy(&mbox->pop_cond);
+		(void)pthread_cond_destroy(&mbox->push_cond);
+		(void)pthread_mutex_destroy(&mbox->lock);
 		return ERR_MEM;
 	}
 
@@ -60,9 +63,9 @@ err_t sys_mbox_new(sys_mbox_t *mbox, int size)
 void sys_mbox_free(sys_mbox_t *mbox)
 {
 	free(mbox->ring);
-	resourceDestroy(mbox->pop_cond);
-	resourceDestroy(mbox->push_cond);
-	resourceDestroy(mbox->lock);
+	(void)pthread_cond_destroy(&mbox->pop_cond);
+	(void)pthread_cond_destroy(&mbox->push_cond);
+	(void)pthread_mutex_destroy(&mbox->lock);
 }
 
 
@@ -86,8 +89,10 @@ static int mbox_trypost(sys_mbox_t *mbox, void *msg)
 	if (mbox_is_full(mbox))
 		return 0;
 
-	if (mbox_is_empty(mbox))
-		condSignal(mbox->push_cond);
+	/* Every post, not only the empty -> non-empty one: with several fetchers
+	 * asleep, two quick posts would otherwise wake one and strand a message.
+	 * Free when nobody waits (no system call). Under the lock, as all signals. */
+	(void)pthread_cond_signal(&mbox->push_cond);
 
 	mbox->ring[mbox->tail] = msg;
 	mbox->tail = WRAP(mbox, tail);
@@ -99,9 +104,9 @@ err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg)
 {
 	int done;
 
-	mutexLock(mbox->lock);
+	(void)pthread_mutex_lock(&mbox->lock);
 	done = mbox_trypost(mbox, msg);
-	mutexUnlock(mbox->lock);
+	(void)pthread_mutex_unlock(&mbox->lock);
 
 	return done ? ERR_OK : ERR_WOULDBLOCK;
 }
@@ -111,7 +116,7 @@ int sys_mbox_trypost_coalesce(sys_mbox_t *mbox, void *msg, sys_mbox_merge_fn mer
 {
 	int done;
 
-	mutexLock(mbox->lock);
+	(void)pthread_mutex_lock(&mbox->lock);
 
 	/* Try to merge onto the newest still-queued entry before checking for a
 	 * free slot: a full mbox whose tail is mergeable still absorbs `msg`
@@ -120,13 +125,13 @@ int sys_mbox_trypost_coalesce(sys_mbox_t *mbox, void *msg, sys_mbox_merge_fn mer
 	if (!mbox_is_empty(mbox)) {
 		size_t last = (mbox->tail == 0) ? (mbox->sz - 1) : (mbox->tail - 1);
 		if (merge(mbox->ring[last], msg)) {
-			mutexUnlock(mbox->lock);
+			(void)pthread_mutex_unlock(&mbox->lock);
 			return SYS_MBOX_COALESCED;
 		}
 	}
 
 	done = mbox_trypost(mbox, msg);
-	mutexUnlock(mbox->lock);
+	(void)pthread_mutex_unlock(&mbox->lock);
 
 	return done ? SYS_MBOX_POSTED : SYS_MBOX_FULL;
 }
@@ -134,12 +139,12 @@ int sys_mbox_trypost_coalesce(sys_mbox_t *mbox, void *msg, sys_mbox_merge_fn mer
 
 void sys_mbox_post(sys_mbox_t *mbox, void *msg)
 {
-	mutexLock(mbox->lock);
+	(void)pthread_mutex_lock(&mbox->lock);
 
 	while (!mbox_trypost(mbox, msg))
-		condWait(mbox->pop_cond, mbox->lock, 0);
+		(void)pthread_cond_wait(&mbox->pop_cond, &mbox->lock);
 
-	mutexUnlock(mbox->lock);
+	(void)pthread_mutex_unlock(&mbox->lock);
 }
 
 
@@ -148,8 +153,8 @@ static int mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 	if (mbox_is_empty(mbox))
 		return 0;
 
-	if (mbox_is_full(mbox))
-		condSignal(mbox->pop_cond);
+	/* Every fetch, for the same reason as in mbox_trypost() */
+	(void)pthread_cond_signal(&mbox->pop_cond);
 
 	/* TODO(#121): the mbox struct has been seen corrupted during USB enumeration
 	 * (a libc-heap overflow, likely USB-side, clobbers ring/head -> a wild
@@ -178,9 +183,9 @@ u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 {
 	int done;
 
-	mutexLock(mbox->lock);
+	(void)pthread_mutex_lock(&mbox->lock);
 	done = mbox_tryfetch(mbox, msg);
-	mutexUnlock(mbox->lock);
+	(void)pthread_mutex_unlock(&mbox->lock);
 
 	return done ? 0 : SYS_MBOX_EMPTY;
 }
@@ -188,34 +193,25 @@ u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 
 u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout_ms)
 {
-	time_t since, now, when, timeout;
-	int found = 1;
+	struct timespec since = { 0 }, deadline;
+	int waited = 0, expired = 0, found;
 
-	timeout = timeout_ms * 1000;
-	gettime(&now, NULL);
-	since = now;
-	when = now + timeout;
+	(void)pthread_mutex_lock(&mbox->lock);
 
-	mutexLock(mbox->lock);
+	found = mbox_tryfetch(mbox, msg);
+	if (!found) {
+		sys_sync_deadline(&since, &deadline, timeout_ms);
+		waited = 1;
 
-	while (!mbox_tryfetch(mbox, msg)) {
-		condWait(mbox->push_cond, mbox->lock, timeout);
-		if (!timeout)
-			continue;
-
-		gettime(&now, NULL);
-		if (now >= when) {
-			found = 0;
-			break;
-		}
-		timeout = when - now;
+		while (!(found = mbox_tryfetch(mbox, msg)) && !expired)
+			expired = sys_sync_wait(&mbox->push_cond, &mbox->lock, timeout_ms, &deadline);
 	}
 
-	mutexUnlock(mbox->lock);
+	(void)pthread_mutex_unlock(&mbox->lock);
 
 	if (!found)
 		return SYS_ARCH_TIMEOUT;
 
-	gettime(&now, NULL);
-	return (now - since) / 1000;
+	/* A message already queued took 0 ms: no clock read on the fast path */
+	return waited ? sys_sync_elapsedMs(&since) : 0;
 }

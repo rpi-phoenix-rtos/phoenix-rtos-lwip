@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,10 +52,32 @@
 #define SOCKTHREAD_PRIO    4
 #define SOCKTHREAD_STACKSZ (4 * _PAGE_SIZE)
 
+/* Idle workers kept for requests that wait (see "Socket servers" below) */
+#define SOCKWORKER_IDLE_MAX 4
 
-struct sock_start {
+
+/* One socket's server: its port, its lwIP socket and the requests it has
+ * handed to workers */
+struct sock_srv {
 	uint32_t port;
 	int sock;
+	pthread_mutex_t lock;
+	pthread_cond_t idle;   /* signalled when inflight drops to 0 or a direction is released */
+	unsigned int inflight; /* requests handed to workers, not yet answered */
+	int busy[2];           /* a recv (SOCK_RX) / a send (SOCK_TX) is under way; under lock */
+};
+
+#define SOCK_RX 0
+#define SOCK_TX 1
+
+
+/* A request handed to a worker */
+struct sock_job {
+	struct sock_job *next;
+	struct sock_srv *ss;
+	msg_rid_t rid;
+	ssize_t sent; /* a send: bytes the server thread has already sent, holding SOCK_TX for the rest */
+	msg_t msg;    /* as received: not yet touched by socket_op() */
 };
 
 
@@ -697,7 +720,8 @@ static void do_socket_ioctl(msg_t *msg, int sock)
 }
 
 
-static int socket_op(msg_t *msg, int sock)
+/* xflags: MSG_* flags added to a recv or send (MSG_DONTWAIT for a try that must not wait) */
+static int socket_op(msg_t *msg, int sock, int xflags)
 {
 	const sockport_msg_t *smi = (const void *)msg->i.raw;
 	sockport_resp_t *smo = (void *)msg->o.raw;
@@ -776,11 +800,11 @@ static int socket_op(msg_t *msg, int sock)
 			}
 			break;
 		case sockmSend:
-			smo->ret = map_errno(lwip_sendto(sock, msg->i.data, msg->i.size, smi->send.flags,
+			smo->ret = map_errno(lwip_sendto(sock, msg->i.data, msg->i.size, smi->send.flags | xflags,
 				smi->send.addrlen == 0 ? NULL : sa_convert_sys_to_lwip(smi->send.addr, smi->send.addrlen), smi->send.addrlen));
 			break;
 		case sockmRecv:
-			smo->ret = map_errno(lwip_recvfrom(sock, msg->o.data, msg->o.size, smi->send.flags, (void *)smo->sockname.addr, &salen));
+			smo->ret = map_errno(lwip_recvfrom(sock, msg->o.data, msg->o.size, smi->send.flags | xflags, (void *)smo->sockname.addr, &salen));
 			if (smo->ret >= 0)
 				sa_convert_lwip_to_sys(smo->sockname.addr);
 			smo->sockname.addrlen = salen;
@@ -825,13 +849,13 @@ static int socket_op(msg_t *msg, int sock)
 			break;
 		case mtRead:
 			if (msg->o.size <= SSIZE_MAX)
-				msg->o.err = map_errno(lwip_read(sock, msg->o.data, msg->o.size));
+				msg->o.err = map_errno(lwip_recvfrom(sock, msg->o.data, msg->o.size, xflags, NULL, NULL));
 			else
 				msg->o.err = -EINVAL;
 			break;
 		case mtWrite:
 			if (msg->i.size <= SSIZE_MAX)
-				msg->o.err = map_errno(lwip_write(sock, msg->i.data, msg->i.size));
+				msg->o.err = map_errno(lwip_sendto(sock, msg->i.data, msg->i.size, xflags, NULL, 0));
 			else
 				msg->o.err = -EINVAL;
 			break;
@@ -871,32 +895,441 @@ static int socket_op(msg_t *msg, int sock)
 }
 
 
-static void socket_thread(void *arg)
+/*
+ * Socket servers
+ *
+ * Every socket has a port and a server thread that receives its requests. A
+ * request that waits -- a blocking accept, connect, recv or send, or a poll that
+ * waits for readiness -- must not hold up the socket's other requests: the
+ * thread that would make it ready may need one of them first. CPython's
+ * `c.connect(s.getsockname())`, while another thread waits in `s.accept()`, sent
+ * getsockname() to the listener's server thread, which was inside lwip_accept()
+ * waiting for that very connect: both threads hung.
+ *
+ * So the server thread answers at once whatever cannot wait, tries a recv, a
+ * send or a poll without waiting first, and hands only what must wait to a
+ * worker -- a thread from a pool shared by all sockets -- which answers it when
+ * lwIP returns. Data that is already there costs no hand-off.
+ *
+ * lwIP (without LWIP_NETCONN_FULLDUPLEX) takes one receiver and one sender on a
+ * socket at a time, so recvs take turns (SOCK_RX), and so do sends (SOCK_TX). Closing
+ * needs no lock: the kernel holds a reference to the file across every request
+ * it sends, so mtClose comes only after all of them have been answered. The
+ * server still waits for its workers to let go of the socket before closing.
+ */
+
+static struct {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	struct sock_job *head, *tail;
+	unsigned int queued; /* jobs no worker has taken yet */
+	unsigned int idle;   /* workers waiting for a job */
+} sockpool;
+
+
+static void sock_srvPut(struct sock_srv *ss)
 {
-	struct sock_start *ss = arg;
-	msg_rid_t respid;
-	uint32_t port = ss->port;
-	int sock = ss->sock, err;
-	msg_t msg;
+	(void)pthread_mutex_lock(&ss->lock);
+	if (--ss->inflight == 0U) {
+		(void)pthread_cond_broadcast(&ss->idle);
+	}
+	(void)pthread_mutex_unlock(&ss->lock);
+}
 
-	free(ss);
 
-	while ((err = msgRecv(port, &msg, &respid)) >= 0) {
-		err = socket_op(&msg, sock);
-		msgRespond(port, &msg, respid);
-		if (err)
+static void sock_srvWaitIdle(struct sock_srv *ss)
+{
+	(void)pthread_mutex_lock(&ss->lock);
+	while (ss->inflight != 0U) {
+		(void)pthread_cond_wait(&ss->idle, &ss->lock);
+	}
+	(void)pthread_mutex_unlock(&ss->lock);
+}
+
+
+/* SOCK_RX, SOCK_TX or -1: the direction a request moves data in */
+static int sock_dir(int type)
+{
+	switch (type) {
+		case sockmRecv:
+		case mtRead:
+			return SOCK_RX;
+		case sockmSend:
+		case mtWrite:
+			return SOCK_TX;
+		default:
+			return -1;
+	}
+}
+
+
+/* A direction is held by whichever thread runs the recv (send), not owned by
+ * one: a split send takes it on the server thread and releases it on a worker */
+static int sock_dirTake(struct sock_srv *ss, int dir, int wait)
+{
+	int taken = 0;
+
+	(void)pthread_mutex_lock(&ss->lock);
+	while ((ss->busy[dir] != 0) && (wait != 0)) {
+		(void)pthread_cond_wait(&ss->idle, &ss->lock);
+	}
+	if (ss->busy[dir] == 0) {
+		ss->busy[dir] = 1;
+		taken = 1;
+	}
+	(void)pthread_mutex_unlock(&ss->lock);
+
+	return taken;
+}
+
+
+static void sock_dirRelease(struct sock_srv *ss, int dir)
+{
+	(void)pthread_mutex_lock(&ss->lock);
+	ss->busy[dir] = 0;
+	(void)pthread_cond_broadcast(&ss->idle);
+	(void)pthread_mutex_unlock(&ss->lock);
+}
+
+
+static void socket_setResult(msg_t *msg, ssize_t ret)
+{
+	sockport_resp_t *smo = (void *)msg->o.raw;
+
+	if ((msg->type == sockmRecv) || (msg->type == sockmSend)) {
+		smo->ret = ret;
+	}
+	else {
+		msg->o.err = ret;
+	}
+}
+
+
+/* The rest of a send the server thread has sent part of without waiting */
+static void sockjob_sendRest(struct sock_job *job)
+{
+	msg_t *msg = &job->msg;
+	const sockport_msg_t *smi = (const void *)msg->i.raw;
+	const struct sockaddr *to = NULL;
+	socklen_t tolen = 0;
+	int flags = 0;
+	ssize_t ret;
+
+	if (msg->type == sockmSend) {
+		flags = smi->send.flags;
+		if (smi->send.addrlen != 0) {
+			to = sa_convert_sys_to_lwip(smi->send.addr, smi->send.addrlen);
+			tolen = smi->send.addrlen;
+		}
+	}
+
+	ret = lwip_sendto(job->ss->sock, (const char *)msg->i.data + job->sent, msg->i.size - job->sent, flags, to, tolen);
+	/* An error after a partial send reports what was sent, as send() does */
+	socket_setResult(msg, (ret < 0) ? job->sent : (job->sent + ret));
+}
+
+
+static void sockjob_run(struct sock_job *job)
+{
+	struct sock_srv *ss = job->ss;
+	int dir = sock_dir(job->msg.type);
+
+	if (job->sent > 0) {
+		/* SOCK_TX came with the job: no other send may come between the two parts */
+		sockjob_sendRest(job);
+	}
+	else {
+		if (dir >= 0) {
+			(void)sock_dirTake(ss, dir, 1);
+		}
+		(void)socket_op(&job->msg, ss->sock, 0);
+	}
+	if (dir >= 0) {
+		sock_dirRelease(ss, dir);
+	}
+
+	msgRespond(ss->port, &job->msg, job->rid);
+	sock_srvPut(ss);
+}
+
+
+/* Takes a queued job, if there is one, and runs it. Called with sockpool.lock
+ * held; returns with it held. */
+static int sockpool_runOne(void)
+{
+	struct sock_job *job = sockpool.head;
+
+	if (job == NULL) {
+		return 0;
+	}
+
+	sockpool.head = job->next;
+	if (sockpool.head == NULL) {
+		sockpool.tail = NULL;
+	}
+	sockpool.queued--;
+
+	(void)pthread_mutex_unlock(&sockpool.lock);
+	sockjob_run(job);
+	free(job);
+	(void)pthread_mutex_lock(&sockpool.lock);
+
+	return 1;
+}
+
+
+static void sockworker_thread(void *arg)
+{
+	(void)arg;
+
+	(void)pthread_mutex_lock(&sockpool.lock);
+	for (;;) {
+		if (sockpool_runOne() != 0) {
+			continue;
+		}
+		if (sockpool.idle >= SOCKWORKER_IDLE_MAX) {
+			break;
+		}
+		sockpool.idle++;
+		(void)pthread_cond_wait(&sockpool.cond, &sockpool.lock);
+		sockpool.idle--;
+	}
+	(void)pthread_mutex_unlock(&sockpool.lock);
+}
+
+
+/* Hands a request that has to wait to a worker, which answers it */
+static void sockjob_submit(struct sock_srv *ss, const msg_t *msg, msg_rid_t rid, ssize_t sent)
+{
+	struct sock_job *job, local;
+	int spawn;
+
+	job = malloc(sizeof(*job));
+
+	(void)pthread_mutex_lock(&ss->lock);
+	ss->inflight++;
+	(void)pthread_mutex_unlock(&ss->lock);
+
+	if (job == NULL) {
+		/* Answer it here, waiting, as before workers existed */
+		local.ss = ss;
+		local.rid = rid;
+		local.sent = sent;
+		local.msg = *msg;
+		sockjob_run(&local);
+		return;
+	}
+
+	job->next = NULL;
+	job->ss = ss;
+	job->rid = rid;
+	job->sent = sent;
+	job->msg = *msg;
+
+	(void)pthread_mutex_lock(&sockpool.lock);
+	if (sockpool.tail != NULL) {
+		sockpool.tail->next = job;
+	}
+	else {
+		sockpool.head = job;
+	}
+	sockpool.tail = job;
+	sockpool.queued++;
+	/* An idle worker takes it, unless each one already has a job coming */
+	spawn = (sockpool.idle < sockpool.queued) ? 1 : 0;
+	(void)pthread_cond_signal(&sockpool.cond);
+	(void)pthread_mutex_unlock(&sockpool.lock);
+
+	if ((spawn != 0) && (sys_thread_opt_new("sockworker", sockworker_thread, NULL, SOCKTHREAD_STACKSZ, SOCKTHREAD_PRIO, NULL) != 0)) {
+		/* No thread for it: run a queued job here, so that every job is taken */
+		(void)pthread_mutex_lock(&sockpool.lock);
+		(void)sockpool_runOne();
+		(void)pthread_mutex_unlock(&sockpool.lock);
+	}
+}
+
+
+static int socket_isNonblocking(int sock)
+{
+	int fl = lwip_fcntl(sock, F_GETFL, 0);
+
+	return ((fl >= 0) && ((fl & O_NONBLOCK) != 0)) ? 1 : 0;
+}
+
+
+static ssize_t socket_result(const msg_t *msg)
+{
+	const sockport_resp_t *smo = (const void *)msg->o.raw;
+
+	return ((msg->type == sockmRecv) || (msg->type == sockmSend)) ? smo->ret : msg->o.err;
+}
+
+
+/* Serves a request on the server thread, answering it there or handing it to a
+ * worker. Returns 1 if msg has been answered here (the caller responds). */
+static int socket_serve(struct sock_srv *ss, msg_t *msg, msg_rid_t rid)
+{
+	const sockport_msg_t *smi = (const void *)msg->i.raw;
+	long long pollval;
+	int dir, dontwait;
+	ssize_t ret;
+	size_t size;
+	msg_t orig;
+
+#if LWIP_IPSEC
+	if (is_key_sockets_fd(ss->sock)) {
+		(void)socket_op(msg, ss->sock, 0);
+		return 1;
+	}
+#endif /* LWIP_IPSEC */
+
+	switch (msg->type) {
+		case sockmAccept:
+		case sockmConnect:
+			if (socket_isNonblocking(ss->sock) == 0) {
+				sockjob_submit(ss, msg, rid, 0);
+				return 0;
+			}
+			break;
+
+		case mtGetAttr:
+			pollval = msg->i.attr.val;
+			if ((msg->i.attr.type != atPollStatus) || ((pollval >> 16) == 0)) {
+				break;
+			}
+			/* A poll that may wait for readiness: look without waiting first */
+			orig = *msg;
+			msg->i.attr.val = pollval & 0xFFFFLL;
+			(void)socket_op(msg, ss->sock, 0);
+			if ((msg->o.err == EOK) && (msg->o.attr.val == 0)) {
+				sockjob_submit(ss, &orig, rid, 0);
+				return 0;
+			}
+			return 1;
+
+		case sockmRecv:
+		case mtRead:
+		case sockmSend:
+		case mtWrite:
+			dir = sock_dir(msg->type);
+			dontwait = ((msg->type == sockmRecv) || (msg->type == sockmSend)) && ((smi->send.flags & MSG_DONTWAIT) != 0);
+			orig = *msg;
+			if (sock_dirTake(ss, dir, 0) == 0) {
+				/* Another recv (send) is under way */
+				if ((dontwait != 0) || (socket_isNonblocking(ss->sock) != 0)) {
+					socket_setResult(msg, -EAGAIN);
+					return 1;
+				}
+				/* Wait for it on a worker */
+				sockjob_submit(ss, &orig, rid, 0);
+				return 0;
+			}
+			(void)socket_op(msg, ss->sock, MSG_DONTWAIT);
+
+			ret = socket_result(msg);
+			size = ((msg->type == sockmSend) || (msg->type == mtWrite)) ? msg->i.size : 0;
+			if (((ret != -EAGAIN) && (ret != -EWOULDBLOCK) && ((ret < 0) || (ret >= (ssize_t)size))) ||
+					(dontwait != 0) || (socket_isNonblocking(ss->sock) != 0)) {
+				/* Done (data or EOF received, all sent, an error), or the caller
+				 * does not wait: this is the answer */
+				sock_dirRelease(ss, dir);
+				return 1;
+			}
+			if (ret <= 0) {
+				/* Nothing moved: the worker starts afresh */
+				sock_dirRelease(ss, dir);
+				ret = 0;
+			}
+			/* else: part of a send went; the worker sends the rest still holding SOCK_TX */
+			sockjob_submit(ss, &orig, rid, ret);
+			return 0;
+
+		default:
 			break;
 	}
 
-	portDestroy(port);
-	if (err < 0)
-		lwip_close(sock);
+	(void)socket_op(msg, ss->sock, 0);
+	return 1;
+}
+
+
+static void socket_thread(void *arg)
+{
+	struct sock_srv *ss = arg;
+	msg_rid_t respid;
+	msg_t msg;
+	int err, closed = 0;
+
+	while ((err = msgRecv(ss->port, &msg, &respid)) >= 0) {
+		if (msg.type == mtClose) {
+			sock_srvWaitIdle(ss);
+			closed = socket_op(&msg, ss->sock, 0);
+			msgRespond(ss->port, &msg, respid);
+			break;
+		}
+		if (socket_serve(ss, &msg, respid) != 0) {
+			msgRespond(ss->port, &msg, respid);
+		}
+	}
+
+	sock_srvWaitIdle(ss);
+	portDestroy(ss->port);
+	if (closed == 0) {
+		lwip_close(ss->sock);
+	}
+
+	/* A worker's last touch of ss is its unlock of ss->lock in sock_srvPut(), and a
+	 * pthread mutex unlock touches nothing of the mutex after releasing it */
+	(void)pthread_cond_destroy(&ss->idle);
+	(void)pthread_mutex_destroy(&ss->lock);
+	free(ss);
+}
+
+
+/* Creates the server (port + thread) of an open socket; closes the socket on failure */
+static int sock_srvStart(uint32_t *port, int sock, int (*closefn)(int))
+{
+	struct sock_srv *ss;
+	int err;
+
+	ss = calloc(1, sizeof(*ss));
+	if (ss == NULL) {
+		closefn(sock);
+		return -ENOMEM;
+	}
+
+	ss->sock = sock;
+	if (pthread_mutex_init(&ss->lock, NULL) != 0) {
+		closefn(sock);
+		free(ss);
+		return -ENOMEM;
+	}
+	if (pthread_cond_init(&ss->idle, NULL) != 0) {
+		(void)pthread_mutex_destroy(&ss->lock);
+		closefn(sock);
+		free(ss);
+		return -ENOMEM;
+	}
+
+	if ((err = portCreate(&ss->port)) == 0) {
+		*port = ss->port;
+		err = sys_thread_opt_new("socket", socket_thread, ss, SOCKTHREAD_STACKSZ, SOCKTHREAD_PRIO, NULL);
+		if (err == 0) {
+			return EOK;
+		}
+		portDestroy(ss->port);
+	}
+
+	(void)pthread_cond_destroy(&ss->idle);
+	(void)pthread_mutex_destroy(&ss->lock);
+	closefn(sock);
+	free(ss);
+	return err;
 }
 
 
 static int wrap_socket(uint32_t *port, int sock, int flags)
 {
-	struct sock_start *ss;
 	int err;
 
 	if ((flags & SOCK_NONBLOCK) && (err = lwip_fcntl(sock, F_SETFL, O_NONBLOCK)) < 0) {
@@ -904,65 +1337,15 @@ static int wrap_socket(uint32_t *port, int sock, int flags)
 		return err;
 	}
 
-	ss = malloc(sizeof(*ss));
-	if (!ss) {
-		lwip_close(sock);
-		return -ENOMEM;
-	}
-
-	ss->sock = sock;
-
-	if ((err = portCreate(&ss->port)) < 0) {
-		lwip_close(ss->sock);
-		free(ss);
-		return err;
-	}
-
-	*port = ss->port;
-
-	if ((err = sys_thread_opt_new("socket", socket_thread, ss, SOCKTHREAD_STACKSZ, SOCKTHREAD_PRIO, NULL))) {
-		portDestroy(ss->port);
-		lwip_close(ss->sock);
-		free(ss);
-		return err;
-	}
-
-	return EOK;
+	return sock_srvStart(port, sock, lwip_close);
 }
 
 
 #if LWIP_IPSEC
 static int wrap_key_socket(uint32_t *port, int sock, int flags)
 {
-	struct sock_start *ss;
-	int err;
-
 	/* no flags are supported by AF_KEY socket */
-
-	ss = malloc(sizeof(*ss));
-	if (!ss) {
-		key_sockets_close(sock);
-		return -ENOMEM;
-	}
-
-	ss->sock = sock;
-
-	if ((err = portCreate(&ss->port)) < 0) {
-		key_sockets_close(sock);
-		free(ss);
-		return err;
-	}
-
-	*port = ss->port;
-
-	if ((err = sys_thread_opt_new("socket", socket_thread, ss, SOCKTHREAD_STACKSZ, SOCKTHREAD_PRIO, NULL))) {
-		portDestroy(ss->port);
-		key_sockets_close(ss->sock);
-		free(ss);
-		return err;
-	}
-
-	return EOK;
+	return sock_srvStart(port, sock, key_sockets_close);
 }
 #endif /* LWIP_IPSEC */
 
@@ -1274,6 +1657,10 @@ __constructor__(1000) void init_lwip_sockets(void)
 {
 	oid_t oid = { 0 };
 	int err;
+
+	if ((pthread_mutex_init(&sockpool.lock, NULL) != 0) || (pthread_cond_init(&sockpool.cond, NULL) != 0)) {
+		errout(-ENOMEM, "socket worker pool");
+	}
 
 #if LWIP_IPSEC
 	key_sockets_init();

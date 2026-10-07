@@ -57,6 +57,7 @@
 #include "netif/ethernet.h"       /* ethernet_input (un-locked inner RX-input fn) */
 
 #include <sys/interrupt.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/threads.h>
 #include <sys/time.h>
@@ -249,7 +250,7 @@ typedef struct {
 	/* TX: single DMA buffer, ring of 256 BDs in MMIO. */
 	void *tx_buf;
 	addr_t tx_buf_phys;
-	handle_t tx_lock;
+	pthread_mutex_t tx_lock; /* user-space lock: no system call when free */
 	uint32_t tx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
 	uint32_t tx_prod_index;  /* 16-bit running counter the HW compares to CONS_INDEX */
 	unsigned long tx_pkts;
@@ -267,7 +268,7 @@ typedef struct {
 	genet_rxbuf_t rx_pc[GENET_RX_POOL_SLOTS];/* custom-pbuf wrapper per pool buffer */
 	uint16_t rx_free[GENET_RX_POOL_SLOTS];   /* free-list (stack of pool-buffer indices) */
 	int rx_free_top;                         /* # entries on the free list */
-	handle_t rx_free_lock;                   /* drain pops, custom-free pushes (cross-thread) */
+	pthread_mutex_t rx_free_lock;            /* drain pops, custom-free pushes (cross-thread); user-space lock */
 	unsigned long rx_zerocopy;               /* frames handed up zero-copy */
 	unsigned long rx_copyfallback;           /* frames that fell back to the copy path */
 	uint32_t rx_index;       /* 0..GENET_TOTAL_DESC-1 — BD index in MMIO */
@@ -297,7 +298,9 @@ typedef struct {
 
 	/* IRQ plumbing: handler runs in interrupt context, masks the level-2
 	 * source bits it's about to service, signals irq_cond; irq_thread
-	 * drains the affected rings and re-unmasks before going back to sleep. */
+	 * drains the affected rings and re-unmasks before going back to sleep.
+	 * irq_lock stays a kernel mutex: interrupt() signals irq_cond from the
+	 * kernel, and condWait() pairs it with a mutex handle. */
 	handle_t irq_lock;
 	handle_t irq_cond;
 	handle_t irq_handle;
@@ -863,8 +866,8 @@ static int genet_initRxRing(genet_state_t *state)
 	state->rx_free_top = 0;
 	for (i = GENET_TOTAL_DESC; i < GENET_RX_POOL_SLOTS; ++i)
 		state->rx_free[state->rx_free_top++] = (uint16_t)i;
-	if (mutexCreate(&state->rx_free_lock) != 0) {
-		genet_printf(state, "rx_free_lock create failed");
+	if (pthread_mutex_init(&state->rx_free_lock, NULL) != 0) {
+		genet_printf(state, "rx_free_lock init failed");
 		return -ENOMEM;
 	}
 
@@ -980,10 +983,10 @@ static void genet_rxbufFree(struct pbuf *p)
 	genet_rxbuf_t *rb = (genet_rxbuf_t *)p;   /* pc is first member: &pc.pbuf == p */
 	genet_state_t *state = (genet_state_t *)rb->state;
 
-	mutexLock(state->rx_free_lock);
+	(void)pthread_mutex_lock(&state->rx_free_lock);
 	if (state->rx_free_top < (int)GENET_RX_POOL_SLOTS)
 		state->rx_free[state->rx_free_top++] = rb->idx;
-	mutexUnlock(state->rx_free_lock);
+	(void)pthread_mutex_unlock(&state->rx_free_lock);
 }
 
 
@@ -992,10 +995,10 @@ static int genet_rxbufPop(genet_state_t *state)
 {
 	int idx = -1;
 
-	mutexLock(state->rx_free_lock);
+	(void)pthread_mutex_lock(&state->rx_free_lock);
 	if (state->rx_free_top > 0)
 		idx = state->rx_free[--state->rx_free_top];
-	mutexUnlock(state->rx_free_lock);
+	(void)pthread_mutex_unlock(&state->rx_free_lock);
 	return idx;
 }
 
@@ -1184,10 +1187,10 @@ static void genet_drainRxRing(genet_state_t *state)
 				}
 				else {
 					/* custom alloc failed: give the spare back, copy instead. */
-					mutexLock(state->rx_free_lock);
+					(void)pthread_mutex_lock(&state->rx_free_lock);
 					if (state->rx_free_top < (int)GENET_RX_POOL_SLOTS)
 						state->rx_free[state->rx_free_top++] = (uint16_t)nb;
-					mutexUnlock(state->rx_free_lock);
+					(void)pthread_mutex_unlock(&state->rx_free_lock);
 					nb = -1;
 				}
 			}
@@ -1583,7 +1586,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	gettime(&_txe0, NULL);
 #endif
 
-	mutexLock(state->tx_lock);
+	(void)pthread_mutex_lock(&state->tx_lock);
 
 #if GENET_TX_PIPELINE
 	/* Wait ONLY if the ring is full; completed BDs are reclaimed implicitly via
@@ -1611,7 +1614,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 				gettime(&now, NULL);
 				if (now >= deadline) {
 					state->tx_timeouts++;
-					mutexUnlock(state->tx_lock);
+					(void)pthread_mutex_unlock(&state->tx_lock);
 					genet_printf(state, "TX ring-full timeout (prod=%u cons=%u)",
 						state->tx_prod_index, cons);
 					return ERR_TIMEOUT;
@@ -1712,7 +1715,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 		gettime(&now, NULL);
 		if (now >= deadline) {
 			state->tx_timeouts++;
-			mutexUnlock(state->tx_lock);
+			(void)pthread_mutex_unlock(&state->tx_lock);
 			genet_printf(state, "TX timeout (prod=%u cons=%u)",
 				state->tx_prod_index, cons & 0xFFFFu);
 			return ERR_TIMEOUT;
@@ -1734,7 +1737,7 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 	}
 #endif
 	state->tx_pkts++;
-	mutexUnlock(state->tx_lock);
+	(void)pthread_mutex_unlock(&state->tx_lock);
 	return ERR_OK;
 }
 
@@ -1954,8 +1957,8 @@ static int genet_netifInit(struct netif *netif, char *cfg)
 	}
 	state->tx_buf_phys = va2pa(state->tx_buf);
 
-	if (mutexCreate(&state->tx_lock) != 0) {
-		genet_printf(state, "tx_lock mutexCreate failed");
+	if (pthread_mutex_init(&state->tx_lock, NULL) != 0) {
+		genet_printf(state, "tx_lock init failed");
 		return -ENOMEM;
 	}
 

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "lwip/sockets.h"
@@ -336,6 +337,101 @@ static void test_partial_dontwait_send(void)
 }
 
 
+/* The port's server thread answers a read() by first trying it with
+ * MSG_DONTWAIT, then -- nothing there -- hands the plain blocking read to a
+ * worker. ntpclient's shape: a connected UDP socket with SO_RCVTIMEO,
+ * write() then read(). */
+struct udp_echo {
+	int sock;
+	int delay_ms;
+};
+
+static void *udp_echo_thread(void *arg)
+{
+	struct udp_echo *e = arg;
+	struct sockaddr_in from;
+	socklen_t len = sizeof(from);
+	char buf[64];
+	int n;
+
+	n = lwip_recvfrom(e->sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &len);
+	CHECK(n > 0);
+	usleep(e->delay_ms * 1000);
+	CHECK(lwip_sendto(e->sock, buf, (size_t)n, 0, (struct sockaddr *)&from, len) == n);
+	return NULL;
+}
+
+static int udp_bound(struct sockaddr_in *addr)
+{
+	socklen_t len = sizeof(*addr);
+	int s = lwip_socket(AF_INET, SOCK_DGRAM, 0);
+
+	CHECK(s >= 0);
+	memset(addr, 0, sizeof(*addr));
+	addr->sin_len = sizeof(*addr);
+	addr->sin_family = AF_INET;
+	addr->sin_addr.s_addr = PP_HTONL(INADDR_LOOPBACK);
+	CHECK(lwip_bind(s, (struct sockaddr *)addr, sizeof(*addr)) == 0);
+	CHECK(lwip_getsockname(s, (struct sockaddr *)addr, &len) == 0);
+	return s;
+}
+
+static long elapsed_ms(struct timespec *t0)
+{
+	struct timespec t1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+static void test_udp_rcvtimeo_try_then_wait(void)
+{
+	struct udp_echo e;
+	struct sockaddr_in addr;
+	struct timeval tv = { 2, 0 };
+	struct timespec t0;
+	pthread_t t;
+	char buf[48] = "ntp?";
+	int c, n;
+
+	current = "connected UDP + SO_RCVTIMEO: DONTWAIT try, then blocking read";
+	e.sock = udp_bound(&addr);
+	e.delay_ms = 100;
+	CHECK(pthread_create(&t, NULL, udp_echo_thread, &e) == 0);
+
+	c = lwip_socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(c >= 0);
+	CHECK(lwip_setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+	CHECK(lwip_setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0);
+	CHECK(lwip_connect(c, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+
+	/* write(): the server thread's try */
+	CHECK(lwip_sendto(c, buf, sizeof(buf), MSG_DONTWAIT, NULL, 0) == (int)sizeof(buf));
+	/* read(): the server thread's try finds nothing ... */
+	n = lwip_recvfrom(c, buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL);
+	CHECK((n < 0) && ((errno == EWOULDBLOCK) || (errno == EAGAIN)));
+	/* ... and the worker's plain read() waits for the reply */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	n = lwip_recvfrom(c, buf, sizeof(buf), 0, NULL, NULL);
+	CHECK(n == (int)sizeof(buf));
+	CHECK(elapsed_ms(&t0) < 1500);
+
+	/* Nothing more comes: SO_RCVTIMEO must end the wait after ~2 s */
+	n = lwip_recvfrom(c, buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL);
+	CHECK(n < 0);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	n = lwip_recvfrom(c, buf, sizeof(buf), 0, NULL, NULL);
+	CHECK((n < 0) && ((errno == EWOULDBLOCK) || (errno == EAGAIN)));
+	CHECK(elapsed_ms(&t0) >= 1800);
+	CHECK(elapsed_ms(&t0) < 4000);
+
+	CHECK(pthread_join(t, NULL) == 0);
+	lwip_close(c);
+	lwip_close(e.sock);
+	printf("ok   %s\n", current);
+}
+
+
 /* Connect to a loopback port nobody listens on: refused, never a hang */
 static void test_refused(void)
 {
@@ -384,6 +480,8 @@ int main(void)
 	test_nonblocking_connect();
 	alarm(WATCHDOG_S);
 	test_refused();
+	alarm(WATCHDOG_S);
+	test_udp_rcvtimeo_try_then_wait();
 	alarm(WATCHDOG_S);
 	test_partial_dontwait_send();
 	alarm(WATCHDOG_S);

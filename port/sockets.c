@@ -927,6 +927,25 @@ static struct {
 } sockpool;
 
 
+/* Copies a request. The kernel packs a small mtRead/mtWrite payload into the
+ * message itself (msg_opack(): o.data / i.data then point into o.raw / i.raw),
+ * so those pointers must follow the copy -- or a worker reading into o.data
+ * would fill the server thread's message, not the one it answers with. */
+static void sock_msgCopy(msg_t *dst, const msg_t *src)
+{
+	const char *iraw = (const char *)src->i.raw, *oraw = (const char *)src->o.raw;
+	const char *idata = src->i.data, *odata = src->o.data;
+
+	*dst = *src;
+	if ((idata >= iraw) && (idata < iraw + sizeof(src->i.raw))) {
+		dst->i.data = (char *)dst->i.raw + (idata - iraw);
+	}
+	if ((odata >= oraw) && (odata < oraw + sizeof(src->o.raw))) {
+		dst->o.data = (char *)dst->o.raw + (odata - oraw);
+	}
+}
+
+
 static void sock_srvPut(struct sock_srv *ss)
 {
 	(void)pthread_mutex_lock(&ss->lock);
@@ -1115,7 +1134,7 @@ static void sockjob_submit(struct sock_srv *ss, const msg_t *msg, msg_rid_t rid,
 		local.ss = ss;
 		local.rid = rid;
 		local.sent = sent;
-		local.msg = *msg;
+		sock_msgCopy(&local.msg, msg);
 		sockjob_run(&local);
 		return;
 	}
@@ -1124,7 +1143,7 @@ static void sockjob_submit(struct sock_srv *ss, const msg_t *msg, msg_rid_t rid,
 	job->ss = ss;
 	job->rid = rid;
 	job->sent = sent;
-	job->msg = *msg;
+	sock_msgCopy(&job->msg, msg);
 
 	(void)pthread_mutex_lock(&sockpool.lock);
 	if (sockpool.tail != NULL) {
@@ -1198,7 +1217,7 @@ static int socket_serve(struct sock_srv *ss, msg_t *msg, msg_rid_t rid)
 				break;
 			}
 			/* A poll that may wait for readiness: look without waiting first */
-			orig = *msg;
+			sock_msgCopy(&orig, msg);
 			msg->i.attr.val = pollval & 0xFFFFLL;
 			(void)socket_op(msg, ss->sock, 0);
 			if ((msg->o.err == EOK) && (msg->o.attr.val == 0)) {
@@ -1213,7 +1232,7 @@ static int socket_serve(struct sock_srv *ss, msg_t *msg, msg_rid_t rid)
 		case mtWrite:
 			dir = sock_dir(msg->type);
 			dontwait = ((msg->type == sockmRecv) || (msg->type == sockmSend)) && ((smi->send.flags & MSG_DONTWAIT) != 0);
-			orig = *msg;
+			sock_msgCopy(&orig, msg);
 			if (sock_dirTake(ss, dir, 0) == 0) {
 				/* Another recv (send) is under way */
 				if ((dontwait != 0) || (socket_isNonblocking(ss->sock) != 0)) {

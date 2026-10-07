@@ -300,6 +300,42 @@ static void test_failed_poll_schedule(void)
 }
 
 
+/* The port's socket server tries a send with MSG_DONTWAIT before handing it to
+ * a worker, and relies on lwIP 2.1's answer when the data does not fit: the
+ * count it did queue (2.0 failed the whole send with ENOMEM instead) */
+static void test_partial_dontwait_send(void)
+{
+	static char buf[2 * 1024 * 1024];
+	struct sockaddr_in addr;
+	int l, c, a, on = 1;
+	ssize_t n;
+
+	current = "MSG_DONTWAIT send that does not fit: partial count";
+	l = listener(&addr);
+	c = lwip_socket(AF_INET, SOCK_STREAM, 0);
+	CHECK(c >= 0);
+	CHECK(lwip_ioctl(c, FIONBIO, &on) == 0);
+	CHECK((lwip_connect(c, (struct sockaddr *)&addr, sizeof(addr)) == 0) || (errno == EINPROGRESS));
+	CHECK(poll_one(l, 0, 5000) == 1);
+	a = lwip_accept(l, NULL, NULL);
+	CHECK(a >= 0);
+	CHECK(poll_one(c, 1, 5000) == 1);
+	on = 0;
+	CHECK(lwip_ioctl(c, FIONBIO, &on) == 0); /* a blocking socket, as for send() */
+
+	n = lwip_send(c, buf, sizeof(buf), MSG_DONTWAIT);
+	CHECK(n > 0);
+	CHECK(n < (ssize_t)sizeof(buf));
+	n = lwip_send(c, buf, sizeof(buf), MSG_DONTWAIT);
+	CHECK((n > 0) || ((n < 0) && (errno == EWOULDBLOCK || errno == EAGAIN)));
+
+	lwip_close(a);
+	lwip_close(c);
+	lwip_close(l);
+	printf("ok   %s\n", current);
+}
+
+
 /* Connect to a loopback port nobody listens on: refused, never a hang */
 static void test_refused(void)
 {
@@ -348,6 +384,8 @@ int main(void)
 	test_nonblocking_connect();
 	alarm(WATCHDOG_S);
 	test_refused();
+	alarm(WATCHDOG_S);
+	test_partial_dontwait_send();
 	alarm(WATCHDOG_S);
 	test_failed_poll_schedule();
 	alarm(0);

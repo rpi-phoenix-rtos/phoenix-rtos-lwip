@@ -19,6 +19,9 @@
  *                                           0 = nothing queued, <0 = error.
  *                                           NEVER blocks (the daemon has a
  *                                           single message thread).
+ *   /dev/wifibatch the same frames, several per message (format in wifibatch.h);
+ *                  optional, used while the daemon's `status` says batch=1 -- see
+ *                  "Frame batches" below
  *   /dev/wifi      text commands: write the command, lseek() back to 0, then
  *                  read() the text reply (the write advances the offset).
  *                    "mac"                   -> reply has a "MAC aa:bb:.." line
@@ -26,8 +29,9 @@
  *                                               NO DHCP; 20-40 s; reply has
  *                                               "JOINWPA ok|fail ..." + "MAC ..."
  *                    "leave"                 -> disassociate
- *                    "status"                -> "STATUS joined=0|1 ..." (joined=0
- *                                               also after a lost association)
+ *                    "status"                -> "STATUS joined=0|1 ... batch=0|1"
+ *                                               (joined=0 also after a lost
+ *                                               association)
  *
  * Consequences for the netif lifecycle:
  *
@@ -56,6 +60,7 @@
  *                            carries no secret. Re-read every WIFI_WATCH_S.
  */
 #include "netif-driver.h"
+#include "wifibatch.h"
 
 #include "lwip/dhcp.h"
 #include "lwip/etharp.h"
@@ -65,6 +70,7 @@
 #include "lwip/snmp.h"
 #include "lwip/tcpip.h"
 
+#include <sys/mman.h>
 #include <sys/threads.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -77,6 +83,7 @@
 
 
 #define WIFI_DATA_DEV "/dev/wifidata"
+#define WIFI_BATCH_DEV "/dev/wifibatch"
 #define WIFI_CTL_DEV  "/dev/wifi"
 #define WIFI_IRQ_DEV  "/dev/wifiirq"
 #define WIFI_CONF     "/etc/wifi.conf"
@@ -150,6 +157,39 @@
 #define WIFI_SSID_CAP 33u /* 32 + NUL, per IEEE 802.11 */
 #define WIFI_PSK_CAP  65u /* 64 + NUL, per WPA2-PSK */
 
+/* Frame batches. On /dev/wifidata every frame is one IPC round trip through the
+ * daemon's single message thread, and that per-frame path (~290 us at a 41.67
+ * MHz bus, of which the bus is ~80-100 us) is what bounds throughput. While the
+ * daemon's `status` reports batch=1 (`wifi batch 1`, or its `batch=1` argument)
+ * and it serves /dev/wifibatch, frames cross several per message instead:
+ *
+ *   TX  linkoutput copies the frame into a queue and returns (one copy, as
+ *       before); the TX thread writes everything queued as one batch. Batches
+ *       form by themselves: while one write is in the daemon, the frames lwIP
+ *       produces meanwhile queue up for the next. An idle link sends batches of
+ *       one, at the cost of one thread hand-off. When the queue is full,
+ *       linkoutput waits, as it used to wait in its own write(), for up to
+ *       WIFI_TXQ_WAIT_US, then refuses the frame with ERR_IF.
+ *       Credits: the daemon takes frames from the front of a batch until the
+ *       firmware's window shuts and returns how many it took. The rest stay at
+ *       the head of the queue and are sent again after WIFI_TX_BLOCKED_US -- not
+ *       dropped: on the one-frame path lwIP got ERR_IF and kept the TCP segment
+ *       for its next output, and a queued frame no longer has that.
+ *   RX  one read returns every frame queued up to the buffer (the rest of the
+ *       glom superframe in hand, then the FIFO), and says whether it ended on an
+ *       empty FIFO, so in interrupt mode the confirming empty read goes too.
+ *
+ * The one-frame path is untouched and is what runs with batch=0, so one boot
+ * measures both. Buffers are whole pages from mmap(): the kernel maps a
+ * page-aligned message buffer into the daemon instead of copying its partial
+ * first page. */
+#define WIFI_BATCH_TX_BUF    (24u * 1024u) /* 16 MTU frames fit */
+#define WIFI_BATCH_TX_FRAMES 16u
+#define WIFI_BATCH_RX_BUF    (24u * 1024u) /* 15 MTU frames; the daemon caps a read at 32 */
+#define WIFI_TX_BLOCKED_US    200u  /* credit window shut: retry after this */
+#define WIFI_TX_BLOCKED_TRIES 500u  /* ... for up to 100 ms, then drop the batch */
+#define WIFI_TXQ_WAIT_US      20000u /* linkoutput waits this long for queue room */
+
 
 typedef struct {
 	struct netif *netif;
@@ -191,11 +231,37 @@ typedef struct {
 	uint8_t rx_buf[WIFI_RX_BUF];
 	char resp[WIFI_RESP_MAX];
 
+	/* Frame batches. batch_fd is set with the other opens, before data_fd is
+	 * published, and never changes after; -1 = the daemon has no /dev/wifibatch
+	 * (or the buffers could not be mapped), and batching stays off. batch is
+	 * what the daemon's last `status` asked for, written by the join thread
+	 * only; a stale value only picks the other (working) path for one frame.
+	 * At a switch, frames still queued may leave after one sent the other way:
+	 * a reordering once per switch, which TCP absorbs. */
+	int batch_fd;
+	volatile int batch;
+	uint8_t *batch_rx;     /* WIFI_BATCH_RX_BUF, RX thread only */
+	uint8_t *batch_tx[2];  /* WIFI_BATCH_TX_BUF each: one fills while one is written */
+	handle_t txq_lock;     /* guards txq */
+	handle_t txq_more;     /* the TX thread waits for frames */
+	handle_t txq_room;     /* linkoutput waits for a free buffer */
+	wifibatch_t txq;       /* the batch being filled */
+
 	unsigned long rx_ok;
 	unsigned long rx_err;
 	unsigned long rx_toobig;
 	unsigned long tx_ok;
 	unsigned long tx_err;
+
+	/* Batch counters. tx_b* are the TX thread's; rx_b* the RX thread's. */
+	unsigned long tx_bwrites;  /* /dev/wifibatch writes */
+	unsigned long tx_bframes;  /* frames the daemon took from them */
+	unsigned long tx_bretries; /* writes the credit window cut short */
+	unsigned long tx_berr;     /* frames dropped: write failed, or the window stayed shut */
+	unsigned long tx_qfull;    /* frames refused (ERR_IF): the queue stayed full */
+	unsigned long rx_breads;   /* /dev/wifibatch reads that returned frames */
+	unsigned long rx_bframes;  /* frames they returned */
+	unsigned long rx_bbad;     /* malformed batches (dropped whole) */
 
 	/* Interrupt-mode RX (RX thread only). */
 	unsigned long irq_wakes;    /* /dev/wifiirq reads that returned an interrupt */
@@ -210,6 +276,9 @@ typedef struct {
 	/* 8 KB: the join thread only does device I/O + snprintf/printf; its text
 	 * buffers live in this struct rather than on the stack. */
 	uint32_t join_stack[2048] __attribute__((aligned(16)));
+	/* 8 KB: the TX thread moves bytes and calls write()/usleep(); 8 KB, like
+	 * the join thread, leaves room for a log line. */
+	uint32_t tx_stack[2048] __attribute__((aligned(16)));
 } wifi_state_t;
 
 
@@ -497,9 +566,16 @@ static int wifi_openDevs(wifi_state_t *state)
 	 * there by the time the open above succeeds. */
 	state->irq_fd = open(WIFI_IRQ_DEV, O_RDONLY);
 
+	/* Optional too: an older daemon has none, and frames go one per message.
+	 * Without the buffers (wifi_netifInit) it is not worth opening. */
+	if ((state->batch_rx != NULL) && (state->batch_tx[0] != NULL)) {
+		state->batch_fd = open(WIFI_BATCH_DEV, O_RDWR);
+	}
+
 	/* Publish data_fd only once BOTH opens succeeded: the RX thread polls that
 	 * field, and a half-open state would have it read from a descriptor this
-	 * thread is about to close. irq_fd is set before it, for the same reason. */
+	 * thread is about to close. irq_fd and batch_fd are set before it, for the
+	 * same reason. */
 	state->ctl_fd = ctl_fd;
 	__atomic_store_n(&state->data_fd, data_fd, __ATOMIC_RELEASE);
 
@@ -586,6 +662,20 @@ static void wifi_backoff(wifi_state_t *state, unsigned secs)
 
 /* --- join thread (supervisor) -------------------------------------- */
 
+/* Follow the daemon's batch setting, from a `status` reply in state->resp. The
+ * switch is logged, so the UART log says which path every transfer took. */
+static void wifi_batchFollow(wifi_state_t *state)
+{
+	int want = ((state->batch_fd >= 0) && (strstr(state->resp, "batch=1") != NULL)) ? 1 : 0;
+
+	if (want != state->batch) {
+		state->batch = want;
+		wifi_printf("frames now go %s", want ? "several per message (" WIFI_BATCH_DEV ")" :
+			"one per message (" WIFI_DATA_DEV ")");
+	}
+}
+
+
 /* Keeps the association in line with the wanted credentials for as long as the
  * netif exists. /etc/wifi.conf is the whole control interface: `wifi connect`
  * rewrites it and `wifi disconnect` removes it, and this loop notices within
@@ -610,8 +700,9 @@ static void wifi_joinThread(void *arg)
 		}
 		sleep(WIFI_DEV_RETRY_S);
 	}
-	wifi_printf("%s + %s open; RX mode: %s", WIFI_DATA_DEV, WIFI_CTL_DEV,
-		(state->irq_fd >= 0) ? "irq (" WIFI_IRQ_DEV ")" : "poll (no " WIFI_IRQ_DEV ")");
+	wifi_printf("%s + %s open; RX mode: %s; batches: %s", WIFI_DATA_DEV, WIFI_CTL_DEV,
+		(state->irq_fd >= 0) ? "irq (" WIFI_IRQ_DEV ")" : "poll (no " WIFI_IRQ_DEV ")",
+		(state->batch_fd >= 0) ? "available (" WIFI_BATCH_DEV ", on with `wifi batch 1`)" : "unavailable");
 
 	if ((wifi_command(state, "mac") == 0) && (wifi_parseMac(state->resp, state->mac) == 0)) {
 		state->mac_valid = true;
@@ -640,10 +731,13 @@ static void wifi_joinThread(void *arg)
 				/* The daemon notices a deauth, a disassoc or the link dropping
 				 * (the AP went away) and reports joined=0; rejoin then, rather
 				 * than keep a lease on a link that no longer carries frames. */
-				if ((wifi_command(state, "status") == 0) && (strstr(state->resp, "joined=0") != NULL)) {
-					wifi_printf("association with \"%s\" lost; rejoining", state->ssid);
-					wifi_leave(state);
-					fails = 0;
+				if (wifi_command(state, "status") == 0) {
+					wifi_batchFollow(state);
+					if (strstr(state->resp, "joined=0") != NULL) {
+						wifi_printf("association with \"%s\" lost; rejoining", state->ssid);
+						wifi_leave(state);
+						fails = 0;
+					}
 				}
 				continue;
 			}
@@ -684,7 +778,7 @@ static void wifi_joinThread(void *arg)
 /* --- RX thread ---------------------------------------------------- */
 
 /* Wrap one received frame in a pbuf and hand it to lwIP. */
-static void wifi_deliverRx(wifi_state_t *state, size_t len)
+static void wifi_deliverRx(wifi_state_t *state, const uint8_t *frame, size_t len)
 {
 	struct netif *netif = state->netif;
 	struct pbuf *p;
@@ -701,7 +795,7 @@ static void wifi_deliverRx(wifi_state_t *state, size_t len)
 	((uint8_t *)p->payload)[0] = 0;
 	((uint8_t *)p->payload)[1] = 0;
 
-	if (pbuf_take_at(p, state->rx_buf, (uint16_t)len, ETH_PAD_SIZE) != ERR_OK) {
+	if (pbuf_take_at(p, frame, (uint16_t)len, ETH_PAD_SIZE) != ERR_OK) {
 		pbuf_free(p);
 		state->rx_err++;
 		return;
@@ -756,6 +850,77 @@ static void wifi_rxNap(wifi_state_t *state, unsigned int seen, unsigned int us)
 #define WIFI_WAKE_TIMEOUT 2 /* /dev/wifiirq timed out: a fallback poll */
 
 
+/* What one data read found (wifi_rxRead). */
+#define WIFI_RXR_ERR     (-1) /* the read failed; counted */
+#define WIFI_RXR_NONE    0    /* nothing queued */
+#define WIFI_RXR_MORE    1    /* frame(s) delivered; more may be queued: read again */
+#define WIFI_RXR_DRAINED 2    /* frame(s) delivered, and the daemon found the FIFO empty */
+
+
+/* One /dev/wifidata read: at most one frame. The path of every build before
+ * batches, unchanged. */
+static int wifi_rxReadOne(wifi_state_t *state)
+{
+	ssize_t n = read(state->data_fd, state->rx_buf, sizeof(state->rx_buf));
+
+	if (n > 0) {
+		wifi_deliverRx(state, state->rx_buf, (size_t)n);
+		return WIFI_RXR_MORE;
+	}
+	if (n == 0) {
+		return WIFI_RXR_NONE;
+	}
+	if (errno == EMSGSIZE) {
+		state->rx_toobig++; /* frame longer than WIFI_RX_BUF; dropped */
+	}
+	else {
+		state->rx_err++;
+	}
+	return WIFI_RXR_ERR;
+}
+
+
+/* One /dev/wifibatch read: every frame the daemon had queued, up to the buffer.
+ * The batch is checked whole before any frame of it goes to lwIP. */
+static int wifi_rxReadBatch(wifi_state_t *state)
+{
+	wifibatch_rd_t r;
+	const uint8_t *f;
+	uint32_t flen;
+	ssize_t n;
+
+	n = read(state->batch_fd, state->batch_rx, WIFI_BATCH_RX_BUF);
+	if (n == 0) {
+		return WIFI_RXR_NONE;
+	}
+	if (n < 0) {
+		state->rx_err++;
+		return WIFI_RXR_ERR;
+	}
+	if (wifibatch_open(&r, state->batch_rx, (size_t)n) < 0) {
+		state->rx_bbad++;
+		state->rx_err++;
+		return WIFI_RXR_ERR;
+	}
+	state->rx_breads++;
+	while ((f = wifibatch_next(&r, &flen)) != NULL) {
+		if ((flen < WIFI_TX_MIN) || (flen > WIFI_RX_BUF)) {
+			state->rx_err++;
+			continue;
+		}
+		wifi_deliverRx(state, f, flen);
+		state->rx_bframes++;
+	}
+	return ((r.flags & WIFIBATCH_F_DRAINED) != 0u) ? WIFI_RXR_DRAINED : WIFI_RXR_MORE;
+}
+
+
+static int wifi_rxRead(wifi_state_t *state)
+{
+	return (state->batch != 0) ? wifi_rxReadBatch(state) : wifi_rxReadOne(state);
+}
+
+
 /* Leave interrupt mode for polling, for the rest of this boot. */
 static void wifi_rxIrqOff(wifi_state_t *state, const char *why)
 {
@@ -772,30 +937,29 @@ static int wifi_rxIrqStep(wifi_state_t *state, int wake)
 {
 	ssize_t n;
 	char c;
+	int got;
 
-	n = read(state->data_fd, state->rx_buf, sizeof(state->rx_buf));
-	if (n > 0) {
+	got = wifi_rxRead(state);
+	if (got > 0) {
 		if (wake == WIFI_WAKE_TIMEOUT) {
 			state->irq_missed++; /* queued, but no interrupt said so */
 		}
 		state->irq_empty_run = 0u;
-		wifi_deliverRx(state, (size_t)n);
-		return WIFI_WAKE_FRAME;
+		if (got == WIFI_RXR_MORE) {
+			return WIFI_WAKE_FRAME;
+		}
+		/* A batch that ended on an empty FIFO: this read acked the interrupt
+		 * before it drained, so a frame queued since has raised the line again,
+		 * and the empty read that would only confirm the drain is skipped. */
 	}
-	if (n < 0) {
-		if (errno == EMSGSIZE) {
-			state->rx_toobig++;
-		}
-		else {
-			state->rx_err++;
-		}
+	else if (got < 0) {
 		usleep(WIFI_RX_ERR_US);
 		return WIFI_WAKE_FRAME;
 	}
-
-	/* Empty: the daemon reads past non-data frames while this path is on, so
-	 * the FIFO really is drained, and the chip will interrupt for the next. */
-	if (wake == WIFI_WAKE_IRQ) {
+	else if (wake == WIFI_WAKE_IRQ) {
+		/* Empty: the daemon reads past non-data frames while this path is on,
+		 * so the FIFO really is drained, and the chip will interrupt for the
+		 * next. */
 		state->irq_empty++;
 		state->irq_empty_run++;
 		if (state->irq_empty_run >= WIFI_IRQ_EMPTY_RUN) {
@@ -830,7 +994,7 @@ static void wifi_rxThread(void *arg)
 	unsigned int interval = WIFI_RX_FAST_US; /* current idle interval */
 	int wake = WIFI_WAKE_FRAME;              /* interrupt mode: why the next read happens */
 	unsigned int kicks;
-	ssize_t n;
+	int got;
 
 	for (;;) {
 		/* The join thread owns the opens; until they land there is nothing to
@@ -863,16 +1027,19 @@ static void wifi_rxThread(void *arg)
 			interval = WIFI_RX_FAST_US;
 		}
 
-		n = read(state->data_fd, state->rx_buf, sizeof(state->rx_buf));
-		if (n > 0) {
-			/* Read again at once: more may be queued behind this frame. */
-			wifi_deliverRx(state, (size_t)n);
+		got = wifi_rxRead(state);
+		if (got > 0) {
 			if (hold < WIFI_RX_HOLD_RX) {
 				hold = WIFI_RX_HOLD_RX;
 			}
 			interval = WIFI_RX_FAST_US;
+			if (got == WIFI_RXR_MORE) {
+				continue; /* read again at once: more may be queued behind */
+			}
+			/* A batch that drained the FIFO: pace the next read like one after
+			 * an empty read, which it would have been. */
 		}
-		else if (n == 0) {
+		if (got >= 0) {
 			/* Nothing queued (read() never blocks): stay fast while a reply
 			 * or a burst is expected, then back off towards the idle rate. */
 			if (hold > 0u) {
@@ -885,12 +1052,6 @@ static void wifi_rxThread(void *arg)
 			}
 		}
 		else {
-			if (errno == EMSGSIZE) {
-				state->rx_toobig++; /* frame longer than WIFI_RX_BUF; dropped */
-			}
-			else {
-				state->rx_err++;
-			}
 			usleep(WIFI_RX_ERR_US);
 		}
 	}
@@ -898,6 +1059,101 @@ static void wifi_rxThread(void *arg)
 
 
 /* --- linkoutput / media / stats ---------------------------------- */
+
+/* Send one batch, keeping the frames the credit window refused at its front
+ * and sending them again shortly: see "Frame batches" at the top. Gives up on
+ * the batch if the window stays shut for WIFI_TX_BLOCKED_TRIES, or the link
+ * goes down meanwhile. TX thread only. */
+static void wifi_txFlush(wifi_state_t *state, wifibatch_t *b)
+{
+	unsigned int tries = 0u;
+	uint32_t count;
+	ssize_t n;
+
+	for (;;) {
+		count = b->count;
+		n = write(state->batch_fd, b->buf, wifibatch_finish(b, 0u));
+		state->tx_bwrites++;
+		if ((n < 0) || ((size_t)n > count)) {
+			state->tx_berr += count;
+			return;
+		}
+		state->tx_bframes += (unsigned long)n;
+		if ((uint32_t)n == count) {
+			return;
+		}
+		wifibatch_drop(b, (uint32_t)n);
+		if ((state->link_up == 0) || (++tries >= WIFI_TX_BLOCKED_TRIES)) {
+			state->tx_berr += b->count;
+			return;
+		}
+		state->tx_bretries++;
+		/* Credits arrive with received frames: make sure a polling RX thread
+		 * is not napping through its idle interval meanwhile. */
+		wifi_rxKick(state);
+		usleep(WIFI_TX_BLOCKED_US);
+	}
+}
+
+
+/* Takes whatever linkoutput queued as one batch, hands linkoutput the other
+ * buffer to fill meanwhile, and sends it. Waits for frames in between, so with
+ * batching off it never runs. */
+static void wifi_txThread(void *arg)
+{
+	wifi_state_t *state = arg;
+	wifibatch_t send;
+	uint8_t *other;
+
+	for (;;) {
+		mutexLock(state->txq_lock);
+		while (state->txq.count == 0u) {
+			(void)condWait(state->txq_more, state->txq_lock, 0);
+		}
+		send = state->txq;
+		other = (send.buf == state->batch_tx[0]) ? state->batch_tx[1] : state->batch_tx[0];
+		wifibatch_init(&state->txq, other, WIFI_BATCH_TX_BUF);
+		(void)condBroadcast(state->txq_room);
+		mutexUnlock(state->txq_lock);
+
+		wifi_txFlush(state, &send);
+		wifi_rxKick(state);
+	}
+}
+
+
+/* linkoutput with batching on: queue the frame for the TX thread. Waits while
+ * the queue is full, as the one-frame path waits in its write() -- but only up
+ * to WIFI_TXQ_WAIT_US. A full queue that long means the TX thread is retrying a
+ * shut credit window, and this runs on the tcpip thread, which carries every
+ * other interface too: refuse with ERR_IF instead, as the one-frame path does
+ * at once for a refused frame, and lwIP keeps a TCP segment for its next
+ * output. */
+static err_t wifi_txQueue(wifi_state_t *state, struct pbuf *p, uint16_t len)
+{
+	uint8_t *slot;
+
+	mutexLock(state->txq_lock);
+	while (((slot = wifibatch_slot(&state->txq, len)) == NULL) ||
+		(state->txq.count >= WIFI_BATCH_TX_FRAMES)) {
+		if (condWait(state->txq_room, state->txq_lock, WIFI_TXQ_WAIT_US) == -ETIME) {
+			if (((slot = wifibatch_slot(&state->txq, len)) != NULL) &&
+				(state->txq.count < WIFI_BATCH_TX_FRAMES)) {
+				break;
+			}
+			state->tx_qfull++;
+			mutexUnlock(state->txq_lock);
+			return ERR_IF;
+		}
+	}
+	pbuf_copy_partial(p, slot, len, ETH_PAD_SIZE);
+	wifibatch_commit(&state->txq, len);
+	(void)condSignal(state->txq_more);
+	mutexUnlock(state->txq_lock);
+
+	return ERR_OK;
+}
+
 
 static err_t wifi_linkOutput(struct netif *netif, struct pbuf *p)
 {
@@ -917,6 +1173,10 @@ static err_t wifi_linkOutput(struct netif *netif, struct pbuf *p)
 		return ERR_BUF;
 	}
 	len = (uint16_t)(p->tot_len - ETH_PAD_SIZE);
+
+	if (state->batch != 0) {
+		return wifi_txQueue(state, p, len);
+	}
 
 	mutexLock(state->tx_lock);
 
@@ -951,17 +1211,62 @@ static int wifi_stats(struct netif *netif, char *buf, size_t cap)
 
 	r = snprintf(buf, cap,
 		"rx=%lu rx_err=%lu rx_toobig=%lu tx=%lu tx_err=%lu link=%d ssid=\"%s\" "
-		"rxmode=%s irq_wakes=%lu irq_timeouts=%lu irq_empty=%lu irq_missed=%lu",
+		"rxmode=%s irq_wakes=%lu irq_timeouts=%lu irq_empty=%lu irq_missed=%lu "
+		"batch=%d/%s tx_bwrites=%lu tx_bframes=%lu tx_bretries=%lu tx_berr=%lu tx_qfull=%lu "
+		"rx_breads=%lu rx_bframes=%lu rx_bbad=%lu",
 		state->rx_ok, state->rx_err, state->rx_toobig,
 		state->tx_ok, state->tx_err, state->link_up, state->ssid,
 		(state->irq_fd >= 0) ? "irq" : "poll", state->irq_wakes, state->irq_timeouts,
-		state->irq_empty, state->irq_missed);
+		state->irq_empty, state->irq_missed,
+		state->batch, (state->batch_fd >= 0) ? "available" : "unavailable",
+		state->tx_bwrites, state->tx_bframes, state->tx_bretries, state->tx_berr, state->tx_qfull,
+		state->rx_breads, state->rx_bframes, state->rx_bbad);
 
 	return ((r > 0) && ((size_t)r < cap)) ? r : 0;
 }
 
 
 /* --- netif init -------------------------------------------------- */
+
+/* The batch buffers and the TX thread. Any failure leaves batching unavailable
+ * (wifi_openDevs then does not open /dev/wifibatch) and the netif works one
+ * frame per message, as before. */
+static void wifi_batchInit(wifi_state_t *state)
+{
+	void *rx, *tx;
+	int err;
+
+	if ((mutexCreate(&state->txq_lock) != 0) || (condCreate(&state->txq_more) != 0) ||
+		(condCreate(&state->txq_room) != 0)) {
+		wifi_printf("batches unavailable: lock/cond creation failed");
+		return;
+	}
+	rx = mmap(NULL, WIFI_BATCH_RX_BUF, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	tx = mmap(NULL, 2u * WIFI_BATCH_TX_BUF, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if ((rx == MAP_FAILED) || (tx == MAP_FAILED)) {
+		wifi_printf("batches unavailable: no memory for the buffers");
+		if (rx != MAP_FAILED) {
+			(void)munmap(rx, WIFI_BATCH_RX_BUF);
+		}
+		if (tx != MAP_FAILED) {
+			(void)munmap(tx, 2u * WIFI_BATCH_TX_BUF);
+		}
+		return;
+	}
+	wifibatch_init(&state->txq, tx, WIFI_BATCH_TX_BUF);
+
+	err = beginthread(wifi_txThread, 4, state->tx_stack, sizeof(state->tx_stack), state);
+	if (err != 0) {
+		wifi_printf("batches unavailable: tx thread failed: %d", err);
+		(void)munmap(rx, WIFI_BATCH_RX_BUF);
+		(void)munmap(tx, 2u * WIFI_BATCH_TX_BUF);
+		return;
+	}
+	state->batch_rx = rx;
+	state->batch_tx[0] = tx;
+	state->batch_tx[1] = (uint8_t *)tx + WIFI_BATCH_TX_BUF;
+}
+
 
 static int wifi_netifInit(struct netif *netif, char *cfg)
 {
@@ -975,6 +1280,7 @@ static int wifi_netifInit(struct netif *netif, char *cfg)
 	state->data_fd = -1;
 	state->ctl_fd = -1;
 	state->irq_fd = -1;
+	state->batch_fd = -1;
 
 	err = wifi_parseCfg(state, cfg);
 	if (err < 0) {
@@ -1006,6 +1312,8 @@ static int wifi_netifInit(struct netif *netif, char *cfg)
 		wifi_printf("rx thread failed: %d", err);
 		return err;
 	}
+
+	wifi_batchInit(state);
 
 	/* Everything blocking -- waiting for the daemon's device files, the MAC
 	 * query and the 20-40 s join -- happens here, off the tcpip thread that

@@ -27,9 +27,6 @@
 #include "cyhal_sdio_def.h"
 
 
-#define USDHC2_ADDR 0x2194000
-#define USDHC2_IRQ  (32 + 23)
-
 #define DMA_BUFFER_SIZE 2048  // should be large enough to hold whole Wi-Fi frame
 
 enum {
@@ -65,20 +62,27 @@ enum {
 };
 
 
+/* The input select (daisy) registers exist only for USDHC2, the SDIO pads of other controllers have none */
+#if CONFIG_WIFI_USDHC_ADDR != 0x2194000
+#if (CONFIG_USDHC_CLK_ISEL >= 0) || (CONFIG_USDHC_CMD_ISEL >= 0) || (CONFIG_USDHC_D0_ISEL >= 0) || (CONFIG_USDHC_D1_ISEL >= 0) || (CONFIG_USDHC_D2_ISEL >= 0) || (CONFIG_USDHC_D3_ISEL >= 0)
+#error "CONFIG_USDHC_*_ISEL must be -1 when Wi-Fi is not on USDHC2"
+#endif
+#endif
+
 static const struct cyhal_sdio_pad {
 	int isel;
 	int iomux;
 	int iopad;
 	char mux_setting;
 	bool do_pull_up;
-	char daisy;
+	int daisy;
 } cyhal_sdio_pads[] = {
-	{ pctl_isel_usdhc2_clk, PCTL(CONFIG_USDHC2_CLK_MUX_PAD), PCTL(CONFIG_USDHC2_CLK_PAD), CONFIG_USDHC2_CLK_MUX_VAL, false, CONFIG_USDHC2_CLK_ISEL },
-	{ pctl_isel_usdhc2_cmd, PCTL(CONFIG_USDHC2_CMD_MUX_PAD), PCTL(CONFIG_USDHC2_CMD_PAD), CONFIG_USDHC2_CMD_MUX_VAL, true, CONFIG_USDHC2_CMD_ISEL },
-	{ pctl_isel_usdhc2_d0, PCTL(CONFIG_USDHC2_D0_MUX_PAD), PCTL(CONFIG_USDHC2_D0_PAD), CONFIG_USDHC2_D0_MUX_VAL, true, CONFIG_USDHC2_D0_ISEL },
-	{ pctl_isel_usdhc2_d1, PCTL(CONFIG_USDHC2_D1_MUX_PAD), PCTL(CONFIG_USDHC2_D1_PAD), CONFIG_USDHC2_D1_MUX_VAL, true, CONFIG_USDHC2_D1_ISEL },
-	{ pctl_isel_usdhc2_d2, PCTL(CONFIG_USDHC2_D2_MUX_PAD), PCTL(CONFIG_USDHC2_D2_PAD), CONFIG_USDHC2_D2_MUX_VAL, true, CONFIG_USDHC2_D2_ISEL },
-	{ pctl_isel_usdhc2_d3, PCTL(CONFIG_USDHC2_D3_MUX_PAD), PCTL(CONFIG_USDHC2_D3_PAD), CONFIG_USDHC2_D3_MUX_VAL, true, CONFIG_USDHC2_D3_ISEL },
+	{ pctl_isel_usdhc2_clk, PCTL(CONFIG_USDHC_CLK_MUX_PAD), PCTL(CONFIG_USDHC_CLK_PAD), CONFIG_USDHC_CLK_MUX_VAL, false, CONFIG_USDHC_CLK_ISEL },
+	{ pctl_isel_usdhc2_cmd, PCTL(CONFIG_USDHC_CMD_MUX_PAD), PCTL(CONFIG_USDHC_CMD_PAD), CONFIG_USDHC_CMD_MUX_VAL, true, CONFIG_USDHC_CMD_ISEL },
+	{ pctl_isel_usdhc2_d0, PCTL(CONFIG_USDHC_D0_MUX_PAD), PCTL(CONFIG_USDHC_D0_PAD), CONFIG_USDHC_D0_MUX_VAL, true, CONFIG_USDHC_D0_ISEL },
+	{ pctl_isel_usdhc2_d1, PCTL(CONFIG_USDHC_D1_MUX_PAD), PCTL(CONFIG_USDHC_D1_PAD), CONFIG_USDHC_D1_MUX_VAL, true, CONFIG_USDHC_D1_ISEL },
+	{ pctl_isel_usdhc2_d2, PCTL(CONFIG_USDHC_D2_MUX_PAD), PCTL(CONFIG_USDHC_D2_PAD), CONFIG_USDHC_D2_MUX_VAL, true, CONFIG_USDHC_D2_ISEL },
+	{ pctl_isel_usdhc2_d3, PCTL(CONFIG_USDHC_D3_MUX_PAD), PCTL(CONFIG_USDHC_D3_PAD), CONFIG_USDHC_D3_MUX_VAL, true, CONFIG_USDHC_D3_ISEL },
 };
 
 static struct {
@@ -90,6 +94,7 @@ static struct {
 	addr_t dmaphys;
 
 	volatile bool irq_enabled;
+	volatile bool irq_rearm; /* the card interrupt waits masked for the next command */
 
 	handle_t irq_handle;
 	handle_t irq_lock;
@@ -175,6 +180,8 @@ static int wait_for_cmd(uint32_t flags, uint32_t wait_us, uint32_t max_cnt)
 				cy_log_msg(CYLF_SDIO, CY_LOG_ERR, "SDIO cmd error (Command CRC Error)\n");
 			if (val & (1 << 16)) /* CTOE=1 */
 				cy_log_msg(CYLF_SDIO, CY_LOG_ERR, "SDIO cmd error (Command Timeout Error)\n");
+			/* error bits are W1C and survive RSTC/RSTD - clear them (except CINT) or every next cmd fails */
+			*(sdio_common.base + int_status) = val & ~(1U << 8);
 			return -1;
 		}
 
@@ -290,6 +297,14 @@ static void sdio_irq_thread(void *arg)
 			condWait(sdio_common.irq_cond, sdio_common.irq_lock, 0);
 		}
 
+		if (!finish) {
+			/* this will also clear CINT */
+			val = *(sdio_common.base + int_status_en);
+			val &= ~(1 << 8); /* CINTESEN=0 */
+			*(sdio_common.base + int_status_en) = val;
+			sdio_common.irq_rearm = true;
+		}
+
 		mutexUnlock(sdio_common.irq_lock);
 
 		if (finish) {
@@ -298,20 +313,12 @@ static void sdio_irq_thread(void *arg)
 
 		// cy_log_msg(CYLF_SDIO, CY_LOG_DEBUG, "got SDIO IRQ\n");
 
-		/* this will also clear CINT */
-		val = *(sdio_common.base + int_status_en);
-		val &= ~(1 << 8); /* CINTESEN=0 */
-		*(sdio_common.base + int_status_en) = val;
-
+		/*
+		 * The card holds the interrupt until WHD services it over SDIO, so the next command unmasks it
+		 * (sdio_irq_rearm). The handler wakes the WHD thread, which always reads the card's interrupt
+		 * status next. The interrupt may fire once more after each command until WHD clears that status.
+		 */
 		sdio_common.irq_handler(sdio_common.irq_handler_arg, CYHAL_SDIO_CARD_INTERRUPT);
-
-		val = *(sdio_common.base + int_status_en);
-		val |= 1 << 8; /* CINTESEN=1 */
-		*(sdio_common.base + int_status_en) = val;
-
-		val = *(sdio_common.base + int_signal_en);
-		val |= 1 << 8; /* CINTIEN=1 */
-		*(sdio_common.base + int_signal_en) = val;
 
 		// cy_log_msg(CYLF_SDIO, CY_LOG_DEBUG, "done SDIO IRQ\n");
 	}
@@ -320,10 +327,10 @@ static void sdio_irq_thread(void *arg)
 }
 
 /* NOTE: obj is ignored - state is kept in sdio_common */
-cy_rslt_t cyhal_sdio_start_irq_thread(cyhal_sdio_t *obj)
+cy_rslt_t cyhal_sdio_start_irq_thread(cyhal_sdio_t *obj, cy_thread_priority_t priority)
 {
 	cy_log_msg(CYLF_SDIO, CY_LOG_DEBUG, "cyhal_sdio_start_irq_thread\n");
-	if (cy_rtos_create_thread(&sdio_common.irq_thread_id, sdio_irq_thread, "SDIO_IRQ", NULL, 1024, 4, NULL) != CY_RSLT_SUCCESS) {
+	if (cy_rtos_create_thread(&sdio_common.irq_thread_id, sdio_irq_thread, "SDIO_IRQ", NULL, 1024, priority, NULL) != CY_RSLT_SUCCESS) {
 		cy_log_msg(CYLF_SDIO, CY_LOG_ERR, "failed to start SDIO IRQ handler thread\n");
 		return CYHAL_SDIO_RSLT_ERR_BAD_PARAM;
 	}
@@ -352,10 +359,12 @@ static int cyhal_sdio_pad_init(void)
 			return ret;
 		}
 
-		ret = cyhal_utils_set_iosel(p->isel, p->daisy);
-		if (ret < 0) {
-			cy_log_msg(CYLF_SDIO, CY_LOG_ERR, "can't configure SDIO pins iosel\n");
-			return ret;
+		if (p->daisy >= 0) {
+			ret = cyhal_utils_set_iosel(p->isel, (char)p->daisy);
+			if (ret < 0) {
+				cy_log_msg(CYLF_SDIO, CY_LOG_ERR, "can't configure SDIO pins iosel\n");
+				return ret;
+			}
 		}
 	}
 
@@ -373,7 +382,7 @@ cy_rslt_t cyhal_sdio_init(cyhal_sdio_t *obj)
 	memset(&sdio_common, 0, sizeof(sdio_common));
 
 	do {
-		void *ptr = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, USDHC2_ADDR);
+		void *ptr = mmap(NULL, _PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, CONFIG_WIFI_USDHC_ADDR);
 		if (ptr == MAP_FAILED) {
 			cy_log_msg(CYLF_SDIO, CY_LOG_ERR, "failed to mmap SDIO registers\n");
 			break;
@@ -405,8 +414,8 @@ cy_rslt_t cyhal_sdio_init(cyhal_sdio_t *obj)
 			break;
 		}
 
-		/* enable USDHC2_CLK */
-		if (cyhal_utils_set_devclk(pctl_clk_usdhc2, 3) < 0) {
+		/* enable uSDHC clock */
+		if (cyhal_utils_set_devclk(PCTL(CONFIG_WIFI_USDHC_CLK), 3) < 0) {
 			cy_log_msg(CYLF_SDIO, CY_LOG_ERR, "can't enable SDIO clock\n");
 			break;
 		}
@@ -512,21 +521,18 @@ cy_rslt_t cyhal_sdio_configure(cyhal_sdio_t *obj, const cyhal_sdio_cfg_t *config
 		val = *(sdio_common.base + pres_state) & (1 << 3);
 	} while (!val);
 
+	/* data timeout = SDCLK * 2^(14 + DTOCV) = 10.5 ms at both clocks, longer than wait_for_cmd() polls (~1 ms) */
 	if (config->frequencyhal_hz == 50000000) {
 		/* FREQ = 400000000 / 2 / (4 * 1) = 50000000 */
-		*(sdio_common.base + sys_ctrl) = (0x2 << 8) | 0xf; /* SDCLKFS=0x2 DVS=0x0 */
+		*(sdio_common.base + sys_ctrl) = (0x5 << 16) | (0x2 << 8) | 0xf; /* DTOCV=0x5 SDCLKFS=0x2 DVS=0x0 */
 	}
 	else {
 		/* FREQ = 400000000 / 2 / (8 * 1) = 25000000 */
-		*(sdio_common.base + sys_ctrl) = (0x4 << 8) | 0xf; /* SDCLKFS=0x4 DVS=0x0 */
+		*(sdio_common.base + sys_ctrl) = (0x4 << 16) | (0x4 << 8) | 0xf; /* DTOCV=0x4 SDCLKFS=0x4 DVS=0x0 */
 	}
 
-#if 0
-    /* FRC_SDCLK_ON=1 */
-    val = *(sdio_common.base + vend_spec);
-    val |= 1 << 8;
-    *(sdio_common.base + vend_spec) = val;
-#endif
+	/* FRC_SDCLK_ON=1: the card signals interrupts on DAT1 only while SDCLK runs, a gated idle clock loses them */
+	*(sdio_common.base + vend_spec) |= 1 << 8;
 
 #if 1
 	/* INITA=1 */
@@ -637,6 +643,30 @@ static cy_rslt_t cyhal_sdio_send_cmd_internal(cyhal_transfer_t direction, cyhal_
 }
 
 
+static void sdio_irq_rearm(void)
+{
+	uint32_t val;
+
+	/* skips the lock on every command; a re-arm set concurrently is done by WHD's next command */
+	if (!sdio_common.irq_rearm) {
+		return;
+	}
+
+	mutexLock(sdio_common.irq_lock);
+	if (sdio_common.irq_rearm && sdio_common.irq_enabled) {
+		val = *(sdio_common.base + int_status_en);
+		val |= 1 << 8; /* CINTESEN=1 */
+		*(sdio_common.base + int_status_en) = val;
+
+		val = *(sdio_common.base + int_signal_en);
+		val |= 1 << 8; /* CINTIEN=1 */
+		*(sdio_common.base + int_signal_en) = val;
+	}
+	sdio_common.irq_rearm = false;
+	mutexUnlock(sdio_common.irq_lock);
+}
+
+
 /* NOTE: obj is ignored - state is kept in sdio_common */
 cy_rslt_t cyhal_sdio_send_cmd(const cyhal_sdio_t *obj, cyhal_transfer_t direction,
 		cyhal_sdio_command_t command, uint32_t argument, uint32_t *response)
@@ -657,6 +687,8 @@ cy_rslt_t cyhal_sdio_send_cmd(const cyhal_sdio_t *obj, cyhal_transfer_t directio
 
 		usleep(1000);
 	}
+
+	sdio_irq_rearm();
 
 	return res;
 }
@@ -763,6 +795,7 @@ cy_rslt_t cyhal_sdio_bulk_transfer(cyhal_sdio_t *obj, cyhal_transfer_t direction
 		usleep(1000);
 	}
 
+	sdio_irq_rearm();
 
 	return res;
 }
@@ -787,7 +820,7 @@ void cyhal_sdio_register_irq(cyhal_sdio_t *obj, cyhal_sdio_irq_handler_t handler
 	sdio_common.irq_handler = handler;
 	sdio_common.irq_handler_arg = handler_arg;
 
-	interrupt(USDHC2_IRQ, sdio_irq_handler, NULL, sdio_common.irq_cond, &sdio_common.irq_handle);
+	interrupt(CONFIG_WIFI_USDHC_IRQ, sdio_irq_handler, NULL, sdio_common.irq_cond, &sdio_common.irq_handle);
 }
 
 
@@ -804,21 +837,22 @@ void cyhal_sdio_irq_enable(cyhal_sdio_t *obj, cyhal_sdio_irq_event_t event, bool
 		return;
 	}
 
-	if (enable != sdio_common.irq_enabled) {
-		val = *(sdio_common.base + int_status_en);
-		if (enable)
-			*(sdio_common.base + int_status_en) = val | (1 << 8); /* CINTESEN=1 */
-		else
-			*(sdio_common.base + int_status_en) = val & ~(1 << 8); /* CINTESEN=0 */
+	mutexLock(sdio_common.irq_lock);
+	val = *(sdio_common.base + int_status_en);
+	if (enable)
+		*(sdio_common.base + int_status_en) = val | (1 << 8); /* CINTESEN=1 */
+	else
+		*(sdio_common.base + int_status_en) = val & ~(1 << 8); /* CINTESEN=0 */
 
-		val = *(sdio_common.base + int_signal_en);
-		if (enable)
-			*(sdio_common.base + int_signal_en) = val | (1 << 8); /* CINTIEN=1 */
-		else
-			*(sdio_common.base + int_signal_en) = val & ~(1 << 8); /* CINTIEN=0 */
+	val = *(sdio_common.base + int_signal_en);
+	if (enable)
+		*(sdio_common.base + int_signal_en) = val | (1 << 8); /* CINTIEN=1 */
+	else
+		*(sdio_common.base + int_signal_en) = val & ~(1 << 8); /* CINTIEN=0 */
 
-		sdio_common.irq_enabled = enable;
-	}
+	sdio_common.irq_enabled = enable;
+	sdio_common.irq_rearm = false;
+	mutexUnlock(sdio_common.irq_lock);
 }
 
 #endif /* (CYBSP_WIFI_INTERFACE_TYPE == CYBSP_SDIO_INTERFACE) */

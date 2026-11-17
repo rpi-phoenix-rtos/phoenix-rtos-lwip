@@ -383,8 +383,8 @@ static void cy_dhcp_thread_func(cy_thread_arg_t thread_input)
 				/* Clear the DHCP options list */
 				memset(&reply_header->options, 0, sizeof(reply_header->options));
 
-				/* Record client MAC address */
-				memcpy(&client_mac_address, request_header->client_hardware_addr, sizeof(client_mac_address));
+				/* Record client MAC address (copied from the released discover packet above) */
+				memcpy(&client_mac_address, reply_header->client_hardware_addr, sizeof(client_mac_address));
 
 				/* Check whether device is already cached */
 				if (!get_client_ip_address_from_cache(&client_mac_address, &client_ip_address)) {
@@ -439,7 +439,9 @@ static void cy_dhcp_thread_func(cy_thread_arg_t thread_input)
 				/* Check that the REQUEST is for this server */
 				find_option_ptr = find_option(request_header, DHCP_SERVER_IDENTIFIER_OPTION_CODE);
 				if ((find_option_ptr != NULL) && (GET_IPV4_ADDRESS(local_ip_address) != htobe32(LWIP_MAKEU32(find_option_ptr[3], find_option_ptr[2], find_option_ptr[1], find_option_ptr[0])))) {
-					break; /* Server ID does not match local IP address */
+					/* Server ID does not match local IP address */
+					packet_delete(received_packet);
+					break;
 				}
 
 				/* Create reply packet */

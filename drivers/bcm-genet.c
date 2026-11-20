@@ -131,6 +131,18 @@
 #define GENET_TX_CACHEABLE 1
 #endif
 
+/* RX cache maintenance over the frame instead of the whole slot (GENET_RX_CACHEABLE).
+ * 0: both per-frame maintenance passes cover the whole GENET_MAX_FRAME slot, 32 lines
+ * each, whatever the frame's size. 1: before the CPU reads a frame, only the lines the
+ * device wrote (the BD length: the 2-byte prefix and the frame); before a buffer is armed
+ * again, only the lines its last frame occupied. That is enough because the CPU writes a
+ * received buffer only through its pbuf, whose payload lies inside the frame, and a line
+ * the CPU merely read stays clean, so no line outside that extent can be dirty. A full
+ * 1514-byte frame then costs 24 + 24 lines instead of 32 + 32; a 60-byte TCP ACK 1 + 1. */
+#ifndef GENET_RX_SYNC_FRAME
+#define GENET_RX_SYNC_FRAME 0
+#endif
+
 /* TEMP diag: per-frame NFS/TCP RX logging in the drain path to discriminate
  * delivered-but-corrupt from before-ring loss (gigabit NFS triage). Revert to 0. */
 #ifndef GENET_RXFRAME_LOG
@@ -266,6 +278,7 @@ typedef struct {
 	addr_t rx_bufs_phys[GENET_RX_POOL_SLOTS];/* PA of each pool buffer */
 	uint16_t rx_bd_buf[GENET_TOTAL_DESC];    /* which pool buffer each BD is armed with */
 	genet_rxbuf_t rx_pc[GENET_RX_POOL_SLOTS];/* custom-pbuf wrapper per pool buffer */
+	uint16_t rx_dirty[GENET_RX_POOL_SLOTS];  /* bytes from the buffer's start its cache lines may differ from RAM in (GENET_RX_SYNC_FRAME) */
 	uint16_t rx_free[GENET_RX_POOL_SLOTS];   /* free-list (stack of pool-buffer indices) */
 	int rx_free_top;                         /* # entries on the free list */
 	pthread_mutex_t rx_free_lock;            /* drain pops, custom-free pushes (cross-thread); user-space lock */
@@ -836,15 +849,19 @@ static int genet_initRxRing(genet_state_t *state)
 	 * scanout high-mem region (e.g. the Pi 4 plo framebuffer triple-buffers around
 	 * 0x3d3b2000..0x3eb84000). A cacheable RX pool that overlaps scanout would let
 	 * RX DMA + cache maintenance clobber the framebuffer. */
-	genet_printf(state, "RXCACHE pool PA=0x%08x..0x%08x (%u KB, cacheable); TX pool PA=0x%08x",
+	genet_printf(state, "RXCACHE pool PA=0x%08x..0x%08x (%u KB, cacheable, maintained per %s); TX pool PA=0x%08x",
 		(unsigned)state->rx_pool_phys,
 		(unsigned)(state->rx_pool_phys + GENET_RX_POOL_SLOTS * GENET_MAX_FRAME),
 		(GENET_RX_POOL_SLOTS * GENET_MAX_FRAME) / 1024u,
+		GENET_RX_SYNC_FRAME ? "frame" : "slot",
 		(unsigned)state->tx_buf_phys);
 #endif
 	for (i = 0; i < GENET_RX_POOL_SLOTS; ++i) {
 		state->rx_bufs[i] = (uint8_t *)state->rx_pool + (size_t)i * GENET_MAX_FRAME;
 		state->rx_bufs_phys[i] = state->rx_pool_phys + (addr_t)i * GENET_MAX_FRAME;
+		/* the kernel's zeroing may have left any line dirty: the first arming of every
+		 * buffer (here for BDs 0..255, at its first refill for the spares) cleans it whole */
+		state->rx_dirty[i] = GENET_MAX_FRAME;
 		state->rx_pc[i].state = state;
 		state->rx_pc[i].idx = (uint16_t)i;
 		state->rx_pc[i].pc.custom_free_function = genet_rxbufFree;
@@ -1044,7 +1061,7 @@ static void genet_drainRxRing(genet_state_t *state)
 		 * during init). lwip is built with ETH_PAD_SIZE=2, so the pbuf
 		 * we hand up must reserve 2 bytes of head pad before the L2
 		 * header for ethernet_input's pbuf_remove_header. */
-		if (frame_len_total > GENET_RX_STATUS_PREFIX &&
+		if (frame_len_total > GENET_RX_STATUS_PREFIX && frame_len_total <= GENET_MAX_FRAME &&
 			(status & (BD_STATUS_SOP | BD_STATUS_EOP)) ==
 			(BD_STATUS_SOP | BD_STATUS_EOP) &&
 			(status & GENET_RX_STATUS_ERROR_MASK) == 0u) {
@@ -1123,8 +1140,11 @@ static void genet_drainRxRing(genet_state_t *state)
 #if GENET_RX_CACHEABLE
 			/* dma_sync_for_cpu: clean+invalidate this slot's lines before ANY
 			 * read of its contents (zero-copy hand-up OR copy fallback below),
-			 * so the CPU sees what the device DMA'd, not a stale cached copy. */
-			genet_dcacheCleanInvalRx(buf, GENET_MAX_FRAME);
+			 * so the CPU sees what the device DMA'd, not a stale cached copy.
+			 * GENET_RX_SYNC_FRAME: the lines the device wrote are enough; a line
+			 * past them is never read for this frame, and a longer frame later
+			 * invalidates it before reading it. */
+			genet_dcacheCleanInvalRx(buf, GENET_RX_SYNC_FRAME ? frame_len_total : GENET_MAX_FRAME);
 #endif
 			nb = genet_rxbufPop(state);   /* spare buffer to re-arm this BD */
 
@@ -1147,10 +1167,14 @@ static void genet_drainRxRing(genet_state_t *state)
 					 * it meanwhile; 'buf' now belongs to lwip until rxbufFree(). */
 					state->rx_bd_buf[state->rx_index] = (uint16_t)nb;
 #if GENET_RX_CACHEABLE
+					/* lwip writes 'buf' only through the pbuf, inside the frame
+					 * (its payload starts at the pad, 'buf' itself, and ends with
+					 * the frame): that is all its next arming must clean */
+					state->rx_dirty[bufidx] = frame_len_total;
 					/* dma_sync_for_device: the spare may carry dirty lines from
 					 * its previous life up the stack — clean+invalidate so they
 					 * can't write back over the device's next DMA into this slot. */
-					genet_dcacheCleanInvalRx(state->rx_bufs[nb], GENET_MAX_FRAME);
+					genet_dcacheCleanInvalRx(state->rx_bufs[nb], GENET_RX_SYNC_FRAME ? state->rx_dirty[nb] : GENET_MAX_FRAME);
 #endif
 					genet_write(state, bd_off + 4,
 						(uint32_t)(state->rx_bufs_phys[nb] & 0xFFFFFFFFu));

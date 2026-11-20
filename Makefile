@@ -61,6 +61,12 @@ ifneq ($(GENET_TX_PIPELINE),)
 CFLAGS += -DGENET_TX_PIPELINE=$(GENET_TX_PIPELINE)
 endif
 
+# RX cache maintenance over the received frame instead of the whole 2 KiB slot
+# (bcm-genet.c). DEFAULT-OFF until HW-validated; `make GENET_RX_SYNC_FRAME=1` enables it.
+ifneq ($(GENET_RX_SYNC_FRAME),)
+CFLAGS += -DGENET_RX_SYNC_FRAME=$(GENET_RX_SYNC_FRAME)
+endif
+
 # Raw TCP throughput bench (gigabit-NFS "size the prize"): opt-in lwiperf TCP
 # server (iperf 2.0.5 protocol) so a host `iperf -c <pi>` measures the
 # lwip-core + driver RX ceiling WITHOUT the socket-copy / NFS-RPC layers above

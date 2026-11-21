@@ -199,6 +199,18 @@
 #define GENET_RX_POLL_US 2000u
 #endif
 
+/* Every observed lost RX interrupt follows one of our transmits, so the backstop polls at
+ * GENET_RX_POLL_US only while there is traffic. After GENET_RX_IDLE_POLLS polls in a row with
+ * no interrupt, no transmit and nothing rescued (~250 ms of silence) it polls every
+ * GENET_RX_IDLE_POLL_US instead, and the next transmit wakes it back to the short interval.
+ * An idle board then takes ~20 wakeups a second here instead of ~500. */
+#ifndef GENET_RX_IDLE_POLL_US
+#define GENET_RX_IDLE_POLL_US 50000u
+#endif
+#ifndef GENET_RX_IDLE_POLLS
+#define GENET_RX_IDLE_POLLS 125u
+#endif
+
 /*
  * RX ring depth. The HW default-queue ring is GENET_TOTAL_DESC (256) BDs and
  * the BUF_SIZE/END_ADDR are programmed for that full count. We MUST back every
@@ -291,6 +303,8 @@ typedef struct {
 	unsigned long rx_rearm_stranded;   /* frames caught by the post-unmask re-drain */
 	unsigned long rx_pollrescue;       /* frames caught by the irq-thread poll backstop (lost-IRQ) */
 	unsigned long rx_polls;            /* irq-thread condWait timeouts (poll backstop invocations) */
+	unsigned int tx_seq;               /* bumped by every transmit (linkoutput; atomic) */
+	int rx_poll_slow;                  /* irq thread waits GENET_RX_IDLE_POLL_US (atomic) */
 #if GENET_RXSTATS_LOG
 	/* Throughput-profiling accumulators (GENET_RXSTATS_LOG only): attribute the
 	 * per-frame drain cost. input_us/input_calls = mean us in netif->input()
@@ -1301,6 +1315,7 @@ static void genet_irqThread(void *arg)
 {
 	genet_state_t *state = arg;
 	uint32_t events;
+	unsigned int quiet = 0u, last_tx = __atomic_load_n(&state->tx_seq, __ATOMIC_SEQ_CST);
 
 	mutexLock(state->irq_lock);
 	for (;;) {
@@ -1316,7 +1331,26 @@ static void genet_irqThread(void *arg)
 			 * any frame the missing interrupt stranded. This bounds RX latency to the
 			 * poll interval (2 ms) regardless of the interrupt-loss root cause, the
 			 * same poll-robustness U-Boot's bcmgenet has by construction. */
-			condWait(state->irq_cond, state->irq_lock, GENET_RX_POLL_US);
+			/* Going slow: announce it, then look at tx_seq again. A transmit bumps tx_seq and
+			 * then reads rx_poll_slow (both seq_cst), so either it sees the flag and signals
+			 * -- under irq_lock, which this thread holds until condWait releases it, so the
+			 * signal cannot come before the wait -- or this thread sees its tx_seq. */
+			if (quiet >= GENET_RX_IDLE_POLLS) {
+				__atomic_store_n(&state->rx_poll_slow, 1, __ATOMIC_SEQ_CST);
+				if (__atomic_load_n(&state->tx_seq, __ATOMIC_SEQ_CST) != last_tx) {
+					__atomic_store_n(&state->rx_poll_slow, 0, __ATOMIC_SEQ_CST);
+				}
+			}
+			condWait(state->irq_cond, state->irq_lock,
+				(__atomic_load_n(&state->rx_poll_slow, __ATOMIC_SEQ_CST) != 0) ? GENET_RX_IDLE_POLL_US : GENET_RX_POLL_US);
+			__atomic_store_n(&state->rx_poll_slow, 0, __ATOMIC_SEQ_CST);
+			if (__atomic_load_n(&state->tx_seq, __ATOMIC_SEQ_CST) != last_tx) {
+				last_tx = __atomic_load_n(&state->tx_seq, __ATOMIC_SEQ_CST);
+				quiet = 0u;
+			}
+			else if (quiet < GENET_RX_IDLE_POLLS) {
+				quiet++;
+			}
 			if (state->irq_events == 0u) {
 				uint32_t rring = GENET_RX_RINGS_OFF +
 					GENET_DEFAULT_RING * GENET_DMA_RING_SIZE;
@@ -1324,6 +1358,7 @@ static void genet_irqThread(void *arg)
 				state->rx_polls++;   /* fork-closer: proves the poll actually runs */
 				uint32_t prod_full = genet_read(state, rring + GENET_RDMA_RING_PROD_INDEX);
 				if ((prod_full & 0xFFFFu) != (state->rx_c_index & 0xFFFFu)) {
+					quiet = 0u;
 					state->rx_pollrescue++;
 					genet_drainRxRing(state);
 				}
@@ -1361,6 +1396,7 @@ static void genet_irqThread(void *arg)
 		}
 		events = state->irq_events;
 		state->irq_events = 0u;
+		quiet = 0u;
 		mutexUnlock(state->irq_lock);
 
 		if ((events & INTRL2_0_RX_DMA_DONE) != 0u) {
@@ -1590,6 +1626,16 @@ static err_t genet_linkOutput(struct netif *netif, struct pbuf *p)
 
 	if (state->last_link_up == 0) {
 		return ERR_IF;
+	}
+
+	/* A reply's RX interrupt can be lost right after a transmit: get the backstop poll back to
+	 * its short interval if the line has been quiet (see GENET_RX_IDLE_POLL_US). */
+	(void)__atomic_add_fetch(&state->tx_seq, 1u, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&state->rx_poll_slow, __ATOMIC_SEQ_CST) != 0) {
+		mutexLock(state->irq_lock);
+		__atomic_store_n(&state->rx_poll_slow, 0, __ATOMIC_SEQ_CST);
+		condSignal(state->irq_cond);
+		mutexUnlock(state->irq_lock);
 	}
 
 	if (p->tot_len > GENET_MAX_FRAME + ETH_PAD_SIZE ||
